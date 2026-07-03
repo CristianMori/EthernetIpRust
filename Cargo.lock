@@ -3,6 +3,12 @@
 version = 3
 
 [[package]]
+name = "anyhow"
+version = "1.0.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+
+[[package]]
 name = "bytes"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19,10 +25,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethernetip-logix"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ethernetip-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "logix-tag-read"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ethernetip-logix",
+ "tokio",
+]
 
 [[package]]
 name = "mio"

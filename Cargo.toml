@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/ethernetip-core",
+    "crates/ethernetip-logix",
+    "samples/logix-tag-read",
 ]
 
 [workspace.package]
@@ -19,6 +21,7 @@ bytes = "1"
 tracing = "0.1"
 
 ethernetip-core = { path = "crates/ethernetip-core", version = "0.1.0" }
+ethernetip-logix = { path = "crates/ethernetip-logix", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

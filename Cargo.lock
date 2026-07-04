@@ -94,6 +94,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethernetip-safety"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ethernetip-connections",
+ "ethernetip-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

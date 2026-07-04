@@ -1,0 +1,16 @@
+[package]
+name = "ethernetip-connections"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "EtherNet/IP Class 1 implicit I/O: assemblies, Forward_Open, EPIO framing"
+
+[dependencies]
+ethernetip-core = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use ethernetip_logix::{TagClient, TagValue};
 
 fn usage() {
-    eprintln!("usage: logix-tag-read <host> [--path 1,0] [--tag Name]");
+    eprintln!("usage: logix-tag-read <host> [--path 1,0] [--tag Name] [--connected]");
     eprintln!("       (default host: 192.168.1.96, default path: 1,0)");
 }
 
@@ -23,6 +23,7 @@ async fn run() -> Result<()> {
     let mut host = "192.168.1.96".to_string();
     let mut path = Some("1,0".to_string());
     let mut tag: Option<String> = None;
+    let mut connected = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -41,6 +42,7 @@ async fn run() -> Result<()> {
             "--tag" => {
                 tag = Some(args.next().context("--tag needs a value")?);
             }
+            "--connected" => connected = true,
             other if !other.starts_with("--") => host = other.to_string(),
             other => {
                 usage();
@@ -49,17 +51,21 @@ async fn run() -> Result<()> {
         }
     }
 
-    println!("Connecting to {host} (path = {:?}) ...", path);
+    println!(
+        "Connecting to {host} (path = {:?}, connected = {}) ...",
+        path, connected
+    );
     let started = Instant::now();
-    let mut builder = TagClient::builder(host.clone());
+    let mut builder = TagClient::builder(host.clone()).use_connected(connected);
     if let Some(p) = path.as_ref() {
         builder = builder.path(p.clone());
     }
     let mut client = builder.connect().await.context("connect failed")?;
     println!(
-        "registered in {:?}, session handle 0x{:08X}",
+        "registered in {:?}, session handle 0x{:08X}, class3_open = {}",
         started.elapsed(),
-        client.session_handle()
+        client.session_handle(),
+        client.is_class3_open()
     );
 
     println!("\n--- browse_tags ---");

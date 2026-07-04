@@ -5,12 +5,17 @@
 //! through the target's Message Router; when a routing path is configured
 //! (typical on a ControlLogix rack where the Ethernet card and CPU sit in
 //! different slots) they get wrapped in `Unconnected_Send` addressed to the
-//! local Connection Manager, which handles the actual bridging.
+//! local Connection Manager, which handles the actual bridging. When
+//! `use_connected` is set on the builder, the client opens a Class 3
+//! connection at register time and rides `SendUnitData` for every subsequent
+//! request.
 
-use ethernetip_core::cip::{service, status, ReplyHeader};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ethernetip_core::cip::{class, service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Item};
 use ethernetip_core::error::{EipError, Result};
-use ethernetip_core::path::parse_route_path;
+use ethernetip_core::path::{parse_route_path, EpathWriter};
 use ethernetip_core::{EipSession, EIP_PORT};
 
 use crate::browse::{
@@ -23,12 +28,27 @@ use crate::types::{decode_read_tag, CipType, TagValue};
 /// Timeout advertised to the target on each unconnected request.
 const REQUEST_TIMEOUT_SECS: u16 = 5;
 
+/// Default originator vendor ID reported in `Forward_Open`.
+const DEFAULT_ORIG_VENDOR: u16 = 0x0001;
+
+/// Class 3 connection parameters, matched to what pycomm3 / Studio 5000 send:
+/// P2P, priority high, fixed 504 bytes.
+const CLASS3_NET_PARAMS: u16 = 0x43F8;
+
+/// Class 3 explicit transport class + trigger byte.
+const CLASS3_TRANSPORT: u8 = 0xA3;
+
+/// Requested Packet Interval for Class 3 (microseconds — this is really the
+/// inactivity/watchdog timeout for explicit connections).
+const CLASS3_RPI_US: u32 = 2_500_000;
+
 /// Builder for [`TagClient`].
 #[derive(Debug, Clone)]
 pub struct TagClientBuilder {
     host: String,
     port: u16,
     route_path: Option<String>,
+    use_connected: bool,
 }
 
 impl TagClientBuilder {
@@ -37,6 +57,7 @@ impl TagClientBuilder {
             host: host.into(),
             port: EIP_PORT,
             route_path: None,
+            use_connected: false,
         }
     }
 
@@ -56,7 +77,15 @@ impl TagClientBuilder {
         self
     }
 
-    /// Open the TCP session and register.
+    /// Open a Class 3 explicit connection at register time and use
+    /// `SendUnitData` for every subsequent request. Slightly cheaper per
+    /// round-trip once the connection is up, and required by some peers.
+    pub fn use_connected(mut self, on: bool) -> Self {
+        self.use_connected = on;
+        self
+    }
+
+    /// Open the TCP session, register, and (optionally) open Class 3.
     pub async fn connect(self) -> Result<TagClient> {
         let route = match &self.route_path {
             Some(spec) => parse_route_path(spec).ok_or_else(|| {
@@ -66,11 +95,23 @@ impl TagClientBuilder {
         };
         let addr = format!("{}:{}", self.host, self.port);
         let session = EipSession::connect_and_register(addr).await?;
-        Ok(TagClient {
+        let mut client = TagClient {
             session,
             route_path: route,
             atoms: AtomCache::new(),
-        })
+            use_connected: self.use_connected,
+            class3_open: false,
+            oto_t_conn_id: 0,
+            tto_o_conn_id: 0,
+            conn_serial: 0,
+            orig_vendor: DEFAULT_ORIG_VENDOR,
+            orig_serial: 0,
+            seq_count: 0,
+        };
+        if client.use_connected {
+            client.open_class3().await?;
+        }
+        Ok(client)
     }
 }
 
@@ -79,6 +120,14 @@ pub struct TagClient {
     session: EipSession,
     route_path: Vec<u8>,
     atoms: AtomCache,
+    use_connected: bool,
+    class3_open: bool,
+    oto_t_conn_id: u32,
+    tto_o_conn_id: u32,
+    conn_serial: u16,
+    orig_vendor: u16,
+    orig_serial: u32,
+    seq_count: u16,
 }
 
 impl TagClient {
@@ -95,6 +144,11 @@ impl TagClient {
     /// Peer session handle (0 before register succeeds).
     pub fn session_handle(&self) -> u32 {
         self.session.session_handle()
+    }
+
+    /// True while a Class 3 explicit connection is open.
+    pub fn is_class3_open(&self) -> bool {
+        self.class3_open
     }
 
     /// Read a single element from a tag, decoded as [`TagValue`].
@@ -268,7 +322,7 @@ impl TagClient {
                 // Program-scope enumeration: prefix the Symbol Object path with
                 // a symbolic segment naming the program so the controller
                 // resolves the right scope.
-                let mut anchored = ethernetip_core::path::EpathWriter::new();
+                let mut anchored = EpathWriter::new();
                 anchored.push_symbolic(&format!("Program:{}", program));
                 anchored.extend_from_slice(&path);
                 build_mr_request(service_code, anchored.as_bytes(), &body)
@@ -297,17 +351,28 @@ impl TagClient {
         Ok(all)
     }
 
-    /// Cleanly unregister and close the socket.
-    pub async fn close(self) -> Result<()> {
+    /// Cleanly close the Class 3 connection (if any), unregister, and close
+    /// the socket.
+    pub async fn close(mut self) -> Result<()> {
+        if self.class3_open {
+            let _ = self.close_class3().await;
+        }
         self.session.close().await
     }
 
-    /// Wrap the MR request per routing configuration and exchange one round.
     async fn dispatch(&mut self, mr: Vec<u8>) -> Result<Vec<u8>> {
-        let payload = if self.route_path.is_empty() {
-            mr
+        if self.class3_open {
+            return self.send_connected(mr).await;
+        }
+        let route = self.route_path.clone();
+        self.dispatch_unconnected(&mr, &route).await
+    }
+
+    async fn dispatch_unconnected(&mut self, mr: &[u8], route: &[u8]) -> Result<Vec<u8>> {
+        let payload = if route.is_empty() {
+            mr.to_vec()
         } else {
-            wrap_unconnected_send(&mr, &self.route_path)
+            wrap_unconnected_send(mr, route)
         };
         let items = [
             Item::null_address(),
@@ -319,5 +384,127 @@ impl TagClient {
             .ok_or_else(|| EipError::Protocol("reply missing UnconnectedData item".into()))?;
         Ok(data.data.clone())
     }
-}
 
+    async fn send_connected(&mut self, mr: Vec<u8>) -> Result<Vec<u8>> {
+        self.seq_count = self.seq_count.wrapping_add(1);
+        let mut cd = Vec::with_capacity(2 + mr.len());
+        cd.extend_from_slice(&self.seq_count.to_le_bytes());
+        cd.extend_from_slice(&mr);
+        let items = [
+            Item::new(
+                item_type::CONNECTED_ADDRESS,
+                self.oto_t_conn_id.to_le_bytes().to_vec(),
+            ),
+            Item::new(item_type::CONNECTED_DATA, cd),
+        ];
+        let envelope = self.session.send_unit_data(&items).await?;
+        let item = envelope
+            .find(item_type::CONNECTED_DATA)
+            .ok_or_else(|| EipError::Protocol("connected reply missing data item".into()))?;
+        if item.data.len() < 2 {
+            return Err(EipError::Short {
+                expected: 2,
+                actual: item.data.len(),
+            });
+        }
+        // Skip the 2-byte reply sequence count so the caller sees only the MR.
+        Ok(item.data[2..].to_vec())
+    }
+
+    async fn open_class3(&mut self) -> Result<()> {
+        let ticks = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| EipError::Protocol("system clock predates unix epoch".into()))?
+            .as_micros() as u64;
+        self.conn_serial = ((ticks & 0xFFFF) as u16).max(1);
+        self.orig_serial = ticks as u32;
+        self.tto_o_conn_id = 0x8000_0000u32 | (self.conn_serial as u32);
+        self.seq_count = 0;
+
+        // Application path = route bytes + Message Router (class 2 instance 1).
+        // The route is baked into the connection here so that per-request
+        // dispatch doesn't need to wrap in Unconnected_Send once the
+        // connection is up.
+        let mut app_path = self.route_path.clone();
+        app_path.extend_from_slice(&[0x20, 0x02, 0x24, 0x01]);
+
+        let mut fo = Vec::with_capacity(36 + app_path.len());
+        fo.push(0x07); // priority/tick
+        fo.push(0x09); // timeout ticks
+        fo.extend_from_slice(&0u32.to_le_bytes()); // O→T id = 0 (target picks)
+        fo.extend_from_slice(&self.tto_o_conn_id.to_le_bytes());
+        fo.extend_from_slice(&self.conn_serial.to_le_bytes());
+        fo.extend_from_slice(&self.orig_vendor.to_le_bytes());
+        fo.extend_from_slice(&self.orig_serial.to_le_bytes());
+        fo.push(0x03); // connection timeout multiplier (×32)
+        fo.extend_from_slice(&[0, 0, 0]); // reserved
+        fo.extend_from_slice(&CLASS3_RPI_US.to_le_bytes());
+        fo.extend_from_slice(&CLASS3_NET_PARAMS.to_le_bytes());
+        fo.extend_from_slice(&CLASS3_RPI_US.to_le_bytes());
+        fo.extend_from_slice(&CLASS3_NET_PARAMS.to_le_bytes());
+        fo.push(CLASS3_TRANSPORT);
+        fo.push((app_path.len() / 2) as u8);
+        fo.extend_from_slice(&app_path);
+
+        let cm_path = {
+            let mut w = EpathWriter::new();
+            w.push_class(class::CONNECTION_MANAGER);
+            w.push_instance(1);
+            w.into_bytes()
+        };
+        let mr = build_mr_request(service::FORWARD_OPEN, &cm_path, &fo);
+
+        // Forward_Open targets the LOCAL Connection Manager and must go as a
+        // bare MR request — the route lives inside the FO's connection_path,
+        // not wrapped around it. Send with an empty route to skip the UCS
+        // wrap in dispatch_unconnected.
+        let bytes = self.dispatch_unconnected(&mr, &[]).await?;
+        let header = ReplyHeader::parse(&bytes)?;
+        if header.general_status != status::SUCCESS {
+            return Err(EipError::Cip {
+                status: header.general_status,
+                ext: header.extended_status,
+            });
+        }
+        let body = &bytes[header.body_offset..];
+        if body.len() < 4 {
+            return Err(EipError::Short {
+                expected: 4,
+                actual: body.len(),
+            });
+        }
+        self.oto_t_conn_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        self.class3_open = true;
+        Ok(())
+    }
+
+    async fn close_class3(&mut self) -> Result<()> {
+        if !self.class3_open {
+            return Ok(());
+        }
+        self.class3_open = false;
+
+        let mut app_path = self.route_path.clone();
+        app_path.extend_from_slice(&[0x20, 0x02, 0x24, 0x01]);
+
+        let mut close_data = Vec::with_capacity(12 + app_path.len());
+        close_data.push(0x07);
+        close_data.push(0x09);
+        close_data.extend_from_slice(&self.conn_serial.to_le_bytes());
+        close_data.extend_from_slice(&self.orig_vendor.to_le_bytes());
+        close_data.extend_from_slice(&self.orig_serial.to_le_bytes());
+        close_data.push((app_path.len() / 2) as u8);
+        close_data.push(0); // reserved
+        close_data.extend_from_slice(&app_path);
+
+        let cm_path = {
+            let mut w = EpathWriter::new();
+            w.push_class(class::CONNECTION_MANAGER);
+            w.push_instance(1);
+            w.into_bytes()
+        };
+        let mr = build_mr_request(service::FORWARD_CLOSE, &cm_path, &close_data);
+        let _ = self.dispatch_unconnected(&mr, &[]).await;
+        Ok(())
+    }
+}

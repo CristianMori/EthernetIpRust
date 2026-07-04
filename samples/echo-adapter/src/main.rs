@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
 
     let mut tcp_bind: SocketAddr = "0.0.0.0:44818".parse().unwrap();
     let mut udp_bind: SocketAddr = SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT));
+    let mut peer_udp_port: u16 = IO_UDP_PORT;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -43,6 +44,12 @@ async fn main() -> Result<()> {
                 udp_bind = args
                     .next()
                     .context("--udp needs a bind spec like 0.0.0.0:2222")?
+                    .parse()?;
+            }
+            "--peer-udp-port" => {
+                peer_udp_port = args
+                    .next()
+                    .context("--peer-udp-port needs a number")?
                     .parse()?;
             }
             other => anyhow::bail!("unexpected argument `{}`", other),
@@ -67,7 +74,8 @@ async fn main() -> Result<()> {
     let handle = start_adapter(
         AdapterConfig::new(assemblies.clone())
             .tcp_bind(tcp_bind)
-            .udp_bind(udp_bind),
+            .udp_bind(udp_bind)
+            .peer_udp_port(peer_udp_port),
     )
     .await?;
 

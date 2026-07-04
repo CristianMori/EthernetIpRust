@@ -1,0 +1,12 @@
+[package]
+name = "echo-scanner"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ethernetip-connections = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

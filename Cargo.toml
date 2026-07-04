@@ -6,6 +6,7 @@ members = [
     "crates/ethernetip-connections",
     "samples/logix-tag-read",
     "samples/echo-adapter",
+    "samples/echo-scanner",
 ]
 
 [workspace.package]

@@ -48,6 +48,10 @@ pub struct AdapterConfig {
     /// data payload (and to emit one on every T→O payload). Logix scanners
     /// use this for the Generic Ethernet Module profile.
     pub run_idle_header: bool,
+    /// UDP destination port for T→O producer packets. Defaults to the
+    /// well-known [`IO_UDP_PORT`]. Overriding is useful for host-local
+    /// interop tests where the scanner has to bind a different port.
+    pub peer_udp_port: u16,
 }
 
 impl AdapterConfig {
@@ -57,6 +61,7 @@ impl AdapterConfig {
             udp_bind: SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT)),
             assemblies,
             run_idle_header: true,
+            peer_udp_port: IO_UDP_PORT,
         }
     }
 
@@ -72,6 +77,11 @@ impl AdapterConfig {
 
     pub fn run_idle_header(mut self, on: bool) -> Self {
         self.run_idle_header = on;
+        self
+    }
+
+    pub fn peer_udp_port(mut self, port: u16) -> Self {
+        self.peer_udp_port = port;
         self
     }
 }
@@ -181,6 +191,7 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
         udp: udp.clone(),
         next_conn_id,
         run_idle,
+        peer_udp_port: cfg.peer_udp_port,
     };
     let accept_task = tokio::spawn(accept_state.run(tcp, shutdown_rx));
 
@@ -203,6 +214,7 @@ struct AcceptState {
     udp: Arc<UdpSocket>,
     next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
+    peer_udp_port: u16,
 }
 
 impl AcceptState {
@@ -228,6 +240,7 @@ impl AcceptState {
                         udp: self.udp.clone(),
                         next_conn_id: self.next_conn_id.clone(),
                         run_idle: self.run_idle,
+                        peer_udp_port: self.peer_udp_port,
                         session_handle: 0,
                         active_conn_id: None,
                     };
@@ -246,6 +259,7 @@ struct SessionState {
     udp: Arc<UdpSocket>,
     next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
+    peer_udp_port: u16,
     session_handle: u32,
     active_conn_id: Option<u32>,
 }
@@ -433,7 +447,7 @@ impl SessionState {
         let producer = ProducerState {
             connection_id: req.t_to_o_connection_id,
             udp: self.udp.clone(),
-            peer_udp: SocketAddr::new(self.peer.ip(), IO_UDP_PORT),
+            peer_udp: SocketAddr::new(self.peer.ip(), self.peer_udp_port),
             rpi_us: req.t_to_o_rpi_us,
             assemblies: self.assemblies.clone(),
             input_assembly: input_asm,
@@ -451,7 +465,7 @@ impl SessionState {
                     t_to_o_conn_id: req.t_to_o_connection_id,
                     input_assembly: input_asm,
                     output_assembly: output_asm,
-                    peer_udp: SocketAddr::new(self.peer.ip(), IO_UDP_PORT),
+                    peer_udp: SocketAddr::new(self.peer.ip(), self.peer_udp_port),
                     o_to_t_rpi_us: req.o_to_t_rpi_us,
                     t_to_o_rpi_us: req.t_to_o_rpi_us,
                     producer_shutdown: producer_shutdown_tx,

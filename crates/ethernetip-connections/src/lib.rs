@@ -12,10 +12,12 @@ pub mod adapter;
 pub mod assembly;
 pub mod epio;
 pub mod forward_open;
+pub mod scanner;
 
 pub use adapter::{
     start as start_adapter, AdapterConfig, AdapterHandle, ConnectionSummary, IO_UDP_PORT,
 };
+pub use scanner::{open_connection as open_scanner_connection, ScannerConfig, ScannerConnection};
 pub use assembly::{Assembly, AssemblyKind, AssemblyRegistry};
 pub use epio::{decode_frame, encode_frame, Frame};
 pub use forward_open::{

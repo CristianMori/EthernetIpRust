@@ -17,7 +17,7 @@ use crate::browse::{
     build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo,
 };
 use crate::request::{build_mr_request, wrap_unconnected_send};
-use crate::tag_path::encode_symbolic;
+use crate::tag_path::{encode_with_cache, AtomCache};
 use crate::types::{decode_read_tag, CipType, TagValue};
 
 /// Timeout advertised to the target on each unconnected request.
@@ -69,6 +69,7 @@ impl TagClientBuilder {
         Ok(TagClient {
             session,
             route_path: route,
+            atoms: AtomCache::new(),
         })
     }
 }
@@ -77,6 +78,7 @@ impl TagClientBuilder {
 pub struct TagClient {
     session: EipSession,
     route_path: Vec<u8>,
+    atoms: AtomCache,
 }
 
 impl TagClient {
@@ -109,7 +111,7 @@ impl TagClient {
     /// returned buffer always starts with the CIP type header (and struct CRC
     /// when applicable) so the caller can inspect it uniformly.
     pub async fn read_tag_raw(&mut self, name: &str, count: u16) -> Result<Vec<u8>> {
-        let path = encode_symbolic(name)?;
+        let path = encode_with_cache(name, &self.atoms)?;
         let body = count.to_le_bytes();
         let mr = build_mr_request(service::READ_TAG, &path, &body);
         let bytes = self.dispatch(mr).await?;
@@ -131,7 +133,7 @@ impl TagClient {
     /// Callers that already know the reply won't fit can skip the initial
     /// `Read_Tag` round-trip by calling this directly.
     pub async fn read_tag_fragmented(&mut self, name: &str, count: u16) -> Result<Vec<u8>> {
-        let path = encode_symbolic(name)?;
+        let path = encode_with_cache(name, &self.atoms)?;
         let mut assembled: Vec<u8> = Vec::new();
         let mut offset: u32 = 0;
 
@@ -210,7 +212,7 @@ impl TagClient {
 
     /// Send a `Write_Tag` with an already-built body (`type + count + data`).
     pub async fn write_tag_raw(&mut self, name: &str, body: &[u8]) -> Result<()> {
-        let path = encode_symbolic(name)?;
+        let path = encode_with_cache(name, &self.atoms)?;
         let mr = build_mr_request(service::WRITE_TAG, &path, body);
         let bytes = self.dispatch(mr).await?;
         let header = ReplyHeader::parse(&bytes)?;
@@ -223,16 +225,56 @@ impl TagClient {
         Ok(())
     }
 
-    /// Enumerate every controller-scope tag.
+    /// Enumerate every controller-scope tag and cache their instance IDs.
     ///
-    /// This does not yet recurse into program scopes; program-scope tags will
-    /// come back as `Program:<name>` entries so the caller can spot them.
+    /// After this returns, subsequent reads and writes of any discovered tag
+    /// use a Symbol Object logical instance segment instead of the full ANSI
+    /// symbolic segment, which is shorter on the wire.
+    ///
+    /// Program-scope tags surface as `Program:<name>` entries so the caller
+    /// knows they exist; recursing into a specific program is done via
+    /// [`Self::browse_program_tags`].
     pub async fn browse_tags(&mut self) -> Result<Vec<TagInfo>> {
+        let all = self.enumerate_symbols(None).await?;
+        for entry in &all {
+            self.atoms.insert_controller(&entry.name, entry.instance_id);
+        }
+        Ok(all)
+    }
+
+    /// Enumerate tags in the given program scope (without the `Program:`
+    /// prefix) and cache their instance IDs in the program-atom map.
+    pub async fn browse_program_tags(&mut self, program: &str) -> Result<Vec<TagInfo>> {
+        let mut all = self.enumerate_symbols(Some(program)).await?;
+        for entry in &mut all {
+            entry.category = TagCategory::Program;
+            self.atoms
+                .insert_program(program, &entry.name, entry.instance_id);
+        }
+        Ok(all)
+    }
+
+    /// Read-only view of the instance-ID cache.
+    pub fn atom_cache(&self) -> &AtomCache {
+        &self.atoms
+    }
+
+    async fn enumerate_symbols(&mut self, program: Option<&str>) -> Result<Vec<TagInfo>> {
         let mut all = Vec::new();
         let mut cursor = 0u32;
         loop {
             let (service_code, path, body) = build_symbol_list_request(cursor);
-            let mr = build_mr_request(service_code, &path, &body);
+            let mr = if let Some(program) = program {
+                // Program-scope enumeration: prefix the Symbol Object path with
+                // a symbolic segment naming the program so the controller
+                // resolves the right scope.
+                let mut anchored = ethernetip_core::path::EpathWriter::new();
+                anchored.push_symbolic(&format!("Program:{}", program));
+                anchored.extend_from_slice(&path);
+                build_mr_request(service_code, anchored.as_bytes(), &body)
+            } else {
+                build_mr_request(service_code, &path, &body)
+            };
             let bytes = self.dispatch(mr).await?;
             let (chunk, last, done) = parse_symbol_chunk(&bytes)?;
             let empty = chunk.is_empty();
@@ -241,8 +283,6 @@ impl TagClient {
                 break;
             }
             if empty {
-                // Guard against a target that returns partial_transfer but no
-                // new instances — otherwise we'd spin forever.
                 return Err(EipError::Protocol(
                     "browse stalled: partial transfer with no entries".into(),
                 ));

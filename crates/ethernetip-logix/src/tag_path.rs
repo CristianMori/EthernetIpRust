@@ -7,22 +7,141 @@
 //! * nested arrays — `Temp[10].AnotherArray[4]`
 //! * program scope — `Program:MainProgram.MyLocal`
 //!
-//! The program-scope prefix `Program:Name` is emitted as a single ANSI
-//! symbolic segment (not split on the `:`).
+//! When an [`AtomCache`] is provided (populated by `TagClient::browse_tags`),
+//! the first-level tag name is replaced with a Symbol Object logical instance
+//! segment — smaller on the wire than the full ANSI symbolic segment, and
+//! immune to name-length limits.
+
+use std::collections::HashMap;
 
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
 
-/// Encode a Logix tag name into a Message Router path.
+/// Two-level cache of Logix Symbol Object instance IDs.
 ///
-/// Returns the raw EPATH bytes (no leading `path_size` byte — that gets added
-/// by the request builder because it also needs to include the service code).
+/// * `controller` maps every controller-scope tag name to its Symbol Object
+///   instance id (including the `Program:<name>` symbols that anchor program
+///   scopes).
+/// * `programs` maps a program name (without the `Program:` prefix) to the
+///   instance ids of its local tags.
+#[derive(Debug, Default, Clone)]
+pub struct AtomCache {
+    controller: HashMap<String, u32>,
+    programs: HashMap<String, HashMap<String, u32>>,
+}
+
+impl AtomCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_controller(&mut self, name: impl Into<String>, id: u32) {
+        self.controller.insert(name.into(), id);
+    }
+
+    pub fn insert_program(
+        &mut self,
+        program: impl Into<String>,
+        name: impl Into<String>,
+        id: u32,
+    ) {
+        self.programs
+            .entry(program.into())
+            .or_default()
+            .insert(name.into(), id);
+    }
+
+    pub fn get_controller(&self, name: &str) -> Option<u32> {
+        self.controller.get(name).copied()
+    }
+
+    pub fn get_program(&self, program: &str, name: &str) -> Option<u32> {
+        self.programs.get(program)?.get(name).copied()
+    }
+
+    pub fn clear(&mut self) {
+        self.controller.clear();
+        self.programs.clear();
+    }
+
+    pub fn controller_len(&self) -> usize {
+        self.controller.len()
+    }
+}
+
+/// Encode a Logix tag name into a Message Router path with no cache lookups.
+///
+/// Equivalent to calling [`encode_with_cache`] with an empty [`AtomCache`].
 pub fn encode_symbolic(name: &str) -> Result<Vec<u8>> {
+    encode_with_cache(name, &AtomCache::new())
+}
+
+/// Encode a Logix tag name, substituting Symbol Object instance segments for
+/// the first-level identifier(s) when the cache has an entry.
+pub fn encode_with_cache(name: &str, cache: &AtomCache) -> Result<Vec<u8>> {
     if name.is_empty() {
         return Err(EipError::Protocol("empty tag name".into()));
     }
+    let segments = split_dotted(name);
     let mut writer = EpathWriter::new();
-    for (idx, segment) in split_dotted(name).into_iter().enumerate() {
+    let mut consumed = 0usize;
+
+    // Case 1: program-scope tag with both anchors cached
+    //         → sym("Program:X") + INST(local_id)
+    if segments.len() >= 2 {
+        if let Some(program_tail) = segments[0].strip_prefix("Program:") {
+            let (program, program_idx) = split_indexers(segments[0])?;
+            if !program_idx.is_empty() {
+                return Err(EipError::Protocol(format!(
+                    "program-scope prefix cannot carry an index: `{}`",
+                    segments[0]
+                )));
+            }
+            let (local_name, local_idx) = split_indexers(segments[1])?;
+            if program_tail.is_empty() || local_name.is_empty() {
+                return Err(EipError::Protocol(format!(
+                    "empty component in `{}`",
+                    name
+                )));
+            }
+            if let Some(local_id) = cache.get_program(program_tail, local_name) {
+                writer.push_symbolic(program);
+                writer.push_instance(local_id);
+                for idx in local_idx {
+                    writer.push_element(idx);
+                }
+                consumed = 2;
+            }
+        }
+    }
+
+    // Case 2: controller-scope tag whose first segment is cached
+    //         → INST(controller_id).
+    //
+    // Skip this shortcut for `Program:X` anchors — Logix will not accept a
+    // program instance segment without the leading symbolic marker.
+    if consumed == 0 {
+        let (first, first_idx) = split_indexers(segments[0])?;
+        if first.is_empty() {
+            return Err(EipError::Protocol(format!(
+                "empty path component in `{}`",
+                name
+            )));
+        }
+        if !first.starts_with("Program:") {
+            if let Some(id) = cache.get_controller(first) {
+                writer.push_instance(id);
+                for idx in first_idx {
+                    writer.push_element(idx);
+                }
+                consumed = 1;
+            }
+        }
+    }
+
+    // Anything not covered by the cache falls through to full ANSI symbolic
+    // segments, one per remaining dotted component.
+    for segment in &segments[consumed..] {
         let (base, indices) = split_indexers(segment)?;
         if base.is_empty() {
             return Err(EipError::Protocol(format!(
@@ -30,7 +149,7 @@ pub fn encode_symbolic(name: &str) -> Result<Vec<u8>> {
                 name
             )));
         }
-        if idx == 0 {
+        if consumed == 0 {
             if let Some(program_tail) = base.strip_prefix("Program:") {
                 if program_tail.is_empty() {
                     return Err(EipError::Protocol("empty program name".into()));
@@ -41,7 +160,9 @@ pub fn encode_symbolic(name: &str) -> Result<Vec<u8>> {
         for element in indices {
             writer.push_element(element);
         }
+        consumed = consumed.saturating_add(1);
     }
+
     Ok(writer.into_bytes())
 }
 
@@ -103,10 +224,7 @@ mod tests {
     #[test]
     fn indexed() {
         let p = encode_symbolic("Arr[3]").unwrap();
-        assert_eq!(
-            p,
-            vec![0x91, 0x03, b'A', b'r', b'r', 0x00, 0x28, 0x03]
-        );
+        assert_eq!(p, vec![0x91, 0x03, b'A', b'r', b'r', 0x00, 0x28, 0x03]);
     }
 
     #[test]
@@ -133,7 +251,6 @@ mod tests {
     #[test]
     fn program_scope() {
         let p = encode_symbolic("Program:MainProgram.Local").unwrap();
-        // Program:MainProgram is 19 chars (odd) => padded, then "Local" is 5 chars (odd) => padded.
         assert_eq!(&p[..2], &[0x91, 0x13]);
         assert_eq!(&p[2..21], b"Program:MainProgram");
         assert_eq!(p[21], 0x00);
@@ -144,18 +261,77 @@ mod tests {
 
     #[test]
     fn large_index() {
-        // 0x100 should use 16-bit form.
         let p = encode_symbolic("Big[256]").unwrap();
         assert_eq!(
             p,
-            vec![
-                0x91, 0x03, b'B', b'i', b'g', 0x00, 0x29, 0x00, 0x00, 0x01
-            ]
+            vec![0x91, 0x03, b'B', b'i', b'g', 0x00, 0x29, 0x00, 0x00, 0x01]
         );
     }
 
     #[test]
     fn rejects_unbalanced() {
         assert!(encode_symbolic("Bad[1").is_err());
+    }
+
+    #[test]
+    fn cached_controller_tag_uses_instance_segment() {
+        let mut cache = AtomCache::new();
+        cache.insert_controller("FreeRunningTimer", 0x42);
+        let p = encode_with_cache("FreeRunningTimer", &cache).unwrap();
+        assert_eq!(p, vec![0x24, 0x42]);
+    }
+
+    #[test]
+    fn cached_controller_tag_with_member() {
+        let mut cache = AtomCache::new();
+        cache.insert_controller("Motor", 7);
+        let p = encode_with_cache("Motor.Speed", &cache).unwrap();
+        assert_eq!(
+            p,
+            vec![0x24, 0x07, 0x91, 0x05, b'S', b'p', b'e', b'e', b'd', 0x00]
+        );
+    }
+
+    #[test]
+    fn cached_controller_tag_with_index_and_member() {
+        let mut cache = AtomCache::new();
+        cache.insert_controller("Arr", 3);
+        let p = encode_with_cache("Arr[5].Sub", &cache).unwrap();
+        assert_eq!(
+            p,
+            vec![0x24, 0x03, 0x28, 0x05, 0x91, 0x03, b'S', b'u', b'b', 0x00]
+        );
+    }
+
+    #[test]
+    fn cached_program_scope() {
+        let mut cache = AtomCache::new();
+        cache.insert_controller("Program:MainProgram", 4);
+        cache.insert_program("MainProgram", "Framework", 2);
+        let p = encode_with_cache("Program:MainProgram.Framework", &cache).unwrap();
+        assert_eq!(&p[..2], &[0x91, 0x13]);
+        assert_eq!(&p[2..21], b"Program:MainProgram");
+        assert_eq!(p[21], 0x00);
+        assert_eq!(&p[22..24], &[0x24, 0x02]);
+    }
+
+    #[test]
+    fn cache_miss_falls_back_to_symbolic() {
+        let cache = AtomCache::new();
+        let cached = encode_with_cache("UnknownTag", &cache).unwrap();
+        let bare = encode_symbolic("UnknownTag").unwrap();
+        assert_eq!(cached, bare);
+    }
+
+    #[test]
+    fn program_prefix_never_uses_bare_instance() {
+        // Even when Program:X is in the controller cache, we must not emit
+        // INST(id) as the first segment — Logix rejects that form. Falling
+        // back to a symbolic Program:X segment keeps the read valid.
+        let mut cache = AtomCache::new();
+        cache.insert_controller("Program:MainProgram", 4);
+        let p = encode_with_cache("Program:MainProgram.Framework", &cache).unwrap();
+        assert_eq!(&p[..2], &[0x91, 0x13]);
+        assert_eq!(&p[2..21], b"Program:MainProgram");
     }
 }

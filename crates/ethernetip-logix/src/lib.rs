@@ -11,6 +11,7 @@ pub mod types;
 
 pub use browse::{TagCategory, TagInfo};
 pub use tag_client::{TagClient, TagClientBuilder};
+pub use tag_path::AtomCache;
 pub use types::{CipType, TagValue};
 
 pub use ethernetip_core::{EipError, Result};

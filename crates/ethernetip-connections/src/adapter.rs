@@ -628,7 +628,10 @@ impl ProducerState {
                     let frame = Frame {
                         connection_id: self.connection_id,
                         sequence: seq,
-                        run_idle: if self.run_idle { Some(true) } else { None },
+                        cip_sequence: seq as u16,
+                        // Run/idle header is O->T only per the Generic Ethernet
+                        // Module profile — adapters don't emit it on T->O.
+                        run_idle: None,
                         data,
                     };
                     let bytes = epio::encode_frame(&frame);

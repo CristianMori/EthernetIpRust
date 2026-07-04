@@ -8,7 +8,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use ethernetip_core::cpf::{item_type, Envelope, Item};
+use ethernetip_core::cpf::item_type;
 use ethernetip_core::error::{EipError, Result};
 
 /// Sequenced Address item type id.
@@ -18,7 +18,14 @@ pub const SEQUENCED_ADDRESS: u16 = 0x8002;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub connection_id: u32,
+    /// Encapsulation (CPF Sequenced Address) sequence number — a monotonically
+    /// increasing counter carried alongside the connection id so a receiver
+    /// can detect UDP reordering / loss.
     pub sequence: u32,
+    /// CIP Class 1 sequence count — a per-connection u16 that lives inside
+    /// the ConnectedData payload and increments once per produced frame.
+    /// Distinct from the CPF sequence above.
+    pub cip_sequence: u16,
     /// Optional run/idle header — `Some(true)` for run, `Some(false)` for idle,
     /// `None` when the connection format has no run/idle header.
     pub run_idle: Option<bool>,
@@ -26,59 +33,111 @@ pub struct Frame {
 }
 
 /// Encode an EPIO frame. When `run_idle` is `Some`, the four run/idle header
-/// bytes are prepended to the connected-data item so the receiver knows how
-/// to distinguish idle heartbeats from actual data updates.
+/// bytes are prepended to the connected-data payload so the receiver knows
+/// how to distinguish idle heartbeats from actual data updates.
+///
+/// Unlike the CPF envelope used inside TCP `SendRRData` / `SendUnitData`,
+/// UDP EPIO frames start directly at the item count — no leading
+/// `interface_handle` / `timeout` prefix.
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {
-    let mut sa = BytesMut::with_capacity(8);
-    sa.put_u32_le(frame.connection_id);
-    sa.put_u32_le(frame.sequence);
-    let mut cd = Vec::with_capacity(4 + frame.data.len());
+    let run_idle_bytes = if frame.run_idle.is_some() { 4 } else { 0 };
+    // Payload = CIP seq (2) + [run/idle (4)] + app data
+    let payload_len = 2 + run_idle_bytes + frame.data.len();
+    let total = 2 + 4 + 8 + 4 + payload_len;
+    let mut buf = BytesMut::with_capacity(total);
+    buf.put_u16_le(2); // item count
+    buf.put_u16_le(SEQUENCED_ADDRESS);
+    buf.put_u16_le(8);
+    buf.put_u32_le(frame.connection_id);
+    buf.put_u32_le(frame.sequence);
+    buf.put_u16_le(item_type::CONNECTED_DATA);
+    buf.put_u16_le(payload_len as u16);
+    buf.put_u16_le(frame.cip_sequence);
     if let Some(run) = frame.run_idle {
-        cd.extend_from_slice(&(if run { 1u32 } else { 0u32 }).to_le_bytes());
+        buf.put_u32_le(if run { 1 } else { 0 });
     }
-    cd.extend_from_slice(&frame.data);
-    let items = [
-        Item::new(SEQUENCED_ADDRESS, sa.to_vec()),
-        Item::new(item_type::CONNECTED_DATA, cd),
-    ];
-    ethernetip_core::cpf::encode_envelope(0, 0, &items)
+    buf.put_slice(&frame.data);
+    buf.to_vec()
 }
 
 /// Decode an EPIO frame. `expect_run_idle` tells the decoder whether the
 /// connection was opened with a 32-bit run/idle header — the receiver has to
 /// know this because it's not self-describing on the wire.
+///
+/// UDP EPIO frames start with the item count directly (no envelope prefix),
+/// which is why this decoder walks the byte stream by hand instead of going
+/// through the shared TCP CPF envelope parser.
 pub fn decode_frame(bytes: &[u8], expect_run_idle: bool) -> Result<Frame> {
-    let envelope = Envelope::parse(bytes)?;
-    let sa = envelope
-        .find(SEQUENCED_ADDRESS)
-        .ok_or_else(|| EipError::Protocol("EPIO frame missing SequencedAddress item".into()))?;
-    let cd = envelope
-        .find(item_type::CONNECTED_DATA)
-        .ok_or_else(|| EipError::Protocol("EPIO frame missing ConnectedData item".into()))?;
-    if sa.data.len() < 8 {
+    if bytes.len() < 18 {
         return Err(EipError::Short {
-            expected: 8,
-            actual: sa.data.len(),
+            expected: 18,
+            actual: bytes.len(),
         });
     }
-    let mut cur = sa.data.as_slice();
+    let mut cur = bytes;
+    let item_count = cur.get_u16_le();
+    if item_count < 2 {
+        return Err(EipError::Protocol(format!(
+            "EPIO frame item count {} < 2",
+            item_count
+        )));
+    }
+    let addr_type = cur.get_u16_le();
+    let addr_len = cur.get_u16_le();
+    if addr_type != SEQUENCED_ADDRESS || addr_len != 8 {
+        return Err(EipError::Protocol(format!(
+            "EPIO frame not SequencedAddress: type=0x{:04X} len={}",
+            addr_type, addr_len
+        )));
+    }
     let connection_id = cur.get_u32_le();
     let sequence = cur.get_u32_le();
+
+    if cur.remaining() < 4 {
+        return Err(EipError::Short {
+            expected: 4,
+            actual: cur.remaining(),
+        });
+    }
+    let data_type = cur.get_u16_le();
+    let data_len = cur.get_u16_le() as usize;
+    if data_type != item_type::CONNECTED_DATA {
+        return Err(EipError::Protocol(format!(
+            "EPIO frame data item type 0x{:04X} != 0x00B1",
+            data_type
+        )));
+    }
+    if cur.remaining() < data_len {
+        return Err(EipError::Short {
+            expected: data_len,
+            actual: cur.remaining(),
+        });
+    }
+    let payload = &cur[..data_len];
+    if payload.len() < 2 {
+        return Err(EipError::Short {
+            expected: 2,
+            actual: payload.len(),
+        });
+    }
+    let cip_sequence = u16::from_le_bytes([payload[0], payload[1]]);
+    let after_seq = &payload[2..];
     let (run_idle, data) = if expect_run_idle {
-        if cd.data.len() < 4 {
+        if after_seq.len() < 4 {
             return Err(EipError::Short {
                 expected: 4,
-                actual: cd.data.len(),
+                actual: after_seq.len(),
             });
         }
-        let hdr = u32::from_le_bytes([cd.data[0], cd.data[1], cd.data[2], cd.data[3]]);
-        (Some((hdr & 1) != 0), cd.data[4..].to_vec())
+        let hdr = u32::from_le_bytes([after_seq[0], after_seq[1], after_seq[2], after_seq[3]]);
+        (Some((hdr & 1) != 0), after_seq[4..].to_vec())
     } else {
-        (None, cd.data.clone())
+        (None, after_seq.to_vec())
     };
     Ok(Frame {
         connection_id,
         sequence,
+        cip_sequence,
         run_idle,
         data,
     })
@@ -93,6 +152,7 @@ mod tests {
         let frame = Frame {
             connection_id: 0xDEAD_BEEF,
             sequence: 42,
+            cip_sequence: 7,
             run_idle: Some(true),
             data: vec![0x11, 0x22, 0x33, 0x44],
         };
@@ -106,6 +166,7 @@ mod tests {
         let frame = Frame {
             connection_id: 0x1234,
             sequence: 1,
+            cip_sequence: 99,
             run_idle: None,
             data: b"payload".to_vec(),
         };
@@ -119,6 +180,7 @@ mod tests {
         let frame = Frame {
             connection_id: 1,
             sequence: 0,
+            cip_sequence: 0,
             run_idle: Some(false),
             data: vec![],
         };

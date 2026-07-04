@@ -464,6 +464,7 @@ impl ProducerState {
                     let epio = Frame {
                         connection_id: self.connection_id,
                         sequence: seq,
+                        cip_sequence: seq as u16,
                         run_idle: None, // safety frames carry their own run/idle in mode byte
                         data: wire,
                     };

@@ -487,7 +487,8 @@ impl ConsumerState {
                             continue;
                         }
                     };
-                    let frame = match epio::decode_frame(&buf[..n], self.run_idle) {
+                    // T->O frames don't carry the run/idle header (that's O->T only).
+                    let frame = match epio::decode_frame(&buf[..n], false) {
                         Ok(f) => f,
                         Err(err) => {
                             tracing::debug!("epio decode error: {err}");
@@ -538,6 +539,7 @@ impl ProducerState {
                     let frame = Frame {
                         connection_id: self.connection_id,
                         sequence: seq,
+                        cip_sequence: seq as u16,
                         run_idle: if self.run_idle { Some(true) } else { None },
                         data,
                     };

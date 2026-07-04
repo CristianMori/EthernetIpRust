@@ -636,6 +636,7 @@ impl TcooLoop {
                     let epio = Frame {
                         connection_id: conn_id,
                         sequence: seq_next,
+                        cip_sequence: seq_next as u16,
                         run_idle: None,
                         data: buf[..n].to_vec(),
                     };

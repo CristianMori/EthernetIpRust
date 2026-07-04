@@ -103,21 +103,92 @@ impl TagClient {
 
     /// Read `count` elements as the raw wire bytes (type header + payload).
     ///
-    /// Structures come back with the `0x02A0` type header intact so the caller
-    /// can inspect the CRC handle.
+    /// When the target answers `PARTIAL_TRANSFER` or `REPLY_TOO_LARGE` — the
+    /// typical case for structures and long strings — the read transparently
+    /// switches to `Read_Tag_Fragmented` and reassembles the chunks. The
+    /// returned buffer always starts with the CIP type header (and struct CRC
+    /// when applicable) so the caller can inspect it uniformly.
     pub async fn read_tag_raw(&mut self, name: &str, count: u16) -> Result<Vec<u8>> {
         let path = encode_symbolic(name)?;
         let body = count.to_le_bytes();
         let mr = build_mr_request(service::READ_TAG, &path, &body);
         let bytes = self.dispatch(mr).await?;
         let header = ReplyHeader::parse(&bytes)?;
-        if header.general_status != status::SUCCESS {
-            return Err(EipError::Cip {
+        match header.general_status {
+            status::SUCCESS => Ok(bytes[header.body_offset..].to_vec()),
+            status::PARTIAL_TRANSFER | status::REPLY_TOO_LARGE => {
+                self.read_tag_fragmented(name, count).await
+            }
+            _ => Err(EipError::Cip {
                 status: header.general_status,
                 ext: header.extended_status,
-            });
+            }),
         }
-        Ok(bytes[header.body_offset..].to_vec())
+    }
+
+    /// Force a fragmented read regardless of size.
+    ///
+    /// Callers that already know the reply won't fit can skip the initial
+    /// `Read_Tag` round-trip by calling this directly.
+    pub async fn read_tag_fragmented(&mut self, name: &str, count: u16) -> Result<Vec<u8>> {
+        let path = encode_symbolic(name)?;
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut offset: u32 = 0;
+
+        loop {
+            let mut body = Vec::with_capacity(6);
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&offset.to_le_bytes());
+            let mr = build_mr_request(service::READ_TAG_FRAGMENTED, &path, &body);
+            let bytes = self.dispatch(mr).await?;
+            let header = ReplyHeader::parse(&bytes)?;
+            let done = match header.general_status {
+                status::SUCCESS => true,
+                status::PARTIAL_TRANSFER => false,
+                _ => {
+                    return Err(EipError::Cip {
+                        status: header.general_status,
+                        ext: header.extended_status,
+                    });
+                }
+            };
+            let chunk = &bytes[header.body_offset..];
+            if chunk.len() < 2 {
+                return Err(EipError::Short {
+                    expected: 2,
+                    actual: chunk.len(),
+                });
+            }
+            let type_code = u16::from_le_bytes([chunk[0], chunk[1]]);
+            // Struct replies carry a 2-byte type marker plus a 2-byte CRC handle
+            // in every fragment; atomic replies just carry the 2-byte type code.
+            let prefix = if type_code == CipType::Struct as u16 {
+                4
+            } else {
+                2
+            };
+            if chunk.len() < prefix {
+                return Err(EipError::Short {
+                    expected: prefix,
+                    actual: chunk.len(),
+                });
+            }
+            if assembled.is_empty() {
+                assembled.extend_from_slice(&chunk[..prefix]);
+            }
+            let payload = &chunk[prefix..];
+            assembled.extend_from_slice(payload);
+            offset = offset.saturating_add(payload.len() as u32);
+            if done {
+                break;
+            }
+            if payload.is_empty() {
+                return Err(EipError::Protocol(
+                    "fragmented read stalled: partial transfer with empty chunk".into(),
+                ));
+            }
+        }
+        Ok(assembled)
     }
 
     /// Write a single-element atomic tag. Structures are not yet supported

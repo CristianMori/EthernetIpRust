@@ -442,11 +442,18 @@ impl SessionState {
         let assigned_oto_t = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
         self.active_conn_id = Some(assigned_oto_t);
 
-        // Producer task: push T→O EPIO at the actual RPI.
+        // Producer task: push T→O EPIO at the actual RPI on a *separate*
+        // ephemeral socket. Reusing the receive-side bind on port 2222 for
+        // sending confuses the loopback layer on Windows when both peers
+        // sit on the same port — the OS routes the reply back to the
+        // sender's own socket instead of the wildcard-bound consumer.
+        let send_udp = Arc::new(
+            tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?,
+        );
         let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
         let producer = ProducerState {
             connection_id: req.t_to_o_connection_id,
-            udp: self.udp.clone(),
+            udp: send_udp,
             peer_udp: SocketAddr::new(self.peer.ip(), self.peer_udp_port),
             rpi_us: req.t_to_o_rpi_us,
             assemblies: self.assemblies.clone(),

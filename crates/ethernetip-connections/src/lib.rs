@@ -8,10 +8,14 @@
 //! Higher-level actors (scanner / adapter) live in the modules that use these
 //! primitives — they will land in follow-up commits.
 
+pub mod adapter;
 pub mod assembly;
 pub mod epio;
 pub mod forward_open;
 
+pub use adapter::{
+    start as start_adapter, AdapterConfig, AdapterHandle, ConnectionSummary, IO_UDP_PORT,
+};
 pub use assembly::{Assembly, AssemblyKind, AssemblyRegistry};
 pub use epio::{decode_frame, encode_frame, Frame};
 pub use forward_open::{

@@ -5,6 +5,7 @@ members = [
     "crates/ethernetip-logix",
     "crates/ethernetip-connections",
     "samples/logix-tag-read",
+    "samples/echo-adapter",
 ]
 
 [workspace.package]
@@ -16,7 +17,7 @@ authors = ["Cristian Mori"]
 repository = "https://github.com/CristianMori/EthernetIPRust"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread", "macros", "sync", "signal"] }
 thiserror = "1"
 bytes = "1"
 tracing = "0.1"

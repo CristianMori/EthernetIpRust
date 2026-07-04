@@ -9,6 +9,8 @@ members = [
     "samples/echo-adapter",
     "samples/echo-scanner",
     "samples/logix-host",
+    "samples/safety-adapter",
+    "samples/safety-scanner",
 ]
 
 [workspace.package]

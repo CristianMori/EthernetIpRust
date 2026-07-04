@@ -1,5 +1,6 @@
 //! CIP Safety building blocks.
 
+pub mod adapter;
 pub mod cpcrc;
 pub mod crc;
 pub mod forward_open;
@@ -7,6 +8,8 @@ pub mod frame_codec;
 pub mod scanner;
 pub mod segment;
 pub mod types;
+
+pub use adapter::{start_safety_adapter, SafetyAdapterConfig, SafetyAdapterHandle};
 
 pub use forward_open::{
     build_safety_forward_open, SafetyAppReply, SafetyForwardOpenConfig, SafetyForwardOpenWire,

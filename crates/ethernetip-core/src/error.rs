@@ -1,3 +1,11 @@
+//! Central error type shared across every crate in the workspace.
+//!
+//! Each variant maps to a distinct wire / runtime failure — `Io` for socket
+//! problems, `Encap` for a non-zero encapsulation status, `Cip` for a non-zero
+//! CIP general status (with any extended-status words), `Short` for a
+//! truncated buffer, `Protocol` for a wire-structure mismatch, and the
+//! session-lifecycle variants for register / close bookkeeping.
+
 use std::io;
 use thiserror::Error;
 

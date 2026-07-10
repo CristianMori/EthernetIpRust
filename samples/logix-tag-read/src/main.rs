@@ -1,3 +1,18 @@
+//! Logix tag reader — talks to a real ControlLogix / CompactLogix (or the
+//! bundled `logix-host` sample) over EtherNet/IP, browses the controller's
+//! Symbol Object list, and reads one tag by name.
+//!
+//! Usage:
+//!   logix-tag-read [host] [--path 1,0] [--no-path] [--tag Name] [--connected]
+//!
+//!   host          — target PLC IP; default `192.168.1.96`.
+//!   --path 1,0    — libplctag-style routing (backplane port + slot); default `1,0`.
+//!   --no-path     — connect directly with no routing (CompactLogix / EN-hosted).
+//!   --tag Name    — read this specific tag; when omitted, the sample browses
+//!                   the tag list and auto-reads the first DINT it finds.
+//!   --connected   — open a Class 3 explicit connection at register time;
+//!                   subsequent reads ride SendUnitData.
+
 use std::env;
 use std::process::ExitCode;
 use std::time::Instant;

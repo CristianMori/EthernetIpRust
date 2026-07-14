@@ -64,7 +64,10 @@ impl SafetyScannerConfig {
     pub fn new(adapter_tcp: SocketAddr, server: SafetyForwardOpenConfig) -> Self {
         Self {
             adapter_tcp,
-            udp_bind: SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT)),
+            // Bind an ephemeral port by default so scanner and adapter can
+            // coexist on the same host without port trickery. The chosen
+            // endpoint is advertised to the target via Sockaddr Info T→O.
+            udp_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             route_prefix: Vec::new(),
             server,
             client: None,

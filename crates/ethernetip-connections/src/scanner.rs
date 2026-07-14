@@ -78,7 +78,12 @@ impl ScannerConfig {
     ) -> Self {
         Self {
             adapter_tcp,
-            udp_bind: SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT)),
+            // Bind an ephemeral port by default — mirrors how the C# /
+            // Python / C++ scanners behave in practice, and lets a scanner
+            // coexist with an adapter (which owns 2222) on the same host
+            // without any port trickery. The advertised endpoint gets
+            // handed to the target via Sockaddr Info T→O.
+            udp_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             config_assembly,
             o_to_t_assembly,
             t_to_o_assembly,

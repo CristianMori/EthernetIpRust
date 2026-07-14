@@ -673,7 +673,12 @@ impl TcooLoop {
                         // scanner picked and included as its own client_tto_o).
                         (
                             conn.t_to_o_conn_id,
-                            SocketAddr::new(conn.peer_udp.ip(), self.peer_udp_port),
+                            // Use the full tracked peer_udp — the consumer
+                            // keeps it in sync with the scanner's actual
+                            // (typically ephemeral) source endpoint, so
+                            // overriding the port here would send TCOO to
+                            // a socket the scanner isn't listening on.
+                            conn.peer_udp,
                             conn.cid_seed_s3,
                             (conn.last_ping & 0x03) as u8,
                         )

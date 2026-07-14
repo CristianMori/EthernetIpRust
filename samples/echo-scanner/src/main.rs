@@ -25,7 +25,11 @@ async fn main() -> Result<()> {
         .init();
 
     let mut adapter_addr: SocketAddr = "127.0.0.1:44818".parse().unwrap();
-    let mut udp_bind: SocketAddr = SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT));
+    // Default to an ephemeral UDP port so the scanner can coexist with a
+    // co-located adapter (which owns 2222) without a port conflict. The
+    // chosen endpoint gets handed to the adapter via Sockaddr Info T→O.
+    let mut udp_bind: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 0));
+    let _ = IO_UDP_PORT; // keep the import warning-free — 2222 is the default on the adapter side.
     let mut rpi_ms: u32 = 20;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {

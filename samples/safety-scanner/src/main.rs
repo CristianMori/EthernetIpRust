@@ -25,7 +25,9 @@ async fn main() -> Result<()> {
         .init();
 
     let mut adapter: SocketAddr = "127.0.0.1:44818".parse().unwrap();
-    let mut udp_bind: SocketAddr = "0.0.0.0:2222".parse().unwrap();
+    // Ephemeral default — the scanner's chosen endpoint is advertised via
+    // Sockaddr Info T→O so the adapter knows where to send safety frames.
+    let mut udp_bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut peer_udp_port: u16 = 2222;
     let mut rpi_ms: u32 = 50;
     let mut data_size: u16 = 8;

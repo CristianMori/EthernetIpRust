@@ -5,7 +5,7 @@
 //! data flows through a caller-supplied [`AssemblyRegistry`], so multiple
 //! scanners can share buffers with application code without any extra sync.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -250,11 +250,21 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
         connection_path: connection_path.clone(),
     };
 
-    // Wrap FO request in Message Router format, send via SendRRData.
+    // Bind UDP up front so we know the port to advertise in Sockaddr Info T→O.
+    let udp = Arc::new(UdpSocket::bind(cfg.udp_bind).await?);
+    let our_udp = udp.local_addr()?;
+
+    // Wrap FO request in Message Router format, send via SendRRData. We
+    // include a Sockaddr Info T→O CPF item so the target knows exactly which
+    // UDP endpoint to send T→O frames to — the CIP-standards-compliant way
+    // to negotiate cyclic-I/O peer endpoints. Value is our bind address; a
+    // wildcard `0.0.0.0` lets the target fall back to our TCP peer address.
     let mr = build_mr_request(service::FORWARD_OPEN, &cm_path_bytes(), &fo_req.encode());
+    let sockaddr_bytes = ethernetip_core::cpf::encode_sockaddr_in_v4(our_udp)?;
     let items = [
         Item::null_address(),
         Item::new(item_type::UNCONNECTED_DATA, mr),
+        Item::new(item_type::SOCKADDR_INFO_T_TO_O, sockaddr_bytes),
     ];
     let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
     ctx_counter = ctx_counter.wrapping_add(1);
@@ -279,13 +289,13 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
     }
     let fo_resp = ForwardOpenResponse::decode(&data.data[header.body_offset..])?;
 
-    // Bind UDP for T→O reception.
-    let udp = Arc::new(UdpSocket::bind(cfg.udp_bind).await?);
+    // Discover target UDP endpoint from Sockaddr Info O→T if the target
+    // included one; else fall back to (adapter_tcp_ip, 2222). A zero address
+    // in the CPF item means "use my TCP peer" — same convention C# follows.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let rx_count = Arc::new(AtomicU64::new(0));
     let tx_count = Arc::new(AtomicU64::new(0));
 
-    // Consumer task: incoming T→O frames.
     let consumer_state = ConsumerState {
         udp: udp.clone(),
         assemblies: cfg.assemblies.clone(),
@@ -297,7 +307,12 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
     let consumer_task = tokio::spawn(consumer_state.run(shutdown_rx.clone()));
 
     // Producer task: outgoing O→T frames.
-    let peer_udp = SocketAddr::new(cfg.adapter_tcp.ip(), IO_UDP_PORT);
+    let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
+        &reply_env,
+        item_type::SOCKADDR_INFO_O_TO_T,
+        cfg.adapter_tcp.ip(),
+        IO_UDP_PORT,
+    );
     let producer_state = ProducerState {
         udp: udp.clone(),
         peer_udp,
@@ -382,6 +397,9 @@ fn cm_path_bytes() -> Vec<u8> {
     w.push_instance(1);
     w.into_bytes()
 }
+
+// resolve_peer_udp moved to ethernetip_core::cpf::resolve_peer_udp so the
+// safety crate can share it without a cross-crate dependency.
 
 async fn exchange(
     stream: &mut TcpStream,

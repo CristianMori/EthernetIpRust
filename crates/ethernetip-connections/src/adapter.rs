@@ -345,14 +345,27 @@ impl SessionState {
             .ok_or_else(|| EipError::Protocol("SendRRData missing UnconnectedData item".into()))?;
         let (service_code, path, body) = split_mr_request(&mr_item.data)?;
 
+        let mut include_sockaddr_reply = false;
         let (reply_service, reply_status, reply_body) = match service_code {
             s if s == service::FORWARD_OPEN => {
-                match self.handle_forward_open(&body).await {
-                    Ok(resp) => (
-                        service::FORWARD_OPEN | service::REPLY_FLAG,
-                        status::SUCCESS,
-                        resp.encode(),
-                    ),
+                // Scanner may have advertised its UDP endpoint in a Sockaddr
+                // Info T→O CPF item — use it (with 0.0.0.0 falling back to
+                // the TCP peer IP) instead of the hard default peer:2222.
+                let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
+                    &envelope,
+                    item_type::SOCKADDR_INFO_T_TO_O,
+                    self.peer.ip(),
+                    self.peer_udp_port,
+                );
+                match self.handle_forward_open(&body, peer_udp).await {
+                    Ok(resp) => {
+                        include_sockaddr_reply = true;
+                        (
+                            service::FORWARD_OPEN | service::REPLY_FLAG,
+                            status::SUCCESS,
+                            resp.encode(),
+                        )
+                    }
                     Err(err) => {
                         tracing::warn!("Forward_Open rejected: {err}");
                         (
@@ -397,10 +410,18 @@ impl SessionState {
         mr_reply.push(0); // ext status size
         mr_reply.extend_from_slice(&reply_body);
 
-        let items = [
+        // Build reply CPF items; on a successful Forward_Open reply, tack a
+        // Sockaddr Info O→T item onto the response so the scanner knows the
+        // adapter's UDP endpoint for cyclic frames.
+        let mut items: Vec<Item> = vec![
             Item::null_address(),
             Item::new(item_type::UNCONNECTED_DATA, mr_reply),
         ];
+        if include_sockaddr_reply {
+            let local = self.udp.local_addr()?;
+            let sockaddr_bytes = ethernetip_core::cpf::encode_sockaddr_in_v4(local)?;
+            items.push(Item::new(item_type::SOCKADDR_INFO_O_TO_T, sockaddr_bytes));
+        }
         let body = ethernetip_core::cpf::encode_envelope(0, envelope.timeout, &items);
         self.write_reply(
             Command::SendRRData,
@@ -411,7 +432,11 @@ impl SessionState {
         .await
     }
 
-    async fn handle_forward_open(&mut self, body: &[u8]) -> Result<ForwardOpenResponse> {
+    async fn handle_forward_open(
+        &mut self,
+        body: &[u8],
+        peer_udp: SocketAddr,
+    ) -> Result<ForwardOpenResponse> {
         let req = ForwardOpenRequest::decode(body)?;
         let (input_asm, output_asm) = parse_connection_path(&req.connection_path)?;
 
@@ -442,19 +467,19 @@ impl SessionState {
         let assigned_oto_t = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
         self.active_conn_id = Some(assigned_oto_t);
 
-        // Producer task: push T→O EPIO at the actual RPI on a *separate*
-        // ephemeral socket. Reusing the receive-side bind on port 2222 for
-        // sending confuses the loopback layer on Windows when both peers
-        // sit on the same port — the OS routes the reply back to the
-        // sender's own socket instead of the wildcard-bound consumer.
-        let send_udp = Arc::new(
-            tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?,
-        );
+        // Producer task uses the SAME UDP socket for send — matches how
+        // the C#/C++/Python ports organize their UDP transports, and lets
+        // outgoing frames carry our advertised bind address as source so a
+        // peer that filters on it sees a match. (Earlier we split into an
+        // ephemeral send socket to dodge a suspected Windows loopback
+        // quirk; the actual fix was Sockaddr Info hand-off, so we can
+        // share the socket cleanly again.)
+        let send_udp = self.udp.clone();
         let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
         let producer = ProducerState {
             connection_id: req.t_to_o_connection_id,
             udp: send_udp,
-            peer_udp: SocketAddr::new(self.peer.ip(), self.peer_udp_port),
+            peer_udp,
             rpi_us: req.t_to_o_rpi_us,
             assemblies: self.assemblies.clone(),
             input_assembly: input_asm,
@@ -472,7 +497,7 @@ impl SessionState {
                     t_to_o_conn_id: req.t_to_o_connection_id,
                     input_assembly: input_asm,
                     output_assembly: output_asm,
-                    peer_udp: SocketAddr::new(self.peer.ip(), self.peer_udp_port),
+                    peer_udp,
                     o_to_t_rpi_us: req.o_to_t_rpi_us,
                     t_to_o_rpi_us: req.t_to_o_rpi_us,
                     producer_shutdown: producer_shutdown_tx,

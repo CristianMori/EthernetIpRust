@@ -163,6 +163,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
     let shared_accept = shared.clone();
     let connection_open_task = connection_open.clone();
     let next_conn_id_task = next_conn_id.clone();
+    let udp_accept = udp.clone();
     let accept_task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         loop {
@@ -182,8 +183,9 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
                     let shared = shared_accept.clone();
                     let open = connection_open_task.clone();
                     let next_conn_id = next_conn_id_task.clone();
+                    let udp_task = udp_accept.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_session(stream, peer, cfg, shared, open, next_conn_id).await {
+                        if let Err(err) = handle_session(stream, peer, udp_task, cfg, shared, open, next_conn_id).await {
                             tracing::debug!("safety session ended: {err}");
                         }
                     });
@@ -231,6 +233,7 @@ struct ActiveConnection {
 async fn handle_session(
     mut stream: TcpStream,
     peer: SocketAddr,
+    udp: Arc<UdpSocket>,
     cfg: SafetyAdapterConfig,
     shared: Arc<Mutex<Option<ActiveConnection>>>,
     connection_open: Arc<AtomicBool>,
@@ -259,6 +262,7 @@ async fn handle_session(
                 let reply_body = handle_send_rr_data(
                     &payload,
                     peer,
+                    &udp,
                     &cfg,
                     &shared,
                     &connection_open,
@@ -287,6 +291,7 @@ async fn handle_session(
 async fn handle_send_rr_data(
     payload: &[u8],
     peer: SocketAddr,
+    udp: &UdpSocket,
     cfg: &SafetyAdapterConfig,
     shared: &Mutex<Option<ActiveConnection>>,
     connection_open: &AtomicBool,
@@ -298,7 +303,13 @@ async fn handle_send_rr_data(
         .ok_or_else(|| EipError::Protocol("SendRRData missing UnconnectedData".into()))?;
     let mr = mr_item.data.clone();
     if mr.len() < 2 {
-        return Ok(build_reply_envelope(0x00, status::PATH_SEGMENT_ERROR, &[], envelope.timeout));
+        return Ok(build_reply_envelope(
+            0x00,
+            status::PATH_SEGMENT_ERROR,
+            &[],
+            envelope.timeout,
+            None,
+        ));
     }
     let service_code = mr[0];
     let path_words = mr[1] as usize;
@@ -309,16 +320,42 @@ async fn handle_send_rr_data(
             status::PATH_SEGMENT_ERROR,
             &[],
             envelope.timeout,
+            None,
         ));
     }
     let body = &mr[path_end..];
 
+    let mut sockaddr_reply_bytes: Option<Vec<u8>> = None;
     let (reply_service, reply_status, reply_body) = match service_code {
         s if s == service::FORWARD_OPEN => {
-            match handle_safety_forward_open(body, peer, cfg, shared, connection_open, next_conn_id)
-                .await
+            // Prefer the originator's advertised T→O endpoint from Sockaddr
+            // Info; fall back to (peer_tcp_ip, cfg.peer_udp_port).
+            let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
+                &envelope,
+                item_type::SOCKADDR_INFO_T_TO_O,
+                peer.ip(),
+                cfg.peer_udp_port,
+            );
+            match handle_safety_forward_open(
+                body,
+                peer_udp,
+                cfg,
+                shared,
+                connection_open,
+                next_conn_id,
+            )
+            .await
             {
-                Ok(reply) => (s | service::REPLY_FLAG, status::SUCCESS, reply),
+                Ok(reply) => {
+                    // Include our UDP endpoint in the reply so the scanner
+                    // knows where to place O→T frames.
+                    if let Ok(local) = udp.local_addr() {
+                        if let Ok(sa) = ethernetip_core::cpf::encode_sockaddr_in_v4(local) {
+                            sockaddr_reply_bytes = Some(sa);
+                        }
+                    }
+                    (s | service::REPLY_FLAG, status::SUCCESS, reply)
+                }
                 Err(err) => {
                     tracing::warn!("safety Forward_Open rejected: {err}");
                     (s | service::REPLY_FLAG, status::CONNECTION_FAILURE, Vec::new())
@@ -347,26 +384,36 @@ async fn handle_send_rr_data(
         reply_status,
         &reply_body,
         envelope.timeout,
+        sockaddr_reply_bytes,
     ))
 }
 
-fn build_reply_envelope(service: u8, status: u8, body: &[u8], timeout: u16) -> Vec<u8> {
+fn build_reply_envelope(
+    service: u8,
+    status: u8,
+    body: &[u8],
+    timeout: u16,
+    sockaddr_o_to_t: Option<Vec<u8>>,
+) -> Vec<u8> {
     let mut mr_reply = Vec::with_capacity(4 + body.len());
     mr_reply.push(service);
     mr_reply.push(0);
     mr_reply.push(status);
     mr_reply.push(0);
     mr_reply.extend_from_slice(body);
-    let items = [
+    let mut items: Vec<Item> = vec![
         Item::null_address(),
         Item::new(item_type::UNCONNECTED_DATA, mr_reply),
     ];
+    if let Some(sa) = sockaddr_o_to_t {
+        items.push(Item::new(item_type::SOCKADDR_INFO_O_TO_T, sa));
+    }
     ethernetip_core::cpf::encode_envelope(0, timeout, &items)
 }
 
 async fn handle_safety_forward_open(
     body: &[u8],
-    peer: SocketAddr,
+    peer_udp: SocketAddr,
     cfg: &SafetyAdapterConfig,
     shared: &Mutex<Option<ActiveConnection>>,
     connection_open: &AtomicBool,
@@ -471,7 +518,7 @@ async fn handle_safety_forward_open(
     reply.extend_from_slice(&app_reply.target_connection_serial.to_le_bytes());
 
     // Register the active connection so consumer / TCOO tasks pick it up.
-    let peer_udp = SocketAddr::new(peer.ip(), cfg.peer_udp_port);
+    // peer_udp came from the caller (Sockaddr Info T→O or fallback default).
     *shared.lock().await = Some(ActiveConnection {
         o_to_t_conn_id: assigned_oto_t,
         t_to_o_conn_id,

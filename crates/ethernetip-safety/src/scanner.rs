@@ -36,8 +36,6 @@ use crate::types::{ModeByte, SafetyFormat};
 pub const IO_UDP_PORT: u16 = 2222;
 
 /// CPF item type ID for a Sockaddr Info O→T response item.
-const CPF_SOCKADDR_INFO_O_TO_T: u16 = 0x8001;
-
 /// Public configuration for [`open_safety_scanner`].
 #[derive(Debug, Clone)]
 pub struct SafetyScannerConfig {
@@ -179,6 +177,10 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
         .as_micros() as u64;
     let server_conn_serial = ((ticks & 0xFFFF) as u16).max(1);
 
+    // Bind UDP up front so we know the port to advertise in Sockaddr Info T→O.
+    let udp = Arc::new(UdpSocket::bind(cfg.udp_bind).await?);
+    let our_udp = udp.local_addr()?;
+
     let fo_wire = build_safety_forward_open(
         &cfg.server,
         server_conn_serial,
@@ -190,10 +192,14 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     )?;
 
     // Build the MR request (Forward_Open service) via the CM path.
+    // Include a Sockaddr Info T→O CPF item so the target knows our UDP
+    // endpoint for T→O safety data.
     let mr = build_mr_request(service::FORWARD_OPEN, &fo_wire.cm_path, &fo_wire.service_data);
+    let sockaddr_bytes = ethernetip_core::cpf::encode_sockaddr_in_v4(our_udp)?;
     let items = [
         Item::null_address(),
         Item::new(item_type::UNCONNECTED_DATA, mr),
+        Item::new(item_type::SOCKADDR_INFO_T_TO_O, sockaddr_bytes),
     ];
     let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
     let (fo_header, fo_reply_bytes) =
@@ -226,30 +232,14 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     }
 
     // Discover target UDP endpoint from Sockaddr Info O→T if present, else
-    // fall back to (peer_ip, IO_UDP_PORT).
-    let mut target_udp = SocketAddr::new(cfg.adapter_tcp.ip(), IO_UDP_PORT);
-    if let Some(item) = envelope.find(CPF_SOCKADDR_INFO_O_TO_T) {
-        if item.data.len() >= 8 {
-            let port = u16::from_be_bytes([item.data[2], item.data[3]]);
-            let ip_bytes = [item.data[4], item.data[5], item.data[6], item.data[7]];
-            if ip_bytes != [0, 0, 0, 0] {
-                target_udp = SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                        ip_bytes[0],
-                        ip_bytes[1],
-                        ip_bytes[2],
-                        ip_bytes[3],
-                    )),
-                    port,
-                );
-            } else if port != 0 {
-                target_udp = SocketAddr::new(cfg.adapter_tcp.ip(), port);
-            }
-        }
-    }
-    // Local-interop override: some samples run scanner/adapter on the same
-    // host with different UDP ports and can't rely on the target populating a
-    // Sockaddr Info item.
+    // fall back to (peer_ip, IO_UDP_PORT). The local-interop override lets
+    // scanner and adapter share a host with different UDP ports.
+    let mut target_udp = ethernetip_core::cpf::resolve_peer_udp(
+        &envelope,
+        item_type::SOCKADDR_INFO_O_TO_T,
+        cfg.adapter_tcp.ip(),
+        IO_UDP_PORT,
+    );
     if cfg.peer_udp_port != IO_UDP_PORT {
         target_udp.set_port(cfg.peer_udp_port);
     }
@@ -259,8 +249,7 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     let pid_seed_s3 = crc::pid_cid_seed_s3(cfg.orig_vendor, cfg.orig_serial, server_conn_serial);
     let pid_seed_s5 = crc::pid_cid_seed_s5(cfg.orig_vendor, cfg.orig_serial, server_conn_serial);
 
-    // Bind UDP, spawn producer + consumer.
-    let udp = Arc::new(UdpSocket::bind(cfg.udp_bind).await?);
+    // UDP socket was bound earlier so we could advertise it in Sockaddr Info.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let output_data = Arc::new(Mutex::new(vec![0u8; cfg.server.consumed_data_size as usize]));
     let consumer_active = Arc::new(AtomicBool::new(false));

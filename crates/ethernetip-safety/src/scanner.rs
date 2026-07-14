@@ -44,7 +44,14 @@ pub struct SafetyScannerConfig {
     /// Optional routing bytes (backplane / slot); empty for a device with a
     /// built-in safety validator.
     pub route_prefix: Vec<u8>,
+    /// Server-direction FO — we produce O→T safety data.
     pub server: SafetyForwardOpenConfig,
+    /// Optional client-direction FO — target produces T→O safety data.
+    /// When set, the scanner opens a second connection right after the
+    /// server one and stands up a consumer that decodes incoming safety
+    /// frames (with target-timestamp rollover tracking) and sends a TCOO
+    /// reply back on every fresh ping_count.
+    pub client: Option<SafetyForwardOpenConfig>,
     pub orig_vendor: u16,
     pub orig_serial: u32,
     /// Peer UDP port for producer packets. Defaults to `IO_UDP_PORT`; local
@@ -60,10 +67,18 @@ impl SafetyScannerConfig {
             udp_bind: SocketAddr::from(([0, 0, 0, 0], IO_UDP_PORT)),
             route_prefix: Vec::new(),
             server,
+            client: None,
             orig_vendor: 0x0001,
             orig_serial: 0x1234_5678,
             peer_udp_port: IO_UDP_PORT,
         }
+    }
+
+    /// Opt into the client direction — attach a second Forward_Open config
+    /// so the scanner also consumes T→O safety data from the target.
+    pub fn client(mut self, cfg: SafetyForwardOpenConfig) -> Self {
+        self.client = Some(cfg);
+        self
     }
 
     pub fn udp_bind(mut self, addr: SocketAddr) -> Self {
@@ -92,14 +107,26 @@ impl SafetyScannerConfig {
 pub struct SafetyScannerConnection {
     pub server_o_to_t_id: u32,
     pub server_t_to_o_id: u32,
+    /// Client-direction (target-produced) O→T id, when client leg opened.
+    pub client_o_to_t_id: Option<u32>,
+    /// Client-direction (target-produced) T→O id, when client leg opened.
+    pub client_t_to_o_id: Option<u32>,
     pub target_app_reply: SafetyAppReply,
     pub target_udp: SocketAddr,
     /// Number of O→T frames produced.
     pub tx_count: Arc<AtomicU64>,
     /// Number of T→O TCOO frames received from the target.
     pub tcoo_count: Arc<AtomicU64>,
+    /// Number of valid T→O safety data frames received (client direction).
+    pub rx_count: Arc<AtomicU64>,
+    /// Number of T→O frames dropped because a CRC or complement check failed.
+    pub rx_crc_fail: Arc<AtomicU64>,
+    /// Number of TCOO replies we've sent to the target on the client leg.
+    pub tcoo_tx: Arc<AtomicU64>,
     /// Output data buffer — writes here are picked up on the next producer tick.
     pub output_data: Arc<Mutex<Vec<u8>>>,
+    /// Input buffer populated as valid T→O safety frames arrive (client leg).
+    pub input_data: Arc<Mutex<Vec<u8>>>,
     /// True once at least one target TCOO has arrived (the C# scanner uses
     /// this to move from `idle` to `run`).
     pub consumer_active: Arc<AtomicBool>,
@@ -108,6 +135,7 @@ pub struct SafetyScannerConnection {
     tcp: Option<TcpStream>,
     session_handle: u32,
     server_conn_serial: u16,
+    client_conn_serial: Option<u16>,
     orig_vendor: u16,
     orig_serial: u32,
     ctx: u64,
@@ -143,6 +171,18 @@ impl SafetyScannerConnection {
             &self.route_prefix,
         )
         .await;
+        if let Some(client_serial) = self.client_conn_serial {
+            let _ = send_safety_forward_close(
+                &mut tcp,
+                self.session_handle,
+                self.next_ctx(),
+                client_serial,
+                self.orig_vendor,
+                self.orig_serial,
+                &self.route_prefix,
+            )
+            .await;
+        }
         let _ = send_unregister(&mut tcp, self.session_handle).await;
         let _ = tcp.shutdown().await;
         Ok(())
@@ -249,12 +289,103 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     let pid_seed_s3 = crc::pid_cid_seed_s3(cfg.orig_vendor, cfg.orig_serial, server_conn_serial);
     let pid_seed_s5 = crc::pid_cid_seed_s5(cfg.orig_vendor, cfg.orig_serial, server_conn_serial);
 
+    // If a client-direction config is provided, open a second Forward_Open
+    // right after the server one and stand up a T→O consumer path.
+    let (client_state, client_conn_serial) = if let Some(client_cfg) = &cfg.client {
+        let client_conn_serial = server_conn_serial.wrapping_add(1).max(1);
+        let client_fo_wire = build_safety_forward_open(
+            client_cfg,
+            client_conn_serial,
+            cfg.orig_vendor,
+            cfg.orig_serial,
+            0x20, // client direction (target produces T→O)
+            &cfg.route_prefix,
+            &[],
+        )?;
+        let mr = build_mr_request(
+            service::FORWARD_OPEN,
+            &client_fo_wire.cm_path,
+            &client_fo_wire.service_data,
+        );
+        let items = [
+            Item::null_address(),
+            Item::new(item_type::UNCONNECTED_DATA, mr),
+        ];
+        let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
+        let (_hdr, reply_bytes) = exchange_with_header(
+            &mut tcp,
+            Command::SendRRData,
+            session_handle,
+            next_ctx(&mut ctx),
+            &body,
+        )
+        .await?;
+        let envelope2 = Envelope::parse(&reply_bytes)?;
+        let mr_item2 = envelope2
+            .find(item_type::UNCONNECTED_DATA)
+            .ok_or_else(|| EipError::Protocol("client FO reply missing UnconnectedData".into()))?;
+        let hdr2 = ReplyHeader::parse(&mr_item2.data)?;
+        if hdr2.general_status != status::SUCCESS {
+            // Best-effort: cancel the server connection we just opened.
+            let _ = send_safety_forward_close(
+                &mut tcp,
+                session_handle,
+                next_ctx(&mut ctx),
+                server_conn_serial,
+                cfg.orig_vendor,
+                cfg.orig_serial,
+                &cfg.route_prefix,
+            )
+            .await;
+            return Err(EipError::Cip {
+                status: hdr2.general_status,
+                ext: hdr2.extended_status,
+            });
+        }
+        let crd = &mr_item2.data[hdr2.body_offset..];
+        if crd.len() < 26 {
+            return Err(EipError::Short {
+                expected: 26,
+                actual: crd.len(),
+            });
+        }
+        let client_oto_t = u32::from_le_bytes([crd[0], crd[1], crd[2], crd[3]]);
+        let client_tto_o = u32::from_le_bytes([crd[4], crd[5], crd[6], crd[7]]);
+        let app_reply_words = crd[24] as usize;
+        let mut client_app_reply = SafetyAppReply::default();
+        if app_reply_words > 0 && crd.len() >= 26 + app_reply_words * 2 {
+            client_app_reply = SafetyAppReply::parse(&crd[26..26 + app_reply_words * 2]);
+        }
+        (
+            Some(ClientLeg {
+                oto_t_id: client_oto_t,
+                tto_o_id: client_tto_o,
+                app_reply: client_app_reply,
+                format: client_cfg.format,
+                data_size: client_cfg.produced_data_size as usize,
+            }),
+            Some(client_conn_serial),
+        )
+    } else {
+        (None, None)
+    };
+
     // UDP socket was bound earlier so we could advertise it in Sockaddr Info.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let output_data = Arc::new(Mutex::new(vec![0u8; cfg.server.consumed_data_size as usize]));
+    let input_data = Arc::new(Mutex::new(vec![
+        0u8;
+        client_state
+            .as_ref()
+            .map(|c| c.data_size)
+            .unwrap_or(0)
+    ]));
     let consumer_active = Arc::new(AtomicBool::new(false));
     let tx_count = Arc::new(AtomicU64::new(0));
     let tcoo_count = Arc::new(AtomicU64::new(0));
+    let rx_count = Arc::new(AtomicU64::new(0));
+    let rx_crc_fail = Arc::new(AtomicU64::new(0));
+    let tcoo_tx = Arc::new(AtomicU64::new(0));
 
     let producer = ProducerState {
         udp: udp.clone(),
@@ -274,34 +405,115 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     };
     let producer_task = tokio::spawn(producer.run(shutdown_rx.clone()));
 
+    // Client-side seeds (target-produced frames): use the target's identity
+    // + the target's safety-validator instance id from the client-leg
+    // SafetyAppReply.
+    let target_vendor = target_app_reply.target_vendor_id;
+    let target_serial = target_app_reply.target_device_serial;
+    let client_leg = client_state.map(|c| {
+        let sv_inst = c.app_reply.target_connection_serial;
+        let target_pid_s1 = crc::pid_cid_seed_s1(target_vendor, target_serial, sv_inst);
+        let target_pid_s3 = crc::pid_cid_seed_s3(target_vendor, target_serial, sv_inst);
+        let target_pid_s5 = crc::pid_cid_seed_s5(target_vendor, target_serial, sv_inst);
+        let cid_seed_s3 = crc::pid_cid_seed_s3(
+            cfg.orig_vendor,
+            cfg.orig_serial,
+            client_conn_serial.unwrap(),
+        );
+        ClientLegState {
+            oto_t_id: c.oto_t_id,
+            tto_o_id: c.tto_o_id,
+            format: c.format,
+            data_size: c.data_size,
+            target_pid_s1,
+            target_pid_s3,
+            target_pid_s5,
+            cid_seed_s3,
+            rollover: Arc::new(Mutex::new(RolloverState::default())),
+            seq: Arc::new(AtomicU32::new(0)),
+        }
+    });
+
     let consumer = ConsumerState {
         udp: udp.clone(),
         server_tto_o_id,
         consumer_active: consumer_active.clone(),
         tcoo_count: tcoo_count.clone(),
+        rx_count: rx_count.clone(),
+        rx_crc_fail: rx_crc_fail.clone(),
+        tcoo_tx: tcoo_tx.clone(),
+        input_data: input_data.clone(),
+        client: client_leg.clone(),
+        target_udp,
+        orig_vendor: cfg.orig_vendor,
+        orig_serial: cfg.orig_serial,
     };
     let consumer_task = tokio::spawn(consumer.run(shutdown_rx));
 
     Ok(SafetyScannerConnection {
         server_o_to_t_id: server_oto_t_id,
         server_t_to_o_id: server_tto_o_id,
+        client_o_to_t_id: client_leg.as_ref().map(|c| c.oto_t_id),
+        client_t_to_o_id: client_leg.as_ref().map(|c| c.tto_o_id),
         target_app_reply,
         target_udp,
         tx_count,
         tcoo_count,
+        rx_count,
+        rx_crc_fail,
+        tcoo_tx,
         output_data,
+        input_data,
         consumer_active,
         shutdown_tx,
         tasks: vec![producer_task, consumer_task],
         tcp: Some(tcp),
         session_handle,
         server_conn_serial,
+        client_conn_serial,
         orig_vendor: cfg.orig_vendor,
         orig_serial: cfg.orig_serial,
         ctx,
         route_prefix: cfg.route_prefix,
         closed: false,
     })
+}
+
+/// Handoff between the open path and the consumer once the client-side FO
+/// succeeds — carries just the IDs + format needed to spin up a decoder.
+#[derive(Debug, Clone)]
+struct ClientLeg {
+    oto_t_id: u32,
+    tto_o_id: u32,
+    app_reply: SafetyAppReply,
+    format: SafetyFormat,
+    data_size: usize,
+}
+
+/// Full per-connection state the consumer thread holds for the client leg.
+#[derive(Debug, Clone)]
+struct ClientLegState {
+    oto_t_id: u32,
+    tto_o_id: u32,
+    format: SafetyFormat,
+    data_size: usize,
+    target_pid_s1: u8,
+    target_pid_s3: u16,
+    target_pid_s5: u32,
+    cid_seed_s3: u16,
+    rollover: Arc<Mutex<RolloverState>>,
+    seq: Arc<AtomicU32>,
+}
+
+/// Target-timestamp rollover tracker. The 16-bit safety timestamp wraps
+/// every ~8.4 s; the consumer has to advance a folded rollover count
+/// BEFORE CRC verification because the CRC-S5 seed depends on it.
+#[derive(Debug, Default)]
+struct RolloverState {
+    initialized: bool,
+    last_ts: u16,
+    rollover_count: u16,
+    last_ping: u8,
 }
 
 fn next_ctx(ctx: &mut u64) -> [u8; 8] {
@@ -474,6 +686,14 @@ struct ConsumerState {
     server_tto_o_id: u32,
     consumer_active: Arc<AtomicBool>,
     tcoo_count: Arc<AtomicU64>,
+    rx_count: Arc<AtomicU64>,
+    rx_crc_fail: Arc<AtomicU64>,
+    tcoo_tx: Arc<AtomicU64>,
+    input_data: Arc<Mutex<Vec<u8>>>,
+    client: Option<ClientLegState>,
+    target_udp: SocketAddr,
+    orig_vendor: u16,
+    orig_serial: u32,
 }
 
 impl ConsumerState {
@@ -502,9 +722,132 @@ impl ConsumerState {
                         // First TCOO flips the consumer-active latch so the
                         // producer starts stamping run=1 on subsequent frames.
                         self.consumer_active.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    // Client T→O connection carries target-produced safety data.
+                    if let Some(client) = self.client.as_ref() {
+                        if frame.connection_id == client.tto_o_id {
+                            self.handle_client_data(client, &frame.data).await;
+                        }
                     }
                 }
             }
+        }
+    }
+
+    async fn handle_client_data(&self, client: &ClientLegState, payload: &[u8]) {
+        // Derive data length from the wire size: short (≤2 B) is len+6,
+        // long is 2*len+8. Anything under 5 B is a TCOO, not data.
+        let wire_len = payload.len();
+        if wire_len < 6 {
+            return;
+        }
+        let data_len = if wire_len >= 7 && wire_len <= 8 {
+            wire_len - 6
+        } else if wire_len >= 14 && (wire_len - 8) % 2 == 0 {
+            (wire_len - 8) / 2
+        } else {
+            return;
+        };
+        if data_len == 0 || data_len != client.data_size {
+            return;
+        }
+
+        // Peek at the timestamp BEFORE the CRC-S5 seed depends on the
+        // rollover count — a wrap detected here has to bump the counter
+        // before verification.
+        let ts = frame_codec::extract_timestamp(payload, data_len, client.format);
+        let rollover_now = {
+            let mut rs = client.rollover.lock().await;
+            if rs.initialized {
+                let delta = ts as i32 - rs.last_ts as i32;
+                if delta < -0x4000 {
+                    rs.rollover_count = rs.rollover_count.wrapping_add(1);
+                }
+            } else {
+                rs.initialized = true;
+            }
+            rs.last_ts = ts;
+            rs.rollover_count
+        };
+
+        let result = frame_codec::decode(
+            payload,
+            data_len,
+            client.format,
+            client.target_pid_s1,
+            client.target_pid_s3,
+            client.target_pid_s5,
+            rollover_now,
+        );
+
+        // Mode byte lives right after the data bytes.
+        let mode_byte = payload.get(data_len).copied().unwrap_or(0);
+        let target_ping = mode_byte & 0x03;
+        let should_reply = {
+            let mut rs = client.rollover.lock().await;
+            let first_time = !rs.initialized || rs.last_ping != target_ping;
+            // Set below regardless so the reply gates on transitions only.
+            rs.last_ping = target_ping;
+            first_time
+        };
+
+        match result {
+            Ok(frame) => {
+                self.rx_count.fetch_add(1, Ordering::Relaxed);
+                let mut w = self.input_data.lock().await;
+                let n = frame.actual_data.len().min(w.len());
+                w[..n].copy_from_slice(&frame.actual_data[..n]);
+            }
+            Err(err) => {
+                self.rx_crc_fail.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!("client-leg CRC fail: {:?}", err);
+            }
+        }
+
+        if should_reply {
+            self.send_client_tcoo(client, target_ping).await;
+        }
+    }
+
+    async fn send_client_tcoo(&self, client: &ClientLegState, ping_reply: u8) {
+        // Consumer time = 128 µs ticks since UNIX epoch — matches how the C++
+        // port derives its TCOO consumer_time_value from the steady clock.
+        let ticks_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
+        let consumer_time_value = ((ticks_us / 128) & 0xFFFF) as u16;
+
+        let mut buf = [0u8; 8];
+        let n = if client.format == SafetyFormat::Extended {
+            frame_codec::encode_time_coordination_extended(
+                &mut buf,
+                ping_reply,
+                consumer_time_value,
+                client.target_pid_s5,
+            )
+        } else {
+            // Base format uses the (originator identity + client connection
+            // serial) CRC-S3 pre-computed at open time.
+            frame_codec::encode_time_coordination(
+                &mut buf,
+                ping_reply,
+                consumer_time_value,
+                client.cid_seed_s3,
+            )
+        };
+        let seq = client.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let epio = Frame {
+            connection_id: client.oto_t_id,
+            sequence: seq,
+            cip_sequence: seq as u16,
+            run_idle: None,
+            data: buf[..n].to_vec(),
+        };
+        let bytes = encode_epio(&epio);
+        if self.udp.send_to(&bytes, self.target_udp).await.is_ok() {
+            self.tcoo_tx.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

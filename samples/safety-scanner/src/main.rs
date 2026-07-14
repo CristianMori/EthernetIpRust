@@ -1,6 +1,11 @@
-//! Minimal safety scanner — opens one safety Forward_Open (server direction),
-//! writes a wall-clock counter into the O→T safety output, and prints the
-//! target's TCOO / connection state.
+//! Minimal safety scanner — opens a safety Forward_Open (server direction)
+//! and, with `--client`, a second Forward_Open (client direction) so it also
+//! consumes target-produced T→O safety data. Writes a wall-clock counter
+//! into the O→T output and prints per-tick statistics.
+//!
+//! Usage:
+//!   safety-scanner [--adapter IP:PORT] [--udp BIND] [--peer-udp-port N]
+//!                  [--rpi-ms N] [--data-size N] [--client]
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -24,6 +29,7 @@ async fn main() -> Result<()> {
     let mut peer_udp_port: u16 = 2222;
     let mut rpi_ms: u32 = 50;
     let mut data_size: u16 = 8;
+    let mut open_client = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -32,6 +38,7 @@ async fn main() -> Result<()> {
             "--peer-udp-port" => peer_udp_port = args.next().context("--peer-udp-port needs a number")?.parse()?,
             "--rpi-ms" => rpi_ms = args.next().context("--rpi-ms needs a number")?.parse()?,
             "--data-size" => data_size = args.next().context("--data-size needs a number")?.parse()?,
+            "--client" => open_client = true,
             other => anyhow::bail!("unexpected argument `{}`", other),
         }
     }
@@ -48,9 +55,25 @@ async fn main() -> Result<()> {
         t_to_o_rpi_us: rpi_us,
         ..SafetyForwardOpenConfig::default()
     };
-    let cfg = SafetyScannerConfig::new(adapter, server)
+    let mut cfg = SafetyScannerConfig::new(adapter, server)
         .udp_bind(udp_bind)
         .peer_udp_port(peer_udp_port);
+    if open_client {
+        // Client leg swaps the O↔T assemblies so target's produce path shows
+        // up as the scanner's consume path.
+        let client = SafetyForwardOpenConfig {
+            consumed_assembly: 301,
+            produced_assembly: 300,
+            config_assembly: 302,
+            consumed_data_size: data_size,
+            produced_data_size: data_size,
+            rpi_us,
+            o_to_t_rpi_us: rpi_us,
+            t_to_o_rpi_us: rpi_us,
+            ..SafetyForwardOpenConfig::default()
+        };
+        cfg = cfg.client(client);
+    }
 
     println!(
         "opening safety scanner: adapter={} udp={} rpi={}ms data={}B",
@@ -58,7 +81,7 @@ async fn main() -> Result<()> {
     );
     let conn = open_safety_scanner(cfg).await?;
     println!(
-        "opened OT=0x{:08X} TO=0x{:08X} target UDP={}  app_reply=(vendor=0x{:04X} serial=0x{:08X} sv_inst={})",
+        "opened server  OT=0x{:08X} TO=0x{:08X} target UDP={}  app_reply=(vendor=0x{:04X} serial=0x{:08X} sv_inst={})",
         conn.server_o_to_t_id,
         conn.server_t_to_o_id,
         conn.target_udp,
@@ -66,6 +89,9 @@ async fn main() -> Result<()> {
         conn.target_app_reply.target_device_serial,
         conn.target_app_reply.target_connection_serial,
     );
+    if let (Some(ot), Some(to)) = (conn.client_o_to_t_id, conn.client_t_to_o_id) {
+        println!("opened client  OT=0x{ot:08X} TO=0x{to:08X}");
+    }
 
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.tick().await;
@@ -84,8 +110,17 @@ async fn main() -> Result<()> {
                 let tx = conn.tx_count.load(Ordering::Relaxed);
                 let tcoo = conn.tcoo_count.load(Ordering::Relaxed);
                 let run = conn.consumer_active.load(Ordering::Relaxed);
+                let rx = conn.rx_count.load(Ordering::Relaxed);
+                let crc_fail = conn.rx_crc_fail.load(Ordering::Relaxed);
+                let tcoo_tx = conn.tcoo_tx.load(Ordering::Relaxed);
+                let in0 = {
+                    let d = conn.input_data.lock().await;
+                    if d.len() >= 4 {
+                        i32::from_le_bytes([d[0], d[1], d[2], d[3]])
+                    } else { 0 }
+                };
                 print!(
-                    "\r[tick {count:>6}] out[0]={count:>10} tx={tx} tcoo_rx={tcoo} run={run} "
+                    "\r[tick {count:>6}] out[0]={count:>10} in[0]={in0:>10} tx={tx} tcoo_rx={tcoo} rx={rx} crc_fail={crc_fail} tcoo_tx={tcoo_tx} run={run} "
                 );
                 use std::io::Write;
                 let _ = std::io::stdout().flush();

@@ -216,10 +216,14 @@ struct ActiveConnection {
     o_to_t_conn_id: u32,
     t_to_o_conn_id: u32,
     peer_udp: SocketAddr,
+    /// Wire format the scanner picked in its Forward_Open — Base or Extended.
+    /// Locked in per-connection so the consumer decodes with the right seeds.
+    format: SafetyFormat,
     pid_seed_s1: u8,
     pid_seed_s3: u16,
     pid_seed_s5: u32,
     cid_seed_s3: u16,
+    cid_seed_s5: u32,
     input_data_len: usize,
     // Rollover tracking for the ORIGINATOR's producer (scanner's O→T).
     rollover_count: u16,
@@ -448,30 +452,57 @@ async fn handle_safety_forward_open(
             safety_off = Some(i);
             break;
         }
-        // Naive walk: most non-safety segments are 2-byte (logical class /
-        // instance / connection point). Fall back to a single-byte step if we
-        // hit an unknown segment.
-        i += match conn_path[i] {
+        // Segment length depends on segment type. Handle the segments the
+        // C++/C#/Python scanners actually put in a safety FO path:
+        //   * Port segments (0x00..0x0F) — 2 bytes
+        //   * Logical 8-bit (Class/Instance/Member/CP/Attribute/Service) — 2
+        //   * Logical 16-bit — 4
+        //   * Logical 32-bit — 6
+        //   * Electronic Key (0x34 special, length in next byte, in words)
+        //   * Data segments (0x80 Simple, 0x91 ANSI symbolic)
+        let step = match conn_path[i] {
             0x00..=0x0F => 2,
-            0x20 | 0x24 | 0x28 | 0x2C | 0x30 | 0x34 | 0x38 => 2,
+            0x20 | 0x24 | 0x28 | 0x2C | 0x30 | 0x38 => 2,
             0x21 | 0x25 | 0x29 | 0x2D | 0x31 => 4,
+            0x22 | 0x26 | 0x2A | 0x2E | 0x32 => 6,
+            0x34 => {
+                // Special: length byte at i+1 is number of 16-bit words.
+                if i + 1 >= conn_path.len() {
+                    break;
+                }
+                2 + conn_path[i + 1] as usize * 2
+            }
+            0x80 | 0x91 => {
+                if i + 1 >= conn_path.len() {
+                    break;
+                }
+                let word_len = conn_path[i + 1] as usize;
+                // ANSI symbolic length is in BYTES, not words; Simple Data
+                // Segment length is in words. Padding takes ANSI symbolic
+                // up to even byte count.
+                if conn_path[i] == 0x91 {
+                    let raw = 2 + word_len;
+                    raw + (raw & 1)
+                } else {
+                    2 + word_len * 2
+                }
+            }
             _ => 2,
         };
+        i += step;
     }
     let safety_off =
         safety_off.ok_or_else(|| EipError::Protocol("no safety segment in Forward_Open".into()))?;
     let (safety_seg, _) = SafetyNetworkSegment::parse(&conn_path[safety_off..])?;
+    // Accept whichever format the scanner picked; per-connection state
+    // records it so the consumer decodes each frame with the right CRC
+    // family (Base = S1/S3, Extended = S5 with rollover-folded seeds).
     let format = if safety_seg.format == 0x02 {
         SafetyFormat::Extended
     } else {
         SafetyFormat::Base
     };
-    if format != cfg.format {
-        return Err(EipError::Protocol(format!(
-            "safety format mismatch: adapter wants {:?}, scanner sent 0x{:02X}",
-            cfg.format, safety_seg.format
-        )));
-    }
+    let _ = cfg.format; // format on cfg becomes the receive buffer's expected shape only.
 
     // We advertise a made-up target connection serial (safety validator
     // instance id) and echo it back in the SafetyAppReply. The scanner uses
@@ -480,13 +511,16 @@ async fn handle_safety_forward_open(
     let target_connection_serial: u16 = 1;
 
     // PID seeds for the O→T direction (scanner produces): originator identity +
-    // scanner's connection serial.
+    // scanner's connection serial. These verify incoming safety data.
     let pid_seed_s1 = crc::pid_cid_seed_s1(orig_vendor, orig_serial, connection_serial);
     let pid_seed_s3 = crc::pid_cid_seed_s3(orig_vendor, orig_serial, connection_serial);
     let pid_seed_s5 = crc::pid_cid_seed_s5(orig_vendor, orig_serial, connection_serial);
-    // CID seed for base-format TCOO reply: originator identity + target
-    // connection serial.
-    let cid_seed_s3 = crc::pid_cid_seed_s3(orig_vendor, orig_serial, target_connection_serial);
+    // CID seeds for the TCOO reply we emit on the T→O side. In CIP Safety
+    // the CID belongs to the CONSUMER of the corresponding data direction;
+    // for a target-side server connection that's the target itself
+    // (target_vendor + target_serial + our safety validator instance id).
+    let cid_seed_s3 = crc::pid_cid_seed_s3(cfg.target_vendor, cfg.target_serial, target_connection_serial);
+    let cid_seed_s5 = crc::pid_cid_seed_s5(cfg.target_vendor, cfg.target_serial, target_connection_serial);
 
     let assigned_oto_t = next_conn_id.fetch_add(1, Ordering::SeqCst);
 
@@ -523,10 +557,12 @@ async fn handle_safety_forward_open(
         o_to_t_conn_id: assigned_oto_t,
         t_to_o_conn_id,
         peer_udp,
+        format,
         pid_seed_s1,
         pid_seed_s3,
         pid_seed_s5,
         cid_seed_s3,
+        cid_seed_s5,
         input_data_len: cfg.input_data_size,
         rollover_count: 0,
         last_ts: 0,
@@ -572,7 +608,7 @@ impl ConsumerLoop {
             Ok(f) => f,
             Err(_) => return,
         };
-        let (data_len, seeds) = {
+        let (data_len, seeds, conn_format) = {
             let mut guard = self.shared.lock().await;
             let Some(conn) = guard.as_mut() else { return };
             if frame.connection_id != conn.o_to_t_conn_id {
@@ -588,12 +624,13 @@ impl ConsumerLoop {
             (
                 conn.input_data_len,
                 (conn.pid_seed_s1, conn.pid_seed_s3, conn.pid_seed_s5),
+                conn.format,
             )
         };
 
         // Peek at the timestamp before verifying the CRC so the rollover
         // counter can be advanced first if the target wrapped.
-        let this_ts = frame_codec::extract_timestamp(&frame.data, data_len, self.format);
+        let this_ts = frame_codec::extract_timestamp(&frame.data, data_len, conn_format);
 
         let rollover_now = {
             let mut guard = self.shared.lock().await;
@@ -613,7 +650,7 @@ impl ConsumerLoop {
         let result = frame_codec::decode(
             &frame.data,
             data_len,
-            self.format,
+            conn_format,
             seeds.0,
             seeds.1,
             seeds.2,
@@ -666,31 +703,42 @@ impl TcooLoop {
                     if *shutdown_rx.borrow() { break; }
                 }
                 _ = ticker.tick() => {
-                    let (conn_id, peer, cid_seed_s3, ping) = {
+                    let (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping) = {
                         let guard = self.shared.lock().await;
                         let Some(conn) = guard.as_ref() else { continue };
-                        // Send TCOO on the T→O connection id (the one the
-                        // scanner picked and included as its own client_tto_o).
                         (
                             conn.t_to_o_conn_id,
                             // Use the full tracked peer_udp — the consumer
                             // keeps it in sync with the scanner's actual
-                            // (typically ephemeral) source endpoint, so
-                            // overriding the port here would send TCOO to
-                            // a socket the scanner isn't listening on.
+                            // (typically ephemeral) source endpoint.
                             conn.peer_udp,
                             conn.cid_seed_s3,
+                            conn.cid_seed_s5,
+                            conn.format,
                             (conn.last_ping & 0x03) as u8,
                         )
                     };
-                    let mut buf = [0u8; 6];
+                    let mut buf = [0u8; 8];
                     let consumer_time_value = 0u16; // placeholder — real impl derives from monotonic clock
-                    let n = frame_codec::encode_time_coordination(
-                        &mut buf,
-                        ping,
-                        consumer_time_value,
-                        cid_seed_s3,
-                    );
+                    // TCOO CRC family must match the connection's safety
+                    // format: Base = CRC-S3, Extended = CRC-S5. Both seed off
+                    // the CID (target's identity + SV instance for the server
+                    // direction, which is where this adapter lives).
+                    let n = if format == SafetyFormat::Extended {
+                        frame_codec::encode_time_coordination_extended(
+                            &mut buf,
+                            ping,
+                            consumer_time_value,
+                            cid_seed_s5,
+                        )
+                    } else {
+                        frame_codec::encode_time_coordination(
+                            &mut buf,
+                            ping,
+                            consumer_time_value,
+                            cid_seed_s3,
+                        )
+                    };
                     let seq_next = seq.fetch_add(1, Ordering::Relaxed) + 1;
                     let epio = Frame {
                         connection_id: conn_id,

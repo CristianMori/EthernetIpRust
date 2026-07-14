@@ -557,26 +557,33 @@ impl ConsumerLoop {
                     if *shutdown_rx.borrow() { break; }
                 }
                 res = self.udp.recv_from(&mut buf) => {
-                    let (n, _peer) = match res {
+                    let (n, sender) = match res {
                         Ok(x) => x,
                         Err(_) => continue,
                     };
-                    self.handle_datagram(&buf[..n]).await;
+                    self.handle_datagram(&buf[..n], sender).await;
                 }
             }
         }
     }
 
-    async fn handle_datagram(&self, bytes: &[u8]) {
+    async fn handle_datagram(&self, bytes: &[u8], sender: SocketAddr) {
         let frame = match decode_epio(bytes, false) {
             Ok(f) => f,
             Err(_) => return,
         };
         let (data_len, seeds) = {
-            let guard = self.shared.lock().await;
-            let Some(conn) = guard.as_ref() else { return };
+            let mut guard = self.shared.lock().await;
+            let Some(conn) = guard.as_mut() else { return };
             if frame.connection_id != conn.o_to_t_conn_id {
                 return;
+            }
+            // Track the scanner's actual UDP source — its port is typically
+            // ephemeral, not the well-known 2222. Producer / TCOO tasks read
+            // peer_udp on every tick so they send back where the scanner is
+            // actually listening.
+            if conn.peer_udp != sender {
+                conn.peer_udp = sender;
             }
             (
                 conn.input_data_len,

@@ -133,7 +133,11 @@ struct ConnectionRow {
     t_to_o_conn_id: u32,
     input_assembly: u16,
     output_assembly: u16,
-    peer_udp: SocketAddr,
+    /// Live peer UDP endpoint — updated by the consumer to the actual source
+    /// of received O→T frames so the producer sends T→O back to the port the
+    /// scanner is actually receiving on (typically an ephemeral port, not the
+    /// well-known 2222).
+    peer_udp: Arc<std::sync::RwLock<SocketAddr>>,
     o_to_t_rpi_us: u32,
     t_to_o_rpi_us: u32,
     producer_shutdown: watch::Sender<bool>,
@@ -151,7 +155,7 @@ impl ConnectionTable {
                 t_to_o_rpi_us: r.t_to_o_rpi_us,
                 input_assembly: r.input_assembly,
                 output_assembly: r.output_assembly,
-                peer_udp: r.peer_udp,
+                peer_udp: *r.peer_udp.read().unwrap(),
             })
             .collect()
     }
@@ -476,10 +480,15 @@ impl SessionState {
         // share the socket cleanly again.)
         let send_udp = self.udp.clone();
         let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
+        // Shared, mutable peer_udp — the consumer will update it to the
+        // actual source of received O→T frames once the scanner starts
+        // producing, so the producer sends T→O back to the port the peer
+        // is actually listening on (typically ephemeral, not 2222).
+        let peer_udp = Arc::new(std::sync::RwLock::new(peer_udp));
         let producer = ProducerState {
             connection_id: req.t_to_o_connection_id,
             udp: send_udp,
-            peer_udp,
+            peer_udp: peer_udp.clone(),
             rpi_us: req.t_to_o_rpi_us,
             assemblies: self.assemblies.clone(),
             input_assembly: input_asm,
@@ -636,7 +645,7 @@ fn parse_connection_path(path: &[u8]) -> Result<(u16, u16)> {
 struct ProducerState {
     connection_id: u32,
     udp: Arc<UdpSocket>,
-    peer_udp: SocketAddr,
+    peer_udp: Arc<std::sync::RwLock<SocketAddr>>,
     rpi_us: u32,
     assemblies: AssemblyRegistry,
     input_assembly: u16,
@@ -667,7 +676,8 @@ impl ProducerState {
                         data,
                     };
                     let bytes = epio::encode_frame(&frame);
-                    if let Err(err) = self.udp.send_to(&bytes, self.peer_udp).await {
+                    let peer = *self.peer_udp.read().unwrap();
+                    if let Err(err) = self.udp.send_to(&bytes, peer).await {
                         tracing::warn!("producer send failed: {err}");
                     }
                 }
@@ -692,7 +702,7 @@ impl ConsumerState {
                     if *shutdown_rx.borrow() { break; }
                 }
                 res = self.udp.recv_from(&mut buf) => {
-                    let (n, _peer) = match res {
+                    let (n, sender) = match res {
                         Ok(x) => x,
                         Err(err) => {
                             tracing::warn!("adapter udp recv error: {err}");
@@ -711,9 +721,17 @@ impl ConsumerState {
                         table.rows
                             .values()
                             .find(|row| row.o_to_t_conn_id == frame.connection_id)
-                            .map(|row| (row.output_assembly, row.o_to_t_conn_id))
+                            .map(|row| (row.output_assembly, row.o_to_t_conn_id, row.peer_udp.clone()))
                     };
-                    if let Some((asm, _)) = target {
+                    if let Some((asm, _, peer_udp_shared)) = target {
+                        // Track the scanner's actual UDP source — its port is
+                        // typically ephemeral, not the well-known 2222. The
+                        // producer reads this on every tick so T→O lands where
+                        // the scanner is actually listening.
+                        let cur = *peer_udp_shared.read().unwrap();
+                        if cur != sender {
+                            *peer_udp_shared.write().unwrap() = sender;
+                        }
                         // Truncate/pad the incoming data to the assembly size, in
                         // case the scanner sends a larger payload than we host.
                         let asm_snapshot = self.assemblies.snapshot(asm);

@@ -563,6 +563,17 @@ async fn handle_safety_forward_open(
     reply.extend_from_slice(&app_reply.target_device_serial.to_le_bytes());
     reply.extend_from_slice(&app_reply.target_connection_serial.to_le_bytes());
 
+    // Seed the originator-side rollover from the safety segment's
+    // initial_rollover_value (Extended format only — Base format doesn't fold
+    // rollover into any CRC). C# scanner defaults this to 0xFFFF, so a naive
+    // zero-init on our side works for the first ~8.4 s window and then all
+    // frames CRC-fail on the wrap.
+    let initial_rollover = if format == SafetyFormat::Extended {
+        safety_seg.initial_rollover_value
+    } else {
+        0
+    };
+
     // Register the active connection so consumer / TCOO tasks pick it up.
     // peer_udp came from the caller (Sockaddr Info T→O or fallback default).
     shared.lock().await.insert(assigned_oto_t, ActiveConnection {
@@ -577,7 +588,7 @@ async fn handle_safety_forward_open(
         cid_seed_s5,
         input_data_len: cfg.input_data_size,
         production_start: Instant::now(),
-        rollover_count: 0,
+        rollover_count: initial_rollover,
         last_ts: 0,
         rollover_initialized: false,
         last_ping: 0xFF,
@@ -672,7 +683,7 @@ impl ConsumerLoop {
             conn.rollover_count
         };
 
-        let result = frame_codec::decode(
+        let mut result = frame_codec::decode(
             &frame.data,
             data_len,
             conn_format,
@@ -681,6 +692,25 @@ impl ConsumerLoop {
             seeds.2,
             rollover_now,
         );
+
+        // Idle-frame fallback: the C# scanner emits a few idle frames with
+        // rollover_count=0 (its struct default) before its consumer flips to
+        // run and adopts initial_rollover_value. Retry with 0 when the first
+        // attempt failed AND the mode byte says idle AND we're not already at 0.
+        if result.is_err() && rollover_now != 0 && wire_len > data_len {
+            let mode_byte = frame.data[data_len];
+            if mode_byte & 0x80 == 0 {
+                result = frame_codec::decode(
+                    &frame.data,
+                    data_len,
+                    conn_format,
+                    seeds.0,
+                    seeds.1,
+                    seeds.2,
+                    0,
+                );
+            }
+        }
 
         match result {
             Ok(DecodedFrame { actual_data, mode, .. }) => {

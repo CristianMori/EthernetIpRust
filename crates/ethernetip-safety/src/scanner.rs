@@ -436,6 +436,7 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
             cid_seed_s3,
             rollover: Arc::new(Mutex::new(RolloverState::default())),
             seq: Arc::new(AtomicU32::new(0)),
+            production_start: std::time::Instant::now(),
         }
     });
 
@@ -508,6 +509,9 @@ struct ClientLegState {
     cid_seed_s3: u16,
     rollover: Arc<Mutex<RolloverState>>,
     seq: Arc<AtomicU32>,
+    /// Monotonic reference the outgoing TCOO consumer_time is derived from
+    /// (elapsed / 128 µs). Same convention as the C# SafetyDevice.
+    production_start: std::time::Instant,
 }
 
 /// Target-timestamp rollover tracker. The 16-bit safety timestamp wraps
@@ -816,13 +820,12 @@ impl ConsumerState {
     }
 
     async fn send_client_tcoo(&self, client: &ClientLegState, ping_reply: u8) {
-        // Consumer time = 128 µs ticks since UNIX epoch — matches how the C++
-        // port derives its TCOO consumer_time_value from the steady clock.
-        let ticks_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros())
-            .unwrap_or(0);
-        let consumer_time_value = ((ticks_us / 128) & 0xFFFF) as u16;
+        // Consumer time = 128 µs ticks since the connection came up. The
+        // producer's time-correction math keys off this monotonic value —
+        // C#, C++, and Python all use a per-connection Stopwatch reference
+        // (see SafetyDevice.SendTimeCoordination in the C# port).
+        let elapsed_us = client.production_start.elapsed().as_micros();
+        let consumer_time_value = ((elapsed_us / 128) & 0xFFFF) as u16;
 
         let mut buf = [0u8; 8];
         let n = if client.format == SafetyFormat::Extended {

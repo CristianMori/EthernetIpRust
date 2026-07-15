@@ -18,7 +18,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -228,6 +228,11 @@ struct ActiveConnection {
     cid_seed_s3: u16,
     cid_seed_s5: u32,
     input_data_len: usize,
+    /// Monotonic reference point for the outgoing consumer_time value in
+    /// every TCOO reply. Set when the FO is accepted; every TCOO advertises
+    /// (elapsed_us / 128) & 0xFFFF from this point so the scanner sees our
+    /// clock tick forward at the CIP Safety-mandated 128 µs cadence.
+    production_start: Instant,
     // Rollover tracking for the ORIGINATOR's producer (scanner's O→T).
     rollover_count: u16,
     last_ts: u16,
@@ -571,6 +576,7 @@ async fn handle_safety_forward_open(
         cid_seed_s3,
         cid_seed_s5,
         input_data_len: cfg.input_data_size,
+        production_start: Instant::now(),
         rollover_count: 0,
         last_ts: 0,
         rollover_initialized: false,
@@ -723,20 +729,29 @@ impl TcooLoop {
                 _ = ticker.tick() => {
                     // Snapshot every active connection under one lock, then
                     // send TCOOs outside the critical section.
-                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8)> = {
+                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8, u16)> = {
                         let guard = self.shared.lock().await;
-                        guard.values().map(|conn| (
-                            conn.t_to_o_conn_id,
-                            conn.peer_udp,
-                            conn.cid_seed_s3,
-                            conn.cid_seed_s5,
-                            conn.format,
-                            (conn.last_ping & 0x03) as u8,
-                        )).collect()
+                        guard.values().map(|conn| {
+                            // consumer_time = monotonic elapsed since FO
+                            // accept, in 128 µs ticks, u16-wrapped. Same
+                            // formula the C# / C++ / Python targets use so
+                            // the producer's time-correction math sees our
+                            // clock advance at the CIP Safety cadence.
+                            let elapsed_us = conn.production_start.elapsed().as_micros();
+                            let consumer_time = ((elapsed_us / 128) & 0xFFFF) as u16;
+                            (
+                                conn.t_to_o_conn_id,
+                                conn.peer_udp,
+                                conn.cid_seed_s3,
+                                conn.cid_seed_s5,
+                                conn.format,
+                                (conn.last_ping & 0x03) as u8,
+                                consumer_time,
+                            )
+                        }).collect()
                     };
-                    for (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping) in rows {
+                    for (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping, consumer_time_value) in rows {
                         let mut buf = [0u8; 8];
-                        let consumer_time_value = 0u16; // TODO: derive from monotonic clock
                         // TCOO CRC family must match the connection's safety
                         // format: Base = CRC-S3, Extended = CRC-S5. Both seed
                         // off the CID (target's identity + SV instance for the

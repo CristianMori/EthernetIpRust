@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ethernetip_safety::{
-    open_safety_scanner, SafetyForwardOpenConfig, SafetyScannerConfig,
+    open_safety_scanner, SafetyForwardOpenConfig, SafetyNetworkNumber, SafetyScannerConfig,
+    UniqueNetworkId,
 };
 
 #[tokio::main]
@@ -32,6 +33,10 @@ async fn main() -> Result<()> {
     let mut rpi_ms: u32 = 50;
     let mut data_size: u16 = 8;
     let mut open_client = false;
+    let mut tunid = UniqueNetworkId::default();
+    let mut consumed_asm: u32 = 300;
+    let mut produced_asm: u32 = 301;
+    let mut config_asm: u32 = 302;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -41,20 +46,31 @@ async fn main() -> Result<()> {
             "--rpi-ms" => rpi_ms = args.next().context("--rpi-ms needs a number")?.parse()?,
             "--data-size" => data_size = args.next().context("--data-size needs a number")?.parse()?,
             "--client" => open_client = true,
+            "--snn" => {
+                tunid.snn = parse_snn(&args.next().context("--snn needs 12 hex chars")?)?;
+            }
+            "--node" => {
+                tunid.node_address =
+                    parse_hex_u32(&args.next().context("--node needs a hex value")?)?;
+            }
+            "--consumed" => consumed_asm = args.next().context("--consumed needs a number")?.parse()?,
+            "--produced" => produced_asm = args.next().context("--produced needs a number")?.parse()?,
+            "--config" => config_asm = args.next().context("--config needs a number")?.parse()?,
             other => anyhow::bail!("unexpected argument `{}`", other),
         }
     }
 
     let rpi_us = rpi_ms.saturating_mul(1000).max(1000);
     let server = SafetyForwardOpenConfig {
-        consumed_assembly: 300,
-        produced_assembly: 301,
-        config_assembly: 302,
+        consumed_assembly: consumed_asm,
+        produced_assembly: produced_asm,
+        config_assembly: config_asm,
         consumed_data_size: data_size,
         produced_data_size: data_size,
         rpi_us,
         o_to_t_rpi_us: rpi_us,
         t_to_o_rpi_us: rpi_us,
+        tunid,
         ..SafetyForwardOpenConfig::default()
     };
     let mut cfg = SafetyScannerConfig::new(adapter, server)
@@ -64,14 +80,15 @@ async fn main() -> Result<()> {
         // Client leg swaps the O↔T assemblies so target's produce path shows
         // up as the scanner's consume path.
         let client = SafetyForwardOpenConfig {
-            consumed_assembly: 301,
-            produced_assembly: 300,
-            config_assembly: 302,
+            consumed_assembly: produced_asm,
+            produced_assembly: consumed_asm,
+            config_assembly: config_asm,
             consumed_data_size: data_size,
             produced_data_size: data_size,
             rpi_us,
             o_to_t_rpi_us: rpi_us,
             t_to_o_rpi_us: rpi_us,
+            tunid,
             ..SafetyForwardOpenConfig::default()
         };
         cfg = cfg.client(client);
@@ -135,4 +152,21 @@ async fn main() -> Result<()> {
     println!("\nclosing...");
     conn.close().await?;
     Ok(())
+}
+
+fn parse_hex_u32(s: &str) -> Result<u32> {
+    let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    Ok(u32::from_str_radix(t, 16)?)
+}
+
+fn parse_snn(s: &str) -> Result<SafetyNetworkNumber> {
+    let hex: String = s.chars().filter(|c| !"_- ".contains(*c)).collect();
+    anyhow::ensure!(hex.len() == 12, "SNN must be 12 hex chars (got {})", hex.len());
+    let mut bytes = [0u8; 6];
+    // Human-readable form is big-endian ("4D90_0101_A35C") but on the wire the
+    // 6-byte SNN is little-endian, matching the C# adapter's parser.
+    for i in 0..6 {
+        bytes[5 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(SafetyNetworkNumber(bytes))
 }

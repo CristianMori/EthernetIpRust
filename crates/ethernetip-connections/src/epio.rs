@@ -40,9 +40,22 @@ pub struct Frame {
 /// UDP EPIO frames start directly at the item count — no leading
 /// `interface_handle` / `timeout` prefix.
 pub fn encode_frame(frame: &Frame) -> Vec<u8> {
+    encode_frame_inner(frame, /*include_cip_sequence=*/ true)
+}
+
+/// Same as [`encode_frame`] but omits the 2-byte CIP Class 1 sequence
+/// count. Use this for CIP Safety data / TCOO frames — safety runs over a
+/// separate transport class that lays out its own sequencing inside the
+/// safety-frame body, so the standard Class 1 seq_count doesn't belong on
+/// the wire.
+pub fn encode_frame_raw(frame: &Frame) -> Vec<u8> {
+    encode_frame_inner(frame, /*include_cip_sequence=*/ false)
+}
+
+fn encode_frame_inner(frame: &Frame, include_cip_sequence: bool) -> Vec<u8> {
+    let seq_bytes = if include_cip_sequence { 2 } else { 0 };
     let run_idle_bytes = if frame.run_idle.is_some() { 4 } else { 0 };
-    // Payload = CIP seq (2) + [run/idle (4)] + app data
-    let payload_len = 2 + run_idle_bytes + frame.data.len();
+    let payload_len = seq_bytes + run_idle_bytes + frame.data.len();
     let total = 2 + 4 + 8 + 4 + payload_len;
     let mut buf = BytesMut::with_capacity(total);
     buf.put_u16_le(2); // item count
@@ -52,7 +65,9 @@ pub fn encode_frame(frame: &Frame) -> Vec<u8> {
     buf.put_u32_le(frame.sequence);
     buf.put_u16_le(item_type::CONNECTED_DATA);
     buf.put_u16_le(payload_len as u16);
-    buf.put_u16_le(frame.cip_sequence);
+    if include_cip_sequence {
+        buf.put_u16_le(frame.cip_sequence);
+    }
     if let Some(run) = frame.run_idle {
         buf.put_u32_le(if run { 1 } else { 0 });
     }
@@ -68,6 +83,21 @@ pub fn encode_frame(frame: &Frame) -> Vec<u8> {
 /// which is why this decoder walks the byte stream by hand instead of going
 /// through the shared TCP CPF envelope parser.
 pub fn decode_frame(bytes: &[u8], expect_run_idle: bool) -> Result<Frame> {
+    decode_frame_inner(bytes, expect_run_idle, /*expect_cip_sequence=*/ true)
+}
+
+/// Same as [`decode_frame`] but the payload is delivered without stripping a
+/// leading 2-byte CIP Class 1 sequence count. Use this for CIP Safety frames
+/// — see the note on [`encode_frame_raw`].
+pub fn decode_frame_raw(bytes: &[u8]) -> Result<Frame> {
+    decode_frame_inner(bytes, /*expect_run_idle=*/ false, /*expect_cip_sequence=*/ false)
+}
+
+fn decode_frame_inner(
+    bytes: &[u8],
+    expect_run_idle: bool,
+    expect_cip_sequence: bool,
+) -> Result<Frame> {
     if bytes.len() < 18 {
         return Err(EipError::Short {
             expected: 18,
@@ -114,14 +144,20 @@ pub fn decode_frame(bytes: &[u8], expect_run_idle: bool) -> Result<Frame> {
         });
     }
     let payload = &cur[..data_len];
-    if payload.len() < 2 {
-        return Err(EipError::Short {
-            expected: 2,
-            actual: payload.len(),
-        });
-    }
-    let cip_sequence = u16::from_le_bytes([payload[0], payload[1]]);
-    let after_seq = &payload[2..];
+    let (cip_sequence, after_seq) = if expect_cip_sequence {
+        if payload.len() < 2 {
+            return Err(EipError::Short {
+                expected: 2,
+                actual: payload.len(),
+            });
+        }
+        (
+            u16::from_le_bytes([payload[0], payload[1]]),
+            &payload[2..],
+        )
+    } else {
+        (0u16, payload)
+    };
     let (run_idle, data) = if expect_run_idle {
         if after_seq.len() < 4 {
             return Err(EipError::Short {

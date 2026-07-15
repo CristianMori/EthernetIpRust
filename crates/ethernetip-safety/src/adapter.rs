@@ -26,7 +26,9 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use ethernetip_connections::epio::{decode_frame as decode_epio, encode_frame as encode_epio, Frame};
+use ethernetip_connections::epio::{
+    decode_frame_raw as decode_epio, encode_frame_raw as encode_epio, Frame,
+};
 use ethernetip_core::cip::{service, status};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
@@ -133,7 +135,8 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
     let tx_tcoo = Arc::new(AtomicU64::new(0));
     let connection_open = Arc::new(AtomicBool::new(false));
     let next_conn_id = Arc::new(AtomicU32::new(0x8000_0000));
-    let shared: Arc<Mutex<Option<ActiveConnection>>> = Arc::new(Mutex::new(None));
+    let shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -239,7 +242,7 @@ async fn handle_session(
     peer: SocketAddr,
     udp: Arc<UdpSocket>,
     cfg: SafetyAdapterConfig,
-    shared: Arc<Mutex<Option<ActiveConnection>>>,
+    shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
     connection_open: Arc<AtomicBool>,
     next_conn_id: Arc<AtomicU32>,
 ) -> Result<()> {
@@ -288,7 +291,7 @@ async fn handle_session(
         }
     }
     connection_open.store(false, Ordering::Relaxed);
-    *shared.lock().await = None;
+    shared.lock().await.clear();
     Ok(())
 }
 
@@ -297,7 +300,7 @@ async fn handle_send_rr_data(
     peer: SocketAddr,
     udp: &UdpSocket,
     cfg: &SafetyAdapterConfig,
-    shared: &Mutex<Option<ActiveConnection>>,
+    shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
     connection_open: &AtomicBool,
     next_conn_id: &AtomicU32,
 ) -> Result<Vec<u8>> {
@@ -367,8 +370,12 @@ async fn handle_send_rr_data(
             }
         }
         s if s == service::FORWARD_CLOSE => {
+            // Removing all rows keeps the semantics simple for now — the
+            // C++/C#/Python ports parse the FC body's connection serial to
+            // remove one specific row; do that next if multi-close per
+            // session is ever needed on both legs independently.
             connection_open.store(false, Ordering::Relaxed);
-            *shared.lock().await = None;
+            shared.lock().await.clear();
             // Minimal Forward_Close reply body: echo conn_serial + orig_vendor + orig_serial + zero pad.
             let mut r = Vec::with_capacity(10);
             if body.len() >= 8 {
@@ -419,7 +426,7 @@ async fn handle_safety_forward_open(
     body: &[u8],
     peer_udp: SocketAddr,
     cfg: &SafetyAdapterConfig,
-    shared: &Mutex<Option<ActiveConnection>>,
+    shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
     connection_open: &AtomicBool,
     next_conn_id: &AtomicU32,
 ) -> Result<Vec<u8>> {
@@ -553,7 +560,7 @@ async fn handle_safety_forward_open(
 
     // Register the active connection so consumer / TCOO tasks pick it up.
     // peer_udp came from the caller (Sockaddr Info T→O or fallback default).
-    *shared.lock().await = Some(ActiveConnection {
+    shared.lock().await.insert(assigned_oto_t, ActiveConnection {
         o_to_t_conn_id: assigned_oto_t,
         t_to_o_conn_id,
         peer_udp,
@@ -580,7 +587,7 @@ struct ConsumerLoop {
     input_data: Arc<Mutex<Vec<u8>>>,
     rx_valid: Arc<AtomicU64>,
     rx_crc_fail: Arc<AtomicU64>,
-    shared: Arc<Mutex<Option<ActiveConnection>>>,
+    shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
     format: SafetyFormat,
 }
 
@@ -604,16 +611,29 @@ impl ConsumerLoop {
     }
 
     async fn handle_datagram(&self, bytes: &[u8], sender: SocketAddr) {
-        let frame = match decode_epio(bytes, false) {
+        let frame = match decode_epio(bytes) {
             Ok(f) => f,
             Err(_) => return,
         };
-        let (data_len, seeds, conn_format) = {
+        // Derive the safety data length from the wire size so we don't have
+        // to match a preconfigured cfg.input_data_size — real scanners
+        // negotiate the payload size in the FO's network parameters and
+        // the wire is self-describing. Short frames encode data_len 1-2
+        // as wire_len - 6; long frames encode data_len 3+ as
+        // (wire_len - 8) / 2.
+        let wire_len = frame.data.len();
+        let data_len = if wire_len == 7 || wire_len == 8 {
+            wire_len - 6
+        } else if wire_len >= 14 && (wire_len - 8) % 2 == 0 {
+            (wire_len - 8) / 2
+        } else {
+            // Unrecognized size — could be TCOO on the wrong id or garbage.
+            return;
+        };
+
+        let (seeds, conn_format) = {
             let mut guard = self.shared.lock().await;
-            let Some(conn) = guard.as_mut() else { return };
-            if frame.connection_id != conn.o_to_t_conn_id {
-                return;
-            }
+            let Some(conn) = guard.get_mut(&frame.connection_id) else { return };
             // Track the scanner's actual UDP source — its port is typically
             // ephemeral, not the well-known 2222. Producer / TCOO tasks read
             // peer_udp on every tick so they send back where the scanner is
@@ -622,7 +642,6 @@ impl ConsumerLoop {
                 conn.peer_udp = sender;
             }
             (
-                conn.input_data_len,
                 (conn.pid_seed_s1, conn.pid_seed_s3, conn.pid_seed_s5),
                 conn.format,
             )
@@ -634,7 +653,7 @@ impl ConsumerLoop {
 
         let rollover_now = {
             let mut guard = self.shared.lock().await;
-            let Some(conn) = guard.as_mut() else { return };
+            let Some(conn) = guard.get_mut(&frame.connection_id) else { return };
             if conn.rollover_initialized {
                 let delta = this_ts as i32 - conn.last_ts as i32;
                 if delta < -0x4000 {
@@ -662,7 +681,7 @@ impl ConsumerLoop {
                 let ping = (mode.0 & 0x03) as u16;
                 {
                     let mut guard = self.shared.lock().await;
-                    if let Some(conn) = guard.as_mut() {
+                    if let Some(conn) = guard.get_mut(&frame.connection_id) {
                         conn.last_ping = ping;
                     }
                 }
@@ -671,11 +690,10 @@ impl ConsumerLoop {
                 let n = actual_data.len().min(w.len());
                 w[..n].copy_from_slice(&actual_data[..n]);
             }
-            Err(SafetyDecodeError::TooShort { .. }) => {
-                // Not a data frame — probably a TCOO on our end; ignore.
-            }
-            Err(_) => {
-                self.rx_crc_fail.fetch_add(1, Ordering::Relaxed);
+            Err(err) => {
+                if !matches!(err, SafetyDecodeError::TooShort { .. }) {
+                    self.rx_crc_fail.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -688,7 +706,7 @@ struct TcooLoop {
     peer_udp_port: u16,
     tcoo_period_us: u32,
     tx_tcoo: Arc<AtomicU64>,
-    shared: Arc<Mutex<Option<ActiveConnection>>>,
+    shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
 }
 
 impl TcooLoop {
@@ -703,53 +721,53 @@ impl TcooLoop {
                     if *shutdown_rx.borrow() { break; }
                 }
                 _ = ticker.tick() => {
-                    let (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping) = {
+                    // Snapshot every active connection under one lock, then
+                    // send TCOOs outside the critical section.
+                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8)> = {
                         let guard = self.shared.lock().await;
-                        let Some(conn) = guard.as_ref() else { continue };
-                        (
+                        guard.values().map(|conn| (
                             conn.t_to_o_conn_id,
-                            // Use the full tracked peer_udp — the consumer
-                            // keeps it in sync with the scanner's actual
-                            // (typically ephemeral) source endpoint.
                             conn.peer_udp,
                             conn.cid_seed_s3,
                             conn.cid_seed_s5,
                             conn.format,
                             (conn.last_ping & 0x03) as u8,
-                        )
+                        )).collect()
                     };
-                    let mut buf = [0u8; 8];
-                    let consumer_time_value = 0u16; // placeholder — real impl derives from monotonic clock
-                    // TCOO CRC family must match the connection's safety
-                    // format: Base = CRC-S3, Extended = CRC-S5. Both seed off
-                    // the CID (target's identity + SV instance for the server
-                    // direction, which is where this adapter lives).
-                    let n = if format == SafetyFormat::Extended {
-                        frame_codec::encode_time_coordination_extended(
-                            &mut buf,
-                            ping,
-                            consumer_time_value,
-                            cid_seed_s5,
-                        )
-                    } else {
-                        frame_codec::encode_time_coordination(
-                            &mut buf,
-                            ping,
-                            consumer_time_value,
-                            cid_seed_s3,
-                        )
-                    };
-                    let seq_next = seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    let epio = Frame {
-                        connection_id: conn_id,
-                        sequence: seq_next,
-                        cip_sequence: seq_next as u16,
-                        run_idle: None,
-                        data: buf[..n].to_vec(),
-                    };
-                    let bytes = encode_epio(&epio);
-                    if self.udp.send_to(&bytes, peer).await.is_ok() {
-                        self.tx_tcoo.fetch_add(1, Ordering::Relaxed);
+                    for (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping) in rows {
+                        let mut buf = [0u8; 8];
+                        let consumer_time_value = 0u16; // TODO: derive from monotonic clock
+                        // TCOO CRC family must match the connection's safety
+                        // format: Base = CRC-S3, Extended = CRC-S5. Both seed
+                        // off the CID (target's identity + SV instance for the
+                        // server direction, which is where this adapter lives).
+                        let n = if format == SafetyFormat::Extended {
+                            frame_codec::encode_time_coordination_extended(
+                                &mut buf,
+                                ping,
+                                consumer_time_value,
+                                cid_seed_s5,
+                            )
+                        } else {
+                            frame_codec::encode_time_coordination(
+                                &mut buf,
+                                ping,
+                                consumer_time_value,
+                                cid_seed_s3,
+                            )
+                        };
+                        let seq_next = seq.fetch_add(1, Ordering::Relaxed) + 1;
+                        let epio = Frame {
+                            connection_id: conn_id,
+                            sequence: seq_next,
+                            cip_sequence: seq_next as u16,
+                            run_idle: None,
+                            data: buf[..n].to_vec(),
+                        };
+                        let bytes = encode_epio(&epio);
+                        if self.udp.send_to(&bytes, peer).await.is_ok() {
+                            self.tx_tcoo.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

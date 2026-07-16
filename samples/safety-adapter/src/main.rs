@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ethernetip_safety::{
     start_safety_adapter, CipDispatcher, SafetyAdapterConfig, SafetyNetworkNumber,
-    SafetySupervisorObject,
+    SafetySupervisorObject, SafetyValidatorObject,
 };
 
 #[tokio::main]
@@ -36,10 +36,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Build a Safety Supervisor (class 0x39, instance 1) and register it on
-    // a dispatcher. A commissioning scanner can now target Safety_Reset
-    // (0x54), Propose_TUNID (0x56), and Apply_TUNID (0x57) — plus the
-    // standard Get_Attribute_Single on the supervisor's eight attributes.
+    // Build a Safety Supervisor (class 0x39, instance 1) and a Safety
+    // Validator (class 0x3A, one instance per open safety connection —
+    // pre-created here so a scanner's `Get_Attribute_Single` against
+    // class 0x3A / instance 1 returns something instead of
+    // OBJECT_DOES_NOT_EXIST). Register both on a shared dispatcher; the
+    // safety adapter will route any MR service that isn't
+    // FORWARD_OPEN / FORWARD_CLOSE through it.
     let mut supervisor = SafetySupervisorObject::new(
         SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
         0xC0A80154,
@@ -47,6 +50,16 @@ async fn main() -> Result<()> {
     supervisor.start();
     let dispatcher = Arc::new(CipDispatcher::new());
     dispatcher.register_class(supervisor.into_cip_class());
+
+    let mut validator = SafetyValidatorObject::new();
+    dispatcher.register_class(validator.into_cip_class());
+    // Pre-allocate one Validator instance so browsers can see it before
+    // any connection opens. Real deployments create these lazily on FO
+    // acceptance via `create_instance_via_dispatcher`.
+    let _preallocated = validator.create_instance_via_dispatcher(
+        &dispatcher,
+        Default::default(),
+    );
 
     let cfg = SafetyAdapterConfig::new(0x0001, 0xC0FFEE01, input_size)
         .tcp_bind(tcp_bind)

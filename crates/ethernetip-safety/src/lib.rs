@@ -9,11 +9,15 @@ pub mod scanner;
 pub mod segment;
 pub mod supervisor;
 pub mod types;
+pub mod validator;
 
 pub use adapter::{start_safety_adapter, SafetyAdapterConfig, SafetyAdapterHandle};
 pub use supervisor::{
     SafetySupervisorMode, SafetySupervisorObject, SafetySupervisorState,
     APPLY_TUNID_SERVICE, PROPOSE_TUNID_SERVICE, SAFETY_RESET_SERVICE,
+};
+pub use validator::{
+    SafetyValidatorInstanceState, SafetyValidatorObject, SafetyValidatorState,
 };
 
 pub use forward_open::{

@@ -105,4 +105,20 @@ impl CipDispatcher {
         let instance = class.get_instance_mut(instance_id)?;
         Some(f(instance))
     }
+
+    /// Give a scoped mutable reference to a whole registered class.
+    /// Callers use this to add new instances after the class has been
+    /// handed to the dispatcher — the Safety Validator, for example,
+    /// allocates a fresh instance every time a safety connection opens.
+    pub fn with_class_mut<F, R>(&self, class_code: u16, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut crate::cip::class::CipClass) -> R,
+    {
+        let mut guard = self
+            .classes
+            .lock()
+            .expect("CipDispatcher classes mutex poisoned");
+        let class = guard.get_mut(&class_code)?;
+        Some(f(class))
+    }
 }

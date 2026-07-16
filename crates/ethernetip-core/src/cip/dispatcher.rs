@@ -86,4 +86,23 @@ impl CipDispatcher {
             .expect("CipDispatcher classes mutex poisoned")
             .contains_key(&class_code)
     }
+
+    /// Give a scoped mutable reference to an instance inside a registered
+    /// class. Returns `None` when the class isn't registered or the
+    /// instance id isn't present. Handy when a caller has already handed a
+    /// class over to the dispatcher and now wants to push state into one
+    /// of its attributes — e.g. a Safety Supervisor whose `start()` needs
+    /// to update the State (attr 1) and Mode (attr 2) attributes.
+    pub fn with_instance_mut<F, R>(&self, class_code: u16, instance_id: u32, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut crate::cip::instance::CipInstance) -> R,
+    {
+        let mut guard = self
+            .classes
+            .lock()
+            .expect("CipDispatcher classes mutex poisoned");
+        let class = guard.get_mut(&class_code)?;
+        let instance = class.get_instance_mut(instance_id)?;
+        Some(f(instance))
+    }
 }

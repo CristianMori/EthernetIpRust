@@ -183,24 +183,77 @@ impl SafetySupervisorObject {
     }
 
     /// Transition to Executing / Run — ready to accept safety connections.
-    pub fn start(&self) {
+    /// Attributes 1 (State) and 2 (Mode) are updated in the CipClass if it
+    /// hasn't been consumed yet by [`into_cip_class`]; after consumption use
+    /// [`Self::sync_to_dispatcher`] to push the new values through the
+    /// dispatcher.
+    pub fn start(&mut self) {
         let mut g = self.inner.lock().unwrap();
         g.state = SafetySupervisorState::Executing;
         g.mode = SafetySupervisorMode::Run;
+        let state = g.state as u8;
+        let mode = g.mode as u8;
+        drop(g);
+        self.sync_state_mode_local(state, mode);
     }
 
     /// Transition to Abort (safety fault detected). The application picks
     /// the moment to call this; the supervisor itself doesn't watchdog.
-    pub fn abort(&self) {
+    pub fn abort(&mut self) {
         let mut g = self.inner.lock().unwrap();
         g.state = SafetySupervisorState::Abort;
+        let state = g.state as u8;
+        let mode = g.mode as u8;
+        drop(g);
+        self.sync_state_mode_local(state, mode);
     }
 
     /// Reset from Abort back to Idle.
-    pub fn reset(&self) {
+    pub fn reset(&mut self) {
         let mut g = self.inner.lock().unwrap();
         g.state = SafetySupervisorState::Idle;
         g.mode = SafetySupervisorMode::Idle;
+        let state = g.state as u8;
+        let mode = g.mode as u8;
+        drop(g);
+        self.sync_state_mode_local(state, mode);
+    }
+
+    /// Write the current State / Mode into attributes 1 / 2 of the not-yet-
+    /// consumed CipClass. Silent no-op once `into_cip_class` has run.
+    fn sync_state_mode_local(&mut self, state: u8, mode: u8) {
+        let Some(cls) = self.cip_class.as_mut() else { return };
+        let Some(inst) = cls.get_instance_mut(1) else { return };
+        if let Some(a) = inst.get_attribute_mut(1) {
+            a.set_data(&[state]);
+        }
+        if let Some(a) = inst.get_attribute_mut(2) {
+            a.set_data(&[mode]);
+        }
+    }
+
+    /// Push the current State / Mode into attributes 1 / 2 of the given
+    /// running dispatcher's Safety Supervisor instance. Use this after
+    /// [`Self::into_cip_class`] has consumed the class and later
+    /// state-transition calls (`start`, `abort`, `reset`) need to reflect
+    /// through the dispatcher.
+    pub fn sync_to_dispatcher(&self, dispatcher: &ethernetip_core::cip::CipDispatcher) {
+        let g = self.inner.lock().unwrap();
+        let state = g.state as u8;
+        let mode = g.mode as u8;
+        drop(g);
+        dispatcher.with_instance_mut(
+            ethernetip_core::cip::class_codes::SAFETY_SUPERVISOR,
+            1,
+            |inst| {
+                if let Some(a) = inst.get_attribute_mut(1) {
+                    a.set_data(&[state]);
+                }
+                if let Some(a) = inst.get_attribute_mut(2) {
+                    a.set_data(&[mode]);
+                }
+            },
+        );
     }
 
     pub fn state(&self) -> SafetySupervisorState {
@@ -419,6 +472,46 @@ mod tests {
         let response =
             dispatcher.dispatch(APPLY_TUNID_SERVICE, path, vec![0u8; UniqueNetworkId::SIZE]);
         assert_eq!(response.general_status, status::OBJECT_STATE_CONFLICT);
+    }
+
+    #[test]
+    fn start_before_register_reflects_in_attribute() {
+        // Transition to Executing BEFORE the class is consumed — the state
+        // should already show through on the first Get_Attribute_Single.
+        let mut sup = SafetySupervisorObject::new(
+            SafetyNetworkNumber([0; 6]),
+            0xC0A8_0001,
+        );
+        sup.start();
+        let dispatcher = Arc::new(CipDispatcher::new());
+        dispatcher.register_class(sup.into_cip_class());
+        // Attr 1 = State (USINT).
+        let mut p = PATH_CLS_INST.to_vec();
+        p.extend_from_slice(&[0x30, 0x01]);
+        let response = dispatcher.dispatch(0x0E, CipPath::parse(&p).unwrap(), Vec::new());
+        assert_eq!(response.general_status, status::SUCCESS);
+        assert_eq!(response.data, vec![SafetySupervisorState::Executing as u8]);
+    }
+
+    #[test]
+    fn sync_to_dispatcher_pushes_state_after_register() {
+        // Transition AFTER registration — attr shouldn't move until
+        // sync_to_dispatcher is called.
+        let (dispatcher, mut sup) = make_supervisor();
+        let mut p = PATH_CLS_INST.to_vec();
+        p.extend_from_slice(&[0x30, 0x01]);
+        let path_attr1 = CipPath::parse(&p).unwrap();
+        // Baseline — Idle.
+        let r0 = dispatcher.dispatch(0x0E, path_attr1.clone(), Vec::new());
+        assert_eq!(r0.data, vec![SafetySupervisorState::Idle as u8]);
+        // Transition state on the supervisor — attr not synced yet.
+        sup.start();
+        let r1 = dispatcher.dispatch(0x0E, path_attr1.clone(), Vec::new());
+        assert_eq!(r1.data, vec![SafetySupervisorState::Idle as u8]);
+        // Push through the dispatcher — attr now Executing.
+        sup.sync_to_dispatcher(&dispatcher);
+        let r2 = dispatcher.dispatch(0x0E, path_attr1, Vec::new());
+        assert_eq!(r2.data, vec![SafetySupervisorState::Executing as u8]);
     }
 
     #[test]

@@ -37,12 +37,11 @@ async fn main() -> Result<()> {
     }
 
     // Build a Safety Supervisor (class 0x39, instance 1) and a Safety
-    // Validator (class 0x3A, one instance per open safety connection —
-    // pre-created here so a scanner's `Get_Attribute_Single` against
-    // class 0x3A / instance 1 returns something instead of
-    // OBJECT_DOES_NOT_EXIST). Register both on a shared dispatcher; the
-    // safety adapter will route any MR service that isn't
-    // FORWARD_OPEN / FORWARD_CLOSE through it.
+    // Validator (class 0x3A). Register both on a shared dispatcher. The
+    // adapter routes any MR service that isn't FORWARD_OPEN / FORWARD_CLOSE
+    // through the dispatcher, AND allocates a fresh Validator instance on
+    // every accepted safety FO — the instance id becomes the target-side
+    // sv_inst that feeds the PID / CID seed derivation.
     let mut supervisor = SafetySupervisorObject::new(
         SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
         0xC0A80154,
@@ -53,19 +52,14 @@ async fn main() -> Result<()> {
 
     let mut validator = SafetyValidatorObject::new();
     dispatcher.register_class(validator.into_cip_class());
-    // Pre-allocate one Validator instance so browsers can see it before
-    // any connection opens. Real deployments create these lazily on FO
-    // acceptance via `create_instance_via_dispatcher`.
-    let _preallocated = validator.create_instance_via_dispatcher(
-        &dispatcher,
-        Default::default(),
-    );
+    let validator = Arc::new(validator);
 
     let cfg = SafetyAdapterConfig::new(0x0001, 0xC0FFEE01, input_size)
         .tcp_bind(tcp_bind)
         .udp_bind(udp_bind)
         .peer_udp_port(peer_udp_port)
-        .dispatcher(dispatcher);
+        .dispatcher(dispatcher)
+        .validator(validator);
     let handle = start_safety_adapter(cfg).await?;
 
     println!(

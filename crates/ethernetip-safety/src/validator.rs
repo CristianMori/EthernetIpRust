@@ -80,6 +80,7 @@ impl SafetyValidatorInstanceState {
 /// runtime state tracker is held separately on the validator object so
 /// callers can update rollover / counters without going through the CIP
 /// attribute layer.
+#[derive(Debug)]
 pub struct SafetyValidatorObject {
     cip_class: Option<CipClass>,
     /// Monotonic instance-id allocator. Starts at 0 so the first allocated

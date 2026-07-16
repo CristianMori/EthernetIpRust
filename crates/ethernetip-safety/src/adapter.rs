@@ -40,6 +40,7 @@ use crate::frame_codec::{self, DecodedFrame, SafetyDecodeError};
 use crate::scanner::IO_UDP_PORT;
 use crate::segment::{SafetyNetworkSegment, SEGMENT_TYPE};
 use crate::types::{SafetyFormat, UniqueNetworkId};
+use crate::validator::{SafetyValidatorInstanceState, SafetyValidatorObject, SafetyValidatorState};
 
 /// Configuration for [`start_safety_adapter`].
 #[derive(Debug, Clone)]
@@ -70,6 +71,14 @@ pub struct SafetyAdapterConfig {
     /// `SERVICE_NOT_SUPPORTED`. Shared `Arc` so a single dispatcher can be
     /// used across multiple sessions.
     pub dispatcher: Option<Arc<CipDispatcher>>,
+    /// Optional Safety Validator (class 0x3A) that allocates a fresh
+    /// instance for every accepted safety Forward_Open. The instance id
+    /// feeds the target-side PID / CID seed calculation (matches C#
+    /// `SafetyDevice.cs:184-215`) — without a validator, the adapter
+    /// hard-codes `sv_inst = 1`. The validator's `CipClass` must already
+    /// be registered on `dispatcher`; both are typically wired together
+    /// at startup.
+    pub validator: Option<Arc<SafetyValidatorObject>>,
 }
 
 impl SafetyAdapterConfig {
@@ -85,6 +94,7 @@ impl SafetyAdapterConfig {
             peer_udp_port: IO_UDP_PORT,
             tcoo_period_us: 100_000,
             dispatcher: None,
+            validator: None,
         }
     }
 
@@ -93,6 +103,14 @@ impl SafetyAdapterConfig {
     /// of returning `SERVICE_NOT_SUPPORTED`.
     pub fn dispatcher(mut self, dispatcher: Arc<CipDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Install a [`SafetyValidatorObject`] so every accepted safety
+    /// Forward_Open gets its own instance and the instance id becomes the
+    /// `sv_inst` component of the target-side PID / CID seeds.
+    pub fn validator(mut self, validator: Arc<SafetyValidatorObject>) -> Self {
+        self.validator = Some(validator);
         self
     }
 
@@ -565,11 +583,26 @@ async fn handle_safety_forward_open(
     };
     let _ = cfg.format; // format on cfg becomes the receive buffer's expected shape only.
 
-    // We advertise a made-up target connection serial (safety validator
-    // instance id) and echo it back in the SafetyAppReply. The scanner uses
-    // this to seed CRCs for the T→O direction (which we don't produce beyond
-    // TCOO right now, so the scanner's client-side seeds are unused).
-    let target_connection_serial: u16 = 1;
+    // Target connection serial = safety validator instance id, echoed in
+    // the SafetyAppReply. Matches C# `SafetyDevice.cs:184-215`: if a
+    // validator is configured we allocate a fresh instance per accepted
+    // FO and use its id; otherwise fall back to a hard-coded 1 (older
+    // Rust adapter behavior — kept so callers without a validator still
+    // interop against clients that always talk to instance 1).
+    let target_connection_serial: u16 = match (cfg.validator.as_ref(), cfg.dispatcher.as_ref())
+    {
+        (Some(v), Some(d)) => v
+            .create_instance_via_dispatcher(
+                d,
+                SafetyValidatorInstanceState {
+                    state: SafetyValidatorState::Executing,
+                    ..Default::default()
+                },
+            )
+            .map(|id| id as u16)
+            .unwrap_or(1),
+        _ => 1,
+    };
 
     // PID seeds for the O→T direction (scanner produces): originator identity +
     // scanner's connection serial. These verify incoming safety data.

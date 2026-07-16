@@ -406,7 +406,12 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
         tx_count: tx_count.clone(),
         seq: AtomicU32::new(0),
         ping_count: AtomicU16::new(0),
-        timestamp: AtomicU16::new(0),
+        // Seed timestamp / rollover from what we advertise in the safety
+        // segment — a spec-compliant consumer reads the same values off the
+        // segment and starts its counters there, so both ends must agree
+        // from frame 1.
+        timestamp: AtomicU16::new(cfg.server.initial_timestamp),
+        rollover_count: AtomicU16::new(cfg.server.initial_rollover_value),
     };
     let producer_task = tokio::spawn(producer.run(shutdown_rx.clone()));
 
@@ -633,6 +638,12 @@ struct ProducerState {
     seq: AtomicU32,
     ping_count: AtomicU16,
     timestamp: AtomicU16,
+    /// Producer rollover — folded into CRC-S5 seed for Extended format.
+    /// Seeded from cfg.server.initial_rollover_value at open, bumped every
+    /// time `timestamp` wraps 0xFFFF -> 0x0000. Base format ignores this
+    /// (S1/S2/S3 don't fold rollover), but any Extended-format consumer
+    /// would drift out of sync at the first wrap if it stayed at 0.
+    rollover_count: AtomicU16,
 }
 
 impl ProducerState {
@@ -651,11 +662,25 @@ impl ProducerState {
                     let active = self.consumer_active.load(Ordering::Relaxed);
                     let ping = (self.ping_count.load(Ordering::Relaxed) & 0x03) as u8;
                     let mode = ModeByte::build(active, ping);
-                    let ts = if active {
-                        let cur = self.timestamp.fetch_add(ts_delta, Ordering::Relaxed);
-                        cur.wrapping_add(ts_delta)
+                    // Snapshot both counters BEFORE advancing them. The frame
+                    // we're about to encode carries the OLD timestamp with
+                    // the OLD rollover; the consumer detects the wrap from
+                    // the *next* frame's timestamp jump and bumps its own
+                    // rollover to match. Reading rollover after the bump
+                    // would emit (old_ts, new_rollover) on the wrap frame,
+                    // which CRCs with the wrong seed and shows up as one
+                    // failed frame per wrap boundary.
+                    let (ts, rollover) = if active {
+                        let ts_send = self.timestamp.load(Ordering::Relaxed);
+                        let rollover_send = self.rollover_count.load(Ordering::Relaxed);
+                        let next_ts = ts_send.wrapping_add(ts_delta);
+                        self.timestamp.store(next_ts, Ordering::Relaxed);
+                        if next_ts < ts_send {
+                            self.rollover_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (ts_send, rollover_send)
                     } else {
-                        0
+                        (0, self.rollover_count.load(Ordering::Relaxed))
                     };
                     let data = self.output_data.lock().await.clone();
                     let mut wire = vec![0u8; frame_codec::wire_size(data.len(), self.format)];
@@ -668,7 +693,7 @@ impl ProducerState {
                         self.pid_seed_s1,
                         self.pid_seed_s3,
                         self.pid_seed_s5,
-                        0, // producer rollover — we don't advance ours here
+                        rollover,
                     );
                     let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
                     let epio = Frame {

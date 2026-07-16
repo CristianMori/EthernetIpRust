@@ -48,6 +48,7 @@ Sibling of [EthernetIPSharp](../EthernetIPSharp), [EthernetIPCpp](../EthernetIPC
 - Consumer-side target-timestamp rollover tracking (essential — the 16-bit safety timestamp wraps every ~8.4 s and CRC-S5 fails without this)
 - Producer-side own-timestamp rollover tracking on the scanner, seeded from the safety segment's `InitialRolloverValue` so the target's validator stays in CRC-S5 sync across every wrap
 - Safety Forward_Open builder with the assembly-shortcut connection path and app-reply parsing
+- **Safety Supervisor Object (class 0x39)** on top of a pluggable `CipClass` / `CipDispatcher` framework — all eight standard attributes (State, Mode, SNN, Configuration Lock, SCID, CFUNID, TUNID, Output Owners) and the three commissioning services (`Safety_Reset` including type-2 Reset Ownership, `Propose_TUNID`, `Apply_TUNID`)
 - Interop-tested against C#, both directions, over 3-minute soaks with 0 CRC failures across ~21 timestamp rollover boundaries
 
 **Logix tag protocol**
@@ -96,10 +97,10 @@ Four workspace crates with one-way dependencies:
                         └────────────────────┘
 ```
 
-- **`ethernetip-core`** — Pure wire types: encapsulation header, CPF envelope + items, CIP status codes + service codes + class ids, EPATH segment writer (`EpathWriter`), libplctag route-path parser, and `EipSession` (tokio TCP client for `RegisterSession` / `SendRRData` / `SendUnitData`). No I/O beyond that one client session.
+- **`ethernetip-core`** — Pure wire types: encapsulation header, CPF envelope + items, CIP status codes + service codes + class ids, EPATH segment writer (`EpathWriter`), libplctag route-path parser, `EipSession` (tokio TCP client for `RegisterSession` / `SendRRData` / `SendUnitData`), and the CIP object framework (`cip::CipDispatcher` / `CipClass` / `CipInstance` / `CipAttribute` / `CipServiceDefinition` + standard `Get_Attribute_Single` / `Set_Attribute_Single` / `Get_Attributes_All` handlers) that classes like Safety Supervisor plug into. No I/O beyond that one client session.
 - **`ethernetip-logix`** — Logix tag protocol on top of `EipSession`. `TagClient` for talking to a real PLC (browse, read, write, fragmented, Class 3, routing, instance cache). `TagServer` for hosting an in-memory `TagRegistry` and answering `Read_Tag` / `Write_Tag` / `Get_Instance_Attribute_List`.
 - **`ethernetip-connections`** — Class 1 building blocks: `AssemblyRegistry` (thread-safe assembly store), EPIO codec (UDP CPF frames — no interface-handle prefix, CIP sequence at start of ConnectedData, optional 32-bit run/idle header O→T only), `ForwardOpenRequest` / `ForwardOpenResponse` / `ForwardCloseRequest` / `ForwardCloseResponse` codecs with typed `NetworkConnectionParameters`, plus a target-side `Adapter` and an originator-side `Scanner` handle.
-- **`ethernetip-safety`** — CIP Safety: `crc` (S1-S5 with PID / rollover seed helpers), `types` (`ModeByte`, `SafetyNetworkNumber`, `SafetyConfigurationId`, `UniqueNetworkId`), `segment::SafetyNetworkSegment` codec, `cpcrc::compute_from_raw`, `frame_codec` (all four base / extended, short / long paths + TCOO), `forward_open::build_safety_forward_open`, `scanner::open_safety_scanner`, `adapter::start_safety_adapter`.
+- **`ethernetip-safety`** — CIP Safety: `crc` (S1-S5 with PID / rollover seed helpers), `types` (`ModeByte`, `SafetyNetworkNumber`, `SafetyConfigurationId`, `UniqueNetworkId`), `segment::SafetyNetworkSegment` codec, `cpcrc::compute_from_raw`, `frame_codec` (all four base / extended, short / long paths + TCOO), `forward_open::build_safety_forward_open`, `scanner::open_safety_scanner`, `adapter::start_safety_adapter`, `supervisor::SafetySupervisorObject` (class 0x39 on top of the CIP object framework — Reset Ownership / Propose / Apply TUNID).
 
 ---
 
@@ -181,6 +182,36 @@ let handle = start_safety_adapter(
 
 // input_data is populated by the consumer as valid frames arrive.
 let input = handle.input_data.lock().await.clone();
+```
+
+### CIP Safety Supervisor (class 0x39) on the adapter
+
+```rust
+use std::sync::Arc;
+use ethernetip_safety::{
+    start_safety_adapter, CipDispatcher, SafetyAdapterConfig, SafetyNetworkNumber,
+    SafetySupervisorObject,
+};
+
+// Build the Supervisor with our SNN + node address, then transition to
+// Executing (Run) so the connection manager will accept safety FOs.
+let mut supervisor = SafetySupervisorObject::new(
+    SafetyNetworkNumber([0xC9, 0x12, 0xB4, 0x00, 0x8D, 0x4D]),
+    0xC0A80154,
+);
+supervisor.start();
+
+// Register the Supervisor's CipClass on a shared dispatcher. Any Message
+// Router request that isn't FORWARD_OPEN / FORWARD_CLOSE — including
+// Safety_Reset with reset_type = 2 (Reset Ownership) — flows through here.
+let dispatcher = Arc::new(CipDispatcher::new());
+dispatcher.register_class(supervisor.into_cip_class());
+
+let handle = start_safety_adapter(
+    SafetyAdapterConfig::new(0x0001, 0xC0FFEE42, /*input_size*/ 8)
+        .dispatcher(dispatcher),
+)
+.await?;
 ```
 
 ### Standard I/O scanner
@@ -355,7 +386,12 @@ The test suite covers CIP path encoding + parsing (round-trips, array indexers, 
 | `path::EpathWriter` | EPATH byte writer that handles symbolic segments, logical class/instance/attribute/element in 8/16/32-bit forms, and word-alignment padding. |
 | `path::parse_route_path` | libplctag-style `"1,0"` port/link decoder. |
 | `cip::ReplyHeader` | Message Router reply prefix parser (service | reply flag, general status, extended status). |
-| `cip::service`, `cip::class`, `cip::status` | Const modules with well-known service / class / status codes. |
+| `cip::service_codes`, `cip::class_codes`, `cip::status` | Const modules with well-known service / class / status codes. |
+| `cip::CipDispatcher` | Registry + router for CIP object requests — resolves `class → instance → service → handler`. Locked internally so it can be shared across sessions via `Arc`. |
+| `cip::CipClass`, `cip::CipInstance`, `cip::CipAttribute`, `cip::AttributeAccess`, `cip::CipDataType` | Object framework primitives — pluggable class definitions with instances, typed attributes, and per-attribute access flags. |
+| `cip::CipServiceDefinition`, `cip::CipServiceHandler`, `cip::CipServiceRequest`, `cip::CipServiceResponse` | Service dispatch types — handlers close over any state they need and are registered per class at class- or instance-level. |
+| `cip::CipPath` | Message Router request path parser (class / instance / attribute / member logical segments; skips port + electronic-key + symbolic segments). |
+| `cip::standard_services` | Ready-made `Get_Attribute_Single` / `Set_Attribute_Single` / `Get_Attributes_All` handlers, auto-registered by `CipClass::new` / `add_standard_instance_services`. |
 | `EipError` | Central error type — I/O, EIP encapsulation status, CIP general status + extended, short buffer, protocol violation. |
 
 ### `ethernetip-logix`
@@ -395,7 +431,8 @@ The test suite covers CIP path encoding + parsing (round-trips, array indexers, 
 | `frame_codec::encode_time_coordination`, `frame_codec::encode_time_coordination_extended` | Base and extended TCOO reply encoders. |
 | `build_safety_forward_open`, `SafetyForwardOpenConfig`, `SafetyAppReply` | Originator-side safety FO builder with CPCRC patching + reply parser. |
 | `open_safety_scanner`, `SafetyScannerConfig`, `SafetyScannerConnection` | Safety scanner (server direction — we produce O→T safety data). |
-| `start_safety_adapter`, `SafetyAdapterConfig`, `SafetyAdapterHandle` | Safety adapter with target-timestamp rollover tracking and a TCOO producer. |
+| `start_safety_adapter`, `SafetyAdapterConfig`, `SafetyAdapterHandle` | Safety adapter with target-timestamp rollover tracking and a TCOO producer. Accepts an optional `CipDispatcher` so registered classes (Safety Supervisor, ...) handle their own Message Router services. |
+| `SafetySupervisorObject`, `SafetySupervisorState`, `SafetySupervisorMode` | CIP Safety Supervisor Object (class 0x39). Owns state / mode / SNN / TUNID / SCID; registers 8 attrs and 3 services (Safety_Reset with Reset Ownership, Propose_TUNID, Apply_TUNID). Hand its `CipClass` to a dispatcher via `into_cip_class()`; push post-registration state transitions with `sync_to_dispatcher()`. |
 
 ---
 
@@ -425,7 +462,9 @@ CIP Safety is a SIL-3-capable layer on top of standard EtherNet/IP. This library
 
 **Rollover tracking (producer):** The scanner has the symmetric problem — it must fold its own outgoing rollover into the S5 seed on every produced frame, and it must snapshot both the timestamp and the rollover *before* advancing them so the wrap frame carries a consistent `(old_ts, old_rollover)` pair. Reading rollover after the bump would emit `(old_ts, new_rollover)` on the wrap boundary, which the consumer can't verify — one CRC failure per wrap. Both counters are seeded from the safety segment's `InitialTimestamp` / `InitialRolloverValue` so both ends agree from frame 1.
 
-**What's still stubbed:** The full CIP Safety Supervisor Object (class 0x39) with its Idle / Configure / Executing state machine and Configure / Apply / Reset services, and the Safety Validator Object (class 0x3A) with per-connection instance state, are not implemented as CIP objects. The safety adapter fakes just enough of the target-side FO acceptance to establish a connection and echo TCOO — real objects with `Get_Attribute_Single` endpoints are a follow-up.
+**Safety Supervisor Object (class 0x39):** implemented on the new pluggable object framework in `ethernetip_core::cip`. Instance 1 carries the eight standard attributes (State, Mode, SNN, Configuration Lock, SCID, CFUNID, TUNID, Output Connection Point Owners) and the three commissioning services — `Safety_Reset` (0x54, with type 0 device / 1 factory / **2 Reset Ownership** clearing CFUNID + owner list + SCID + pending TUNID), `Propose_TUNID` (0x56), `Apply_TUNID` (0x57). The safety-adapter sample constructs one, registers it on a `CipDispatcher`, and hands the dispatcher to `SafetyAdapterConfig::dispatcher` — any Message Router request that isn't FORWARD_OPEN / FORWARD_CLOSE is routed through it.
+
+**What's still stubbed:** The Safety Validator Object (class 0x3A) — per-connection instance state, per-connection PID / CID / rollover attributes, `Safety_Reset` at the connection level — is not implemented; the safety adapter continues to own the connection state directly rather than routing through a Validator instance.
 
 ---
 
@@ -440,6 +479,7 @@ Only tested combinations are listed; blank means not attempted in the initial re
 | Rust Adapter | ✅ | ⚠ O→T works, T→O not received on Windows loopback |  |  |  |  |
 | Rust Safety scanner | ✅ (0 CRC fails) | ✅ (0 CRC fails over 3 min / ~21 rollovers) |  |  |  | — |
 | Rust Safety adapter | ✅ (0 CRC fails) | ✅ (0 CRC fails over 3 min / ~21 rollovers, after upstream C# scanner rollover fix) |  |  |  |  |
+| Rust Safety Supervisor (class 0x39) | unit-tested (14 tests, `Safety_Reset` incl. Reset Ownership + `Propose_TUNID` + `Apply_TUNID` + `Get_Attribute_Single` on 8 attrs) — not yet exercised over the wire against any other port or a live PLC |
 
 The Rust ↔ C# gap was where the last round of wire-format bugs was found — see the [Known limitations](#known-limitations) section.
 
@@ -449,8 +489,8 @@ The Rust ↔ C# gap was where the last round of wire-format bugs was found — s
 
 - **Rust adapter → C# scanner T→O on Windows loopback** is not delivered even though the wire format is correct and `send_to` returns success. Likely a Windows-specific wildcard-bind quirk that would need Sockaddr Info CPF item hand-off to work around cleanly.
 - **Safety scanner has server direction only** — target-produced T→O safety data + our TCOO reply lands as follow-up. C++ / C# / Python ports do both.
-- **No CIP Safety Supervisor / Validator objects** — my safety adapter fakes just enough for FO acceptance and TCOO. `Get_Attribute_Single` against class 0x39 / 0x3A will not respond.
-- **No CIP object framework** — Identity (0x01), TCP/IP Interface (0xF5), Ethernet Link (0xF6), Connection Manager (0x06) are inlined into the adapter's request handler instead of being pluggable CIP objects.
+- **No CIP Safety Validator object (class 0x3A)** — the safety adapter still fakes the connection-instance state that a real Validator would own; `Get_Attribute_Single` against class 0x3A does not respond. The Safety Supervisor (class 0x39) *is* implemented on the new CIP object framework — see [CIP Safety details](#cip-safety-details).
+- **CIP object framework only covers Safety Supervisor** — Identity (0x01), TCP/IP Interface (0xF5), Ethernet Link (0xF6), and Connection Manager (0x06) are still inlined into the adapter's request handler instead of being pluggable CIP objects on top of `ethernetip_core::cip::CipClass`.
 - **No Multiple Service Packet (0x0A)** batching in the tag client.
 - **No UDT template introspection** — struct reads return opaque bytes plus the type-CRC handle.
 - **No reopen-on-drop** for Class 1 or Class 3 — connections that time out have to be reopened by the caller.

@@ -335,6 +335,7 @@ async fn handle_send_rr_data(
             0x00,
             status::PATH_SEGMENT_ERROR,
             &[],
+            &[],
             envelope.timeout,
             None,
         ));
@@ -347,6 +348,7 @@ async fn handle_send_rr_data(
             service_code | service::REPLY_FLAG,
             status::PATH_SEGMENT_ERROR,
             &[],
+            &[],
             envelope.timeout,
             None,
         ));
@@ -355,6 +357,9 @@ async fn handle_send_rr_data(
     let body = &mr[path_end..];
 
     let mut sockaddr_reply_bytes: Option<Vec<u8>> = None;
+    // Extended-status words the reply carries — populated by the dispatcher
+    // path, empty for the FO / FC handlers which never emit ext status.
+    let mut reply_ext_status: Vec<u16> = Vec::new();
     let (reply_service, reply_status, reply_body) = match service_code {
         s if s == service::FORWARD_OPEN => {
             // Prefer the originator's advertised T→O endpoint from Sockaddr
@@ -411,15 +416,14 @@ async fn handle_send_rr_data(
         }
         other => {
             // Route through the CIP object dispatcher if one is registered.
-            // Its own encode() produces the full MR reply (service byte,
-            // reserved, status, ext_words, body), but here we only feed the
-            // reply body / status back to build_reply_envelope, which
-            // rebuilds the MR reply prefix itself. So we split the encoded
-            // response back into its parts.
+            // The dispatcher's response gives us all four MR-reply fields
+            // (service, general_status, extended_status words, body) —
+            // build_reply_envelope carries them through verbatim.
             if let Some(dispatcher) = cfg.dispatcher.as_ref() {
                 match CipPath::parse(path_bytes) {
                     Ok(path) => {
                         let response = dispatcher.dispatch(other, path, body.to_vec());
+                        reply_ext_status = response.extended_status.clone();
                         (response.service_code, response.general_status, response.data)
                     }
                     Err(err) => {
@@ -436,6 +440,7 @@ async fn handle_send_rr_data(
     Ok(build_reply_envelope(
         reply_service,
         reply_status,
+        &reply_ext_status,
         &reply_body,
         envelope.timeout,
         sockaddr_reply_bytes,
@@ -445,15 +450,21 @@ async fn handle_send_rr_data(
 fn build_reply_envelope(
     service: u8,
     status: u8,
+    extended_status: &[u16],
     body: &[u8],
     timeout: u16,
     sockaddr_o_to_t: Option<Vec<u8>>,
 ) -> Vec<u8> {
-    let mut mr_reply = Vec::with_capacity(4 + body.len());
+    // MR reply layout: service, reserved(0), general_status,
+    // extended_status_count (words), extended_status words (LE), body.
+    let mut mr_reply = Vec::with_capacity(4 + extended_status.len() * 2 + body.len());
     mr_reply.push(service);
     mr_reply.push(0);
     mr_reply.push(status);
-    mr_reply.push(0);
+    mr_reply.push(extended_status.len() as u8);
+    for w in extended_status {
+        mr_reply.extend_from_slice(&w.to_le_bytes());
+    }
     mr_reply.extend_from_slice(body);
     let mut items: Vec<Item> = vec![
         Item::null_address(),

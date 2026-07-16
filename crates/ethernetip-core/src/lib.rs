@@ -6,6 +6,7 @@
 
 pub mod cip;
 pub mod cpf;
+pub mod device;
 pub mod encap;
 pub mod error;
 pub mod path;

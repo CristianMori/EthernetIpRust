@@ -79,6 +79,14 @@ pub struct SafetyAdapterConfig {
     /// be registered on `dispatcher`; both are typically wired together
     /// at startup.
     pub validator: Option<Arc<SafetyValidatorObject>>,
+    /// Optional Safety Supervisor (class 0x39). When configured, the
+    /// adapter drives its state machine from connection lifecycle events:
+    /// the first accepted safety Forward_Open transitions the supervisor
+    /// Idle → Executing (mode Idle → Run); the last Forward_Close (or
+    /// end-of-session cleanup that removes the last connection) reverses
+    /// it. Mirrors the C# `SafetyDevice` pattern where the supervisor
+    /// state tracks whether *any* safety connection is live.
+    pub supervisor: Option<Arc<crate::supervisor::SafetySupervisorObject>>,
 }
 
 impl SafetyAdapterConfig {
@@ -95,6 +103,7 @@ impl SafetyAdapterConfig {
             tcoo_period_us: 100_000,
             dispatcher: None,
             validator: None,
+            supervisor: None,
         }
     }
 
@@ -111,6 +120,19 @@ impl SafetyAdapterConfig {
     /// `sv_inst` component of the target-side PID / CID seeds.
     pub fn validator(mut self, validator: Arc<SafetyValidatorObject>) -> Self {
         self.validator = Some(validator);
+        self
+    }
+
+    /// Install a [`crate::supervisor::SafetySupervisorObject`]. The
+    /// adapter will call `.start()` on the first accepted FO and
+    /// `.reset()` when the last connection closes, keeping the
+    /// supervisor's State (attr 1) / Mode (attr 2) in sync with whether
+    /// any safety connection is currently live.
+    pub fn supervisor(
+        mut self,
+        supervisor: Arc<crate::supervisor::SafetySupervisorObject>,
+    ) -> Self {
+        self.supervisor = Some(supervisor);
         self
     }
 
@@ -338,12 +360,21 @@ async fn handle_session(
     // socket or crashed). Drop the same Validator instances the FC path
     // would have removed so those leaks don't accumulate either.
     let mut guard = shared.lock().await;
+    let had_connections = !guard.is_empty();
     if let (Some(dispatcher), Some(validator)) = (cfg.dispatcher.as_ref(), cfg.validator.as_ref()) {
         for row in guard.values() {
             validator.remove_instance_via_dispatcher(dispatcher, row.sv_inst);
         }
     }
     guard.clear();
+    drop(guard);
+    // Supervisor: if we had live connections and the session's death
+    // took them all with it, transition back to Idle.
+    if had_connections {
+        if let (Some(sup), Some(disp)) = (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref()) {
+            sup.transition_idle_via(disp);
+        }
+    }
     Ok(())
 }
 
@@ -419,6 +450,18 @@ async fn handle_send_rr_data(
                             sockaddr_reply_bytes = Some(sa);
                         }
                     }
+                    // Supervisor state transition: Idle → Executing on
+                    // the FIRST accepted safety connection. Subsequent
+                    // FOs don't re-transition (state stays Executing
+                    // as long as any connection is live).
+                    if let (Some(sup), Some(disp)) =
+                        (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref())
+                    {
+                        let is_first = shared.lock().await.len() == 1;
+                        if is_first {
+                            sup.transition_executing_via(disp);
+                        }
+                    }
                     (s | service::REPLY_FLAG, status::SUCCESS, reply)
                 }
                 Err(err) => {
@@ -448,6 +491,15 @@ async fn handle_send_rr_data(
             }
             guard.clear();
             drop(guard);
+            // Supervisor state transition: no connections left → back to
+            // Idle. The FC service always clears the entire connection
+            // table (the "close all rows" simplification kept from
+            // before), so we know we're going Executing → Idle.
+            if let (Some(sup), Some(disp)) =
+                (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref())
+            {
+                sup.transition_idle_via(disp);
+            }
             // Minimal Forward_Close reply body: echo conn_serial + orig_vendor + orig_serial + zero pad.
             let mut r = Vec::with_capacity(10);
             if body.len() >= 8 {

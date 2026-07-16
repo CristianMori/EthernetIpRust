@@ -73,6 +73,16 @@ pub struct SafetySupervisorObject {
     cip_class: Option<CipClass>,
 }
 
+impl std::fmt::Debug for SafetySupervisorObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafetySupervisorObject")
+            .field("state", &self.state())
+            .field("mode", &self.mode())
+            .field("cip_class", &self.cip_class.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
 impl SafetySupervisorObject {
     /// Build the class + register attributes and the three commissioning
     /// services. `snn` and `node_address` seed attribute 3 (SNN) and
@@ -230,6 +240,44 @@ impl SafetySupervisorObject {
         if let Some(a) = inst.get_attribute_mut(2) {
             a.set_data(&[mode]);
         }
+    }
+
+    /// Transition to Executing / Run via `&self` — safe to call through
+    /// an `Arc<Self>`. Doesn't touch the CIP attributes; combine with
+    /// [`Self::sync_to_dispatcher`] to make the change visible to a
+    /// `Get_Attribute_Single` client. Convenience wrapper
+    /// [`Self::transition_executing_via`] does both in one call.
+    pub fn transition_executing(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.state = SafetySupervisorState::Executing;
+        g.mode = SafetySupervisorMode::Run;
+    }
+
+    /// Transition to Idle / Idle via `&self` — safe through an `Arc`.
+    pub fn transition_idle(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.state = SafetySupervisorState::Idle;
+        g.mode = SafetySupervisorMode::Idle;
+    }
+
+    /// Convenience: transition to Executing and immediately sync the new
+    /// state through the dispatcher so a scanner's next
+    /// `Get_Attribute_Single(0x39/1/1)` sees Executing.
+    pub fn transition_executing_via(
+        &self,
+        dispatcher: &ethernetip_core::cip::CipDispatcher,
+    ) {
+        self.transition_executing();
+        self.sync_to_dispatcher(dispatcher);
+    }
+
+    /// Convenience: transition to Idle and sync.
+    pub fn transition_idle_via(
+        &self,
+        dispatcher: &ethernetip_core::cip::CipDispatcher,
+    ) {
+        self.transition_idle();
+        self.sync_to_dispatcher(dispatcher);
     }
 
     /// Push the current State / Mode into attributes 1 / 2 of the given

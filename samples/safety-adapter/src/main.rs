@@ -73,8 +73,11 @@ async fn main() -> Result<()> {
         SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
         0xC0A80154,
     );
-    supervisor.start();
+    // No supervisor.start() here — the adapter transitions the state
+    // machine Idle → Executing on the first accepted FO (matches the
+    // C# SafetyDevice pattern) and back to Idle on the last FC.
     dispatcher.register_class(supervisor.into_cip_class());
+    let supervisor = Arc::new(supervisor);
 
     let mut validator = SafetyValidatorObject::new();
     dispatcher.register_class(validator.into_cip_class());
@@ -85,7 +88,8 @@ async fn main() -> Result<()> {
         .udp_bind(udp_bind)
         .peer_udp_port(peer_udp_port)
         .dispatcher(dispatcher)
-        .validator(validator);
+        .validator(validator)
+        .supervisor(supervisor);
     let handle = start_safety_adapter(cfg).await?;
 
     println!(

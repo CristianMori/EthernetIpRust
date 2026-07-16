@@ -89,11 +89,18 @@ async fn main() -> Result<()> {
         serial_number: 0xC0FFEE00,
         product_name: "Rust Echo Adapter".into(),
     }));
+    // Take the TCP bind's IP as the "our IP" address for the TCP/IP and
+    // Ethernet Link objects — probe() below finds a matching local NIC
+    // by that IP and reads its real MAC.
+    let bind_ip = match tcp_bind.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => Ipv4Addr::new(127, 0, 0, 1),
+    };
     dispatcher.register_class(device::build_tcpip_interface(device::TcpIpConfig::new(
-        Ipv4Addr::new(127, 0, 0, 1),
+        bind_ip,
     )));
     dispatcher.register_class(device::build_ethernet_link(
-        device::EthernetLinkConfig::default(),
+        device::EthernetLinkConfig::probe(bind_ip),
     ));
     let (cm_cls, cm_counters) = build_connection_manager_with_counters();
     dispatcher.register_class(cm_cls);

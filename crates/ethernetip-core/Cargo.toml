@@ -13,3 +13,10 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+# Optional live-NIC query for the Ethernet Link CIP class (device::ethernet_link).
+# Disabling the feature falls back to hardcoded MAC + 1 Gbps.
+network-interface = { version = "2", optional = true }
+
+[features]
+default = ["live-nic"]
+live-nic = ["dep:network-interface"]

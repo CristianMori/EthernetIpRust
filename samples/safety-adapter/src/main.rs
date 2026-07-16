@@ -53,11 +53,15 @@ async fn main() -> Result<()> {
         serial_number: 0xC0FFEE01,
         product_name: "Rust Safety Adapter".into(),
     }));
+    let bind_ip = match tcp_bind.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => Ipv4Addr::new(127, 0, 0, 1),
+    };
     dispatcher.register_class(device::build_tcpip_interface(device::TcpIpConfig::new(
-        Ipv4Addr::new(192, 168, 1, 84),
+        bind_ip,
     )));
     dispatcher.register_class(device::build_ethernet_link(
-        device::EthernetLinkConfig::default(),
+        device::EthernetLinkConfig::probe(bind_ip),
     ));
     dispatcher.register_class(build_connection_manager());
 

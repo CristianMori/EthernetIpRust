@@ -46,8 +46,9 @@ Sibling of [EthernetIPSharp](../EthernetIPSharp), [EthernetIPCpp](../EthernetIPC
 - Safety Network Segment parse/encode (target / router / extended formats)
 - Time Coordination (TCOO) message — base-format encode with CRC-S3 and extended with CRC-S5
 - Consumer-side target-timestamp rollover tracking (essential — the 16-bit safety timestamp wraps every ~8.4 s and CRC-S5 fails without this)
+- Producer-side own-timestamp rollover tracking on the scanner, seeded from the safety segment's `InitialRolloverValue` so the target's validator stays in CRC-S5 sync across every wrap
 - Safety Forward_Open builder with the assembly-shortcut connection path and app-reply parsing
-- Interop-tested Rust safety scanner ↔ Rust safety adapter with 0 CRC failures
+- Interop-tested against C#, both directions, over 3-minute soaks with 0 CRC failures across ~21 timestamp rollover boundaries
 
 **Logix tag protocol**
 - `Read_Tag` (0x4C), `Write_Tag` (0x4D), `Read_Tag_Fragmented` (0x52) — auto-falls-back to fragmented on `PARTIAL_TRANSFER` (0x06) or `REPLY_TOO_LARGE` (0x11)
@@ -420,7 +421,9 @@ CIP Safety is a SIL-3-capable layer on top of standard EtherNet/IP. This library
 
 **A "safety connection" is a pair of two underlying connections** — server and client — one in each direction for full bidirectional safety. The current Rust implementation covers the server side end-to-end and stubs the client side. The other three ports do both.
 
-**Rollover tracking:** The consumer must track the target's 16-bit timestamp rollover *before* verifying the CRC, since the rollover count folds into the CRC-S5 seed. Missing a wrap turns into "CRC fails for every subsequent frame until reconnect". The Rust adapter's consumer peels the on-wire timestamp first, advances its rollover counter when the delta wraps (`delta < -0x4000`), and then decodes with the up-to-date seed.
+**Rollover tracking (consumer):** The consumer must track the target's 16-bit timestamp rollover *before* verifying the CRC, since the rollover count folds into the CRC-S5 seed. Missing a wrap turns into "CRC fails for every subsequent frame until reconnect". The Rust adapter's consumer peels the on-wire timestamp first, advances its rollover counter when the delta wraps (`delta < -0x4000`), and then decodes with the up-to-date seed.
+
+**Rollover tracking (producer):** The scanner has the symmetric problem — it must fold its own outgoing rollover into the S5 seed on every produced frame, and it must snapshot both the timestamp and the rollover *before* advancing them so the wrap frame carries a consistent `(old_ts, old_rollover)` pair. Reading rollover after the bump would emit `(old_ts, new_rollover)` on the wrap boundary, which the consumer can't verify — one CRC failure per wrap. Both counters are seeded from the safety segment's `InitialTimestamp` / `InitialRolloverValue` so both ends agree from frame 1.
 
 **What's still stubbed:** The full CIP Safety Supervisor Object (class 0x39) with its Idle / Configure / Executing state machine and Configure / Apply / Reset services, and the Safety Validator Object (class 0x3A) with per-connection instance state, are not implemented as CIP objects. The safety adapter fakes just enough of the target-side FO acceptance to establish a connection and echo TCOO — real objects with `Get_Attribute_Single` endpoints are a follow-up.
 
@@ -435,8 +438,8 @@ Only tested combinations are listed; blank means not attempted in the initial re
 | Rust TagClient | — | — | — | — | ✅ browse + DINT + UDT (fragmented) + Class 3 | — |
 | Rust Scanner | ✅ | ✅ (both directions bit-exact) |  |  |  |  |
 | Rust Adapter | ✅ | ⚠ O→T works, T→O not received on Windows loopback |  |  |  |  |
-| Rust Safety scanner | ✅ (0 CRC fails) | ❌ (config-defaults + Supervisor gap) |  |  |  | — |
-| Rust Safety adapter | ✅ (0 CRC fails) |  |  |  |  |  |
+| Rust Safety scanner | ✅ (0 CRC fails) | ✅ (0 CRC fails over 3 min / ~21 rollovers) |  |  |  | — |
+| Rust Safety adapter | ✅ (0 CRC fails) | ✅ (0 CRC fails over 3 min / ~21 rollovers, after upstream C# scanner rollover fix) |  |  |  |  |
 
 The Rust ↔ C# gap was where the last round of wire-format bugs was found — see the [Known limitations](#known-limitations) section.
 

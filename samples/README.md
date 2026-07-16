@@ -41,6 +41,16 @@ cargo run --release -p safety-adapter -- --tcp 0.0.0.0:44818 --udp 0.0.0.0:2222 
 
 # Safety scanner (server direction) — sends O→T safety frames at RPI
 cargo run --release -p safety-scanner -- --adapter 127.0.0.1:44818 --rpi-ms 50 --data-size 8
+
+# Safety scanner with explicit TUNID + assembly instances — needed against
+# adapters that validate the target's UNID (SNN+node) or that only register
+# specific assembly instances. SNN parsing matches the C# convention: the
+# visual form "4D90_0101_A35C" maps to bytes {5C, A3, 01, 01, 90, 4D}
+# little-endian on the wire.
+cargo run --release -p safety-scanner -- \
+    --adapter 192.168.204.1:44818 --rpi-ms 50 --data-size 1 \
+    --snn 4D90_0101_A35C --node 0xC0A8CC01 \
+    --consumed 1 --produced 2 --config 197
 ```
 
 ## End-to-end loopback pairs
@@ -85,5 +95,5 @@ cargo run --release -p logix-tag-read -- 127.0.0.1 --no-path --tag rate
 - **`logix-host`** — Any Logix-style client. `logix-tag-read` is the natural pair; pycomm3, RSLogix MSG instructions, and pyeeip also work against it.
 - **`echo-adapter`** — Any EtherNet/IP scanner. In Studio 5000, add the adapter as a "Generic Ethernet Module" with Data-DINT format, Input Assembly = 100 (size 125), Output Assembly = 102 (size 124), Config = 105 (size 10). The defaults match.
 - **`echo-scanner`** — Any Class 1 adapter (this repo's `echo-adapter`, the C#/C++/Python echo modules, or a real device configured to expose Class 1 assemblies).
-- **`safety-adapter`** — A safety scanner (this repo's `safety-scanner`, or a real ControlLogix with a safety I/O module configured to target this adapter's IP + SNN + electronic key + SCID). Fully compatible interop with the C# safety scanner still needs the assembly / TUNID defaults aligned and a proper Safety Supervisor object on the Rust side — see the top-level [README](../README.md#interop-matrix) for status.
-- **`safety-scanner`** — A safety adapter (this repo's `safety-adapter`, or a real 1734-IB8S once the client-direction consumer and Safety Validator objects land).
+- **`safety-adapter`** — A safety scanner (this repo's `safety-scanner`, the C# `SampleSafetyScanner`, or a real ControlLogix with a safety I/O module configured to target this adapter's IP + SNN + electronic key + SCID). Verified against the C# scanner over a 3-min soak (~9000 frames, ~21 rollover boundaries, 0 CRC failures) — see the top-level [README](../README.md#interop-matrix) for the full status.
+- **`safety-scanner`** — A safety adapter (this repo's `safety-adapter`, the C# `SafetyAdapterSample`, or a real 1734-IB8S once the Safety Validator objects land). Adapters that validate the target's UNID or that only expose specific assembly instances need `--snn` / `--node` / `--consumed` / `--produced` / `--config` overrides.

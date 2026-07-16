@@ -262,6 +262,10 @@ struct ActiveConnection {
     cid_seed_s3: u16,
     cid_seed_s5: u32,
     input_data_len: usize,
+    /// Safety Validator instance id allocated for this connection at FO
+    /// accept — needed so Forward_Close can drop the same instance and
+    /// avoid leaking one Validator per connect / disconnect cycle.
+    sv_inst: u32,
     /// Monotonic reference point for the outgoing consumer_time value in
     /// every TCOO reply. Set when the FO is accepted; every TCOO advertises
     /// (elapsed_us / 128) & 0xFFFF from this point so the scanner sees our
@@ -330,7 +334,16 @@ async fn handle_session(
         }
     }
     connection_open.store(false, Ordering::Relaxed);
-    shared.lock().await.clear();
+    // TCP session ended without an explicit Forward_Close (peer closed the
+    // socket or crashed). Drop the same Validator instances the FC path
+    // would have removed so those leaks don't accumulate either.
+    let mut guard = shared.lock().await;
+    if let (Some(dispatcher), Some(validator)) = (cfg.dispatcher.as_ref(), cfg.validator.as_ref()) {
+        for row in guard.values() {
+            validator.remove_instance_via_dispatcher(dispatcher, row.sv_inst);
+        }
+    }
+    guard.clear();
     Ok(())
 }
 
@@ -419,8 +432,22 @@ async fn handle_send_rr_data(
             // C++/C#/Python ports parse the FC body's connection serial to
             // remove one specific row; do that next if multi-close per
             // session is ever needed on both legs independently.
+            //
+            // Also drop the Safety Validator instance we allocated for
+            // each connection during FO — otherwise a scanner that
+            // repeatedly connects and disconnects leaks a Validator
+            // instance per cycle.
             connection_open.store(false, Ordering::Relaxed);
-            shared.lock().await.clear();
+            let mut guard = shared.lock().await;
+            if let (Some(dispatcher), Some(validator)) =
+                (cfg.dispatcher.as_ref(), cfg.validator.as_ref())
+            {
+                for row in guard.values() {
+                    validator.remove_instance_via_dispatcher(dispatcher, row.sv_inst);
+                }
+            }
+            guard.clear();
+            drop(guard);
             // Minimal Forward_Close reply body: echo conn_serial + orig_vendor + orig_serial + zero pad.
             let mut r = Vec::with_capacity(10);
             if body.len() >= 8 {
@@ -669,6 +696,7 @@ async fn handle_safety_forward_open(
         cid_seed_s3,
         cid_seed_s5,
         input_data_len: cfg.input_data_size,
+        sv_inst: target_connection_serial as u32,
         production_start: Instant::now(),
         rollover_count: initial_rollover,
         last_ts: 0,

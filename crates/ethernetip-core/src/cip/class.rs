@@ -96,6 +96,16 @@ impl CipClass {
         self.update_max_instance(id);
     }
 
+    /// Remove an instance by id. Returns the removed instance, or `None`
+    /// if it wasn't present. The class-level max-instance attribute (attr
+    /// 2 on instance 0) is *not* rolled back — CIP allows instance ids to
+    /// stay high-water-marked, and rescanning to find the new max would
+    /// add lock-time to a call that's already on the connection-teardown
+    /// path.
+    pub fn remove_instance(&mut self, id: u32) -> Option<CipInstance> {
+        self.instances.remove(&id)
+    }
+
     fn update_max_instance(&mut self, id: u32) {
         if id <= self.max_instance_id {
             return;

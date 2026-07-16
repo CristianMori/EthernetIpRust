@@ -175,6 +175,25 @@ impl SafetyValidatorObject {
         self.runtime.lock().unwrap().get(&instance_id).cloned()
     }
 
+    /// Remove a validator instance through a dispatcher that already
+    /// holds this validator's class. Called by the safety adapter's
+    /// Forward_Close handler so instances don't leak across
+    /// connect / disconnect cycles. Returns `true` when the id existed
+    /// in either the CIP class or the runtime map.
+    pub fn remove_instance_via_dispatcher(
+        &self,
+        dispatcher: &CipDispatcher,
+        instance_id: u32,
+    ) -> bool {
+        let removed_cip = dispatcher
+            .with_class_mut(class_codes::SAFETY_VALIDATOR, |cls| {
+                cls.remove_instance(instance_id).is_some()
+            })
+            .unwrap_or(false);
+        let removed_runtime = self.runtime.lock().unwrap().remove(&instance_id).is_some();
+        removed_cip || removed_runtime
+    }
+
     /// Mutate the runtime state for an instance under the internal lock.
     /// Silently drops when the instance id isn't registered.
     pub fn with_runtime_state<F>(&self, instance_id: u32, f: F)
@@ -270,6 +289,36 @@ mod tests {
                 .create_instance_via_dispatcher(&dispatcher, SafetyValidatorInstanceState::default());
             assert_eq!(id, Some(expected));
         }
+    }
+
+    #[test]
+    fn remove_instance_drops_from_class_and_runtime() {
+        let mut val = SafetyValidatorObject::new();
+        let dispatcher = Arc::new(CipDispatcher::new());
+        dispatcher.register_class(val.into_cip_class());
+        let id = val
+            .create_instance_via_dispatcher(&dispatcher, SafetyValidatorInstanceState::default())
+            .unwrap();
+
+        // Before remove: attribute lookup succeeds.
+        let mut p = vec![0x20, 0x3A, 0x24, id as u8, 0x30, 0x01];
+        // Assumes id fits in a byte for the test; it does (== 1).
+        assert_eq!(id, 1);
+        let r = dispatcher.dispatch(0x0E, CipPath::parse(&p).unwrap(), Vec::new());
+        assert_eq!(r.general_status, status::SUCCESS);
+
+        // Remove.
+        assert!(val.remove_instance_via_dispatcher(&dispatcher, id));
+
+        // After remove: attribute lookup gets OBJECT_DOES_NOT_EXIST.
+        p = vec![0x20, 0x3A, 0x24, id as u8, 0x30, 0x01];
+        let r = dispatcher.dispatch(0x0E, CipPath::parse(&p).unwrap(), Vec::new());
+        assert_eq!(r.general_status, status::OBJECT_DOES_NOT_EXIST);
+        // Runtime map is gone too.
+        assert!(val.runtime_state(id).is_none());
+
+        // Removing again returns false — nothing to remove.
+        assert!(!val.remove_instance_via_dispatcher(&dispatcher, id));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
 use ethernetip_safety::{
-    build_connection_manager, device, start_safety_adapter, CipDispatcher, SafetyAdapterConfig,
+    device, start_safety_adapter, CipDispatcher, ConnectionManagerObject, SafetyAdapterConfig,
     SafetyNetworkNumber, SafetySupervisorObject, SafetyValidatorObject,
 };
 
@@ -63,7 +63,8 @@ async fn main() -> Result<()> {
     dispatcher.register_class(device::build_ethernet_link(
         device::EthernetLinkConfig::probe(bind_ip),
     ));
-    dispatcher.register_class(build_connection_manager());
+    let mut cm = ConnectionManagerObject::new();
+    dispatcher.register_class(cm.into_cip_class());
 
     // Safety-specific classes on the same dispatcher: Supervisor (0x39,
     // instance 1) and Validator (0x3A, one instance per accepted safety

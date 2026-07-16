@@ -48,11 +48,11 @@ impl Default for EthernetLinkConfig {
 }
 
 impl EthernetLinkConfig {
-    /// Return a config whose MAC is the real MAC of the local NIC that
-    /// owns `bind_ip`. Falls back to [`FALLBACK_MAC`] when the lookup
-    /// fails (no matching NIC, no MAC on that NIC, or the `live-nic`
-    /// feature is disabled). Speed and flags are the defaults — the
-    /// caller can override them after the fact.
+    /// Return a config populated from the local NIC that owns `bind_ip`.
+    /// Real MAC via `network-interface`; on Windows, real link speed via
+    /// `GetIfTable2`. Falls back to [`FALLBACK_MAC`] / [`FALLBACK_SPEED_MBPS`]
+    /// when the lookup fails (no matching NIC, driver reports 0/negative
+    /// speed, or the `live-nic` feature is disabled).
     #[cfg(feature = "live-nic")]
     pub fn probe(bind_ip: Ipv4Addr) -> Self {
         use network_interface::{NetworkInterface, NetworkInterfaceConfig};
@@ -66,6 +66,12 @@ impl EthernetLinkConfig {
                 if let Some(mac_str) = &nic.mac_addr {
                     if let Some(bytes) = parse_mac(mac_str) {
                         cfg.mac = bytes;
+                        // Try to grab real link speed. Platform-specific;
+                        // on non-Windows this is a no-op that leaves the
+                        // fallback in place.
+                        if let Some(mbps) = query_link_speed_mbps(&nic.name, cfg.mac) {
+                            cfg.speed_mbps = mbps;
+                        }
                         return cfg;
                     }
                 }
@@ -94,6 +100,57 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
         out[i] = u8::from_str_radix(p, 16).ok()?;
     }
     Some(out)
+}
+
+// -------------------- link-speed query (platform-specific) --------------------
+
+/// Return the interface's TX link speed in megabits per second, or `None`
+/// when the platform can't tell us. Windows implementation uses
+/// `GetIfTable2` and matches rows by physical (MAC) address.
+#[cfg(all(feature = "live-nic", windows))]
+fn query_link_speed_mbps(_name: &str, mac: [u8; 6]) -> Option<u32> {
+    use std::ptr;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
+    };
+
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = ptr::null_mut();
+        if GetIfTable2(&mut table as *mut _) != 0 || table.is_null() {
+            return None;
+        }
+        let count = (*table).NumEntries as usize;
+        // Table field is a flexible array; walk it via pointer arithmetic.
+        let base = (*table).Table.as_ptr();
+        let mut result = None;
+        for i in 0..count {
+            let row = &*base.add(i);
+            let addr_len = row.PhysicalAddressLength as usize;
+            if addr_len == 6 && row.PhysicalAddress[..6] == mac {
+                // TransmitLinkSpeed is in bits per second (u64). Some
+                // virtual adapters report 0 or u64::MAX — treat both as
+                // "unknown" and let the caller keep the fallback.
+                let bps = row.TransmitLinkSpeed;
+                if bps > 0 && bps < u64::MAX {
+                    let mbps = (bps / 1_000_000) as u32;
+                    if mbps > 0 {
+                        result = Some(mbps);
+                    }
+                }
+                break;
+            }
+        }
+        FreeMibTable(table as _);
+        result
+    }
+}
+
+/// Non-Windows / non-live-nic fallback — returns None, caller keeps
+/// [`FALLBACK_SPEED_MBPS`]. A Linux implementation via netlink /
+/// `/sys/class/net/<name>/speed` would slot in here.
+#[cfg(all(feature = "live-nic", not(windows)))]
+fn query_link_speed_mbps(_name: &str, _mac: [u8; 6]) -> Option<u32> {
+    None
 }
 
 /// Build an Ethernet Link CIP class (0xF6) with attributes 1, 2, and 3 on

@@ -17,6 +17,16 @@ tracing = { workspace = true }
 # Disabling the feature falls back to hardcoded MAC + 1 Gbps.
 network-interface = { version = "2", optional = true }
 
+# Windows-only extras: live link-speed query via GetIfTable2. `windows-sys`
+# is the raw-FFI variant (lighter than the `windows` crate). Only pulled
+# in when the `live-nic` feature is on AND the target is Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+], optional = true }
+
 [features]
 default = ["live-nic"]
-live-nic = ["dep:network-interface"]
+live-nic = ["dep:network-interface", "dep:windows-sys"]

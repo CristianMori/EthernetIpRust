@@ -9,12 +9,14 @@
 //! (peer UDP, assembly registry, UDP socket, run/idle mode) in a
 //! [`ForwardOpenContext`].
 //!
-//! FO / FC are also registered as CipServiceDefinitions on the class so a
-//! commissioning browser walking Class 0x06 sees the services declared,
-//! but their CipServiceHandler bodies return SERVICE_NOT_SUPPORTED — the
-//! sync (`CipInstance`, `CipServiceRequest`) signature can't carry the
-//! per-session context these operations need. The adapter always calls the
-//! `process_*` methods directly.
+//! FO / FC are also registered as *real* CipServiceDefinitions on the
+//! class — callers routing MR requests through
+//! [`CipDispatcher::dispatch_with_context`] with a
+//! [`ForwardOpenContext`] (or [`ForwardCloseContext`]) as the request
+//! context get the same behavior the direct `process_*` methods provide.
+//! Without a context they return `SERVICE_NOT_SUPPORTED` with a
+//! diagnostic — see the class-registration code in
+//! [`ConnectionManagerObject::new`] for details.
 //!
 //! Instance 1 attribute layout (Vol 1 §3-4.1):
 //!
@@ -27,13 +29,14 @@
 //!  * 7 Close Other Requests
 //!  * 8 Connection Timeouts
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use ethernetip_core::cip::{
@@ -176,11 +179,24 @@ impl ConnectionTable {
 /// transport-agnostic and just calls the closure with `(row_metadata,
 /// shutdown_rx)`, receives back the `JoinHandle`, and stores it on the
 /// row.
-pub struct ForwardOpenContext<'a> {
+/// Per-request context handed to [`ConnectionManagerObject::process_forward_open`]
+/// and, when routed through the dispatcher, downcast from
+/// [`CipServiceRequest::context`]. All fields are owned so the struct is
+/// `'static` and can be packed into an `Arc<dyn Any>`.
+#[derive(Clone)]
+pub struct ForwardOpenContext {
     pub peer_udp: SocketAddr,
-    pub assemblies: &'a AssemblyRegistry,
+    pub assemblies: AssemblyRegistry,
     pub udp: Arc<UdpSocket>,
     pub run_idle: bool,
+}
+
+/// Per-request context for the Forward_Close path. Holds the session's
+/// currently active T→O connection id — the handler removes exactly that
+/// row from the connection table.
+#[derive(Clone, Debug)]
+pub struct ForwardCloseContext {
+    pub active_conn_id: Option<u32>,
 }
 
 /// Signature for the adapter-supplied producer task spawner. Called once
@@ -217,7 +233,7 @@ pub struct ConnectionManagerObject {
     connections: Arc<Mutex<ConnectionTable>>,
     counters: Arc<ConnectionManagerCounters>,
     next_conn_id: Arc<AtomicU32>,
-    producer_spawner: std::sync::Mutex<Option<ProducerSpawner>>,
+    producer_spawner: Arc<Mutex<Option<ProducerSpawner>>>,
 }
 
 impl std::fmt::Debug for ConnectionManagerObject {
@@ -242,6 +258,10 @@ impl ConnectionManagerObject {
     /// `Protocol("no producer spawner registered")`.
     pub fn new() -> Self {
         let counters = Arc::new(ConnectionManagerCounters::default());
+        let connections = Arc::new(Mutex::new(ConnectionTable::default()));
+        let next_conn_id = Arc::new(AtomicU32::new(0x8000_0000));
+        let producer_spawner = Arc::new(Mutex::new(None::<ProducerSpawner>));
+
         let mut cls = CipClass::new(class_codes::CONNECTION_MANAGER, "Connection Manager", 1);
         cls.add_standard_instance_services();
 
@@ -259,39 +279,82 @@ impl ConnectionManagerObject {
         }
 
         // Live-counter Get_Attribute_Single override.
-        let counters_for_handler = counters.clone();
+        let counters_for_get = counters.clone();
         cls.add_instance_service(CipServiceDefinition::new(
             GET_ATTRIBUTE_SINGLE,
             "Get_Attribute_Single",
-            move |instance, req| handle_get_attribute_live(instance, req, &counters_for_handler),
+            move |instance, req| handle_get_attribute_live(instance, req, &counters_for_get),
         ));
 
-        // Forward_Open (0x54) / Forward_Close (0x4E) service definitions
-        // exist on the class so a browser sees them declared. Their bodies
-        // return SERVICE_NOT_SUPPORTED — the sync CipServiceHandler
-        // signature can't carry the per-session context these need. The
-        // adapter always calls process_forward_open / process_forward_close
-        // directly.
+        // Real Forward_Open (0x54) handler — captures shared state and
+        // downcasts the request context to a ForwardOpenContext.
+        // When present, does the actual FO work through the same code
+        // path process_forward_open uses. When absent (dispatched via
+        // plain `dispatch` instead of `dispatch_with_context`), returns
+        // SERVICE_NOT_SUPPORTED with a diagnostic.
+        let connections_for_fo = connections.clone();
+        let counters_for_fo = counters.clone();
+        let next_id_for_fo = next_conn_id.clone();
+        let spawner_for_fo = producer_spawner.clone();
         cls.add_instance_service(CipServiceDefinition::new(
             0x54,
             "Forward_Open",
-            handle_forward_open_dispatch_stub,
+            move |_inst, req| {
+                let Some(ctx) = req.context::<ForwardOpenContext>() else {
+                    tracing::warn!(
+                        "Forward_Open reached CipDispatcher with no ForwardOpenContext — \
+                         caller should use CipDispatcher::dispatch_with_context"
+                    );
+                    return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
+                };
+                match do_process_forward_open(
+                    &req.data,
+                    ctx,
+                    &connections_for_fo,
+                    &counters_for_fo,
+                    &next_id_for_fo,
+                    &spawner_for_fo,
+                ) {
+                    Ok(resp) => CipServiceResponse::success_with(req.service_code, resp.encode()),
+                    Err(err) => {
+                        tracing::warn!("Forward_Open rejected via dispatcher: {err}");
+                        CipServiceResponse::error(req.service_code, status::CONNECTION_FAILURE)
+                    }
+                }
+            },
         ));
+
+        // Real Forward_Close (0x4E) handler — same shape.
+        let connections_for_fc = connections.clone();
+        let counters_for_fc = counters.clone();
         cls.add_instance_service(CipServiceDefinition::new(
             0x4E,
             "Forward_Close",
-            handle_forward_close_dispatch_stub,
+            move |_inst, req| {
+                let Some(ctx) = req.context::<ForwardCloseContext>() else {
+                    tracing::warn!(
+                        "Forward_Close reached CipDispatcher with no ForwardCloseContext"
+                    );
+                    return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
+                };
+                match do_process_forward_close(
+                    &req.data,
+                    ctx.active_conn_id,
+                    &connections_for_fc,
+                    &counters_for_fc,
+                ) {
+                    Ok(resp) => CipServiceResponse::success_with(req.service_code, resp.encode()),
+                    Err(_) => CipServiceResponse::error(req.service_code, status::CONNECTION_FAILURE),
+                }
+            },
         ));
 
         Self {
             cip_class: Some(cls),
-            connections: Arc::new(Mutex::new(ConnectionTable::default())),
+            connections,
             counters,
-            // Adapters allocate T→O ids in the upper half of u32 space to
-            // avoid colliding with the O→T ids scanners assign — matches
-            // the pattern the safety adapter uses.
-            next_conn_id: Arc::new(AtomicU32::new(0x8000_0000)),
-            producer_spawner: std::sync::Mutex::new(None),
+            next_conn_id,
+            producer_spawner,
         }
     }
 
@@ -334,155 +397,50 @@ impl ConnectionManagerObject {
         *self.producer_spawner.lock().unwrap() = Some(Arc::new(spawner));
     }
 
-    /// Live connection count.
-    pub async fn connection_count(&self) -> usize {
-        self.connections.lock().await.rows.len()
+    /// Live connection count. Sync now — the connection table sits behind
+    /// a `std::sync::Mutex`; the lock is held only for short lookups.
+    pub fn connection_count(&self) -> usize {
+        self.connections.lock().unwrap().rows.len()
     }
 
-    /// Snapshot of every live connection.
-    pub async fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
-        self.connections.lock().await.summaries()
+    /// Snapshot every live connection.
+    pub fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
+        self.connections.lock().unwrap().summaries()
     }
 
     /// Process a Forward_Open request. Parses the body, validates the
     /// assembly path against the registry, allocates a T→O connection id,
     /// spawns the producer task via the registered spawner, and inserts
     /// the resulting row into the connection table. Increments
-    /// `counters.open_requests` on success, `counters.open_other_rejects`
-    /// on any failure. Returns the response the adapter should encode
-    /// into its FO reply.
-    pub async fn process_forward_open<'a>(
+    /// `counters.open_requests` on success, the appropriate reject counter
+    /// on failure.
+    pub fn process_forward_open(
         &self,
         body: &[u8],
-        ctx: ForwardOpenContext<'a>,
+        ctx: &ForwardOpenContext,
     ) -> Result<ForwardOpenResponse> {
-        let req = ForwardOpenRequest::decode(body).map_err(|e| {
-            self.counters.record_open_format_reject();
-            e
-        })?;
-        let (input_asm, output_asm) = parse_connection_path(&req.connection_path)
-            .map_err(|e| {
-                self.counters.record_open_format_reject();
-                e
-            })?;
-
-        if ctx.assemblies.snapshot(input_asm).is_none() {
-            self.counters.record_open_other_reject();
-            return Err(EipError::Protocol(format!(
-                "unknown T->O assembly {}",
-                input_asm
-            )));
-        }
-        if ctx.assemblies.snapshot(output_asm).is_none() {
-            self.counters.record_open_other_reject();
-            return Err(EipError::Protocol(format!(
-                "unknown O->T assembly {}",
-                output_asm
-            )));
-        }
-        // Refuse if the originator asked for the same instance in both
-        // directions — matches the guard the C++ port added after the
-        // duplicate-assembly bug.
-        if input_asm == output_asm {
-            self.counters.record_open_other_reject();
-            return Err(EipError::Protocol(format!(
-                "Forward_Open uses assembly {} in both directions",
-                input_asm
-            )));
-        }
-
-        let assigned_oto_t = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
-
-        // Shared, mutable peer_udp — the consumer will update it to the
-        // actual source of received O→T frames once the scanner starts
-        // producing, so the producer sends T→O back to the port the peer
-        // is actually listening on (typically ephemeral, not 2222).
-        let peer_udp = Arc::new(std::sync::RwLock::new(ctx.peer_udp));
-
-        let spawner = self
-            .producer_spawner
-            .lock()
-            .unwrap()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                self.counters.record_open_other_reject();
-                EipError::Protocol("Connection Manager: no producer spawner registered".into())
-            })?;
-
-        let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
-        let producer_task = (spawner)(
-            ProducerSpawnArgs {
-                connection_id: req.t_to_o_connection_id,
-                udp: ctx.udp,
-                peer_udp: peer_udp.clone(),
-                rpi_us: req.t_to_o_rpi_us,
-                assemblies: ctx.assemblies.clone(),
-                input_assembly: input_asm,
-                run_idle: ctx.run_idle,
-            },
-            producer_shutdown_rx,
-        );
-
-        {
-            let mut table = self.connections.lock().await;
-            table.rows.insert(
-                assigned_oto_t,
-                ConnectionRow {
-                    o_to_t_conn_id: assigned_oto_t,
-                    t_to_o_conn_id: req.t_to_o_connection_id,
-                    input_assembly: input_asm,
-                    output_assembly: output_asm,
-                    peer_udp,
-                    o_to_t_rpi_us: req.o_to_t_rpi_us,
-                    t_to_o_rpi_us: req.t_to_o_rpi_us,
-                    producer_shutdown: producer_shutdown_tx,
-                    producer_task,
-                },
-            );
-        }
-
-        self.counters.record_open_success();
-        Ok(ForwardOpenResponse {
-            o_to_t_connection_id: assigned_oto_t,
-            t_to_o_connection_id: req.t_to_o_connection_id,
-            connection_serial: req.connection_serial,
-            originator_vendor: req.originator_vendor,
-            originator_serial: req.originator_serial,
-            o_to_t_actual_rpi_us: req.o_to_t_rpi_us,
-            t_to_o_actual_rpi_us: req.t_to_o_rpi_us,
-            app_reply: Vec::new(),
-        })
+        do_process_forward_open(
+            body,
+            ctx,
+            &self.connections,
+            &self.counters,
+            &self.next_conn_id,
+            &self.producer_spawner,
+        )
     }
 
-    /// Process a Forward_Close for the given active connection id. If the
-    /// connection exists, its producer task is shut down and joined; the
-    /// row is removed from the table. Increments `counters.close_requests`
-    /// on success, `counters.close_other_requests` on failure (bad body).
-    pub async fn process_forward_close(
+    /// Process a Forward_Close for the given active connection id. The
+    /// producer task shutdown watch is signaled; the row is removed from
+    /// the table. The producer task exits on the next tick of its own
+    /// accord — we don't await its JoinHandle since this method is now
+    /// sync. (Old async version awaited; the difference is invisible to
+    /// callers.)
+    pub fn process_forward_close(
         &self,
         body: &[u8],
         active_conn_id: Option<u32>,
     ) -> Result<ForwardCloseResponse> {
-        let req = ForwardCloseRequest::decode(body).map_err(|e| {
-            self.counters.record_close_format();
-            e
-        })?;
-        if let Some(id) = active_conn_id {
-            let mut table = self.connections.lock().await;
-            if let Some(row) = table.rows.remove(&id) {
-                let _ = row.producer_shutdown.send(true);
-                drop(table);
-                let _ = row.producer_task.await;
-            }
-        }
-        self.counters.record_close_success();
-        Ok(ForwardCloseResponse {
-            connection_serial: req.connection_serial,
-            originator_vendor: req.originator_vendor,
-            originator_serial: req.originator_serial,
-            app_reply: Vec::new(),
-        })
+        do_process_forward_close(body, active_conn_id, &self.connections, &self.counters)
     }
 }
 
@@ -490,6 +448,146 @@ impl Default for ConnectionManagerObject {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// -------------------- Shared FO/FC implementation --------------------
+//
+// Kept as free functions so both `ConnectionManagerObject::process_*`
+// (which the adapter's inline handler calls) AND the class-registered
+// CipServiceHandler closures (which capture Arcs to the same shared
+// state and downcast the request context) can drive the same code.
+
+fn do_process_forward_open(
+    body: &[u8],
+    ctx: &ForwardOpenContext,
+    connections: &Arc<Mutex<ConnectionTable>>,
+    counters: &Arc<ConnectionManagerCounters>,
+    next_conn_id: &Arc<AtomicU32>,
+    producer_spawner: &Arc<Mutex<Option<ProducerSpawner>>>,
+) -> Result<ForwardOpenResponse> {
+    let req = ForwardOpenRequest::decode(body).map_err(|e| {
+        counters.record_open_format_reject();
+        e
+    })?;
+    let (input_asm, output_asm) = parse_connection_path(&req.connection_path).map_err(|e| {
+        counters.record_open_format_reject();
+        e
+    })?;
+
+    if ctx.assemblies.snapshot(input_asm).is_none() {
+        counters.record_open_other_reject();
+        return Err(EipError::Protocol(format!(
+            "unknown T->O assembly {}",
+            input_asm
+        )));
+    }
+    if ctx.assemblies.snapshot(output_asm).is_none() {
+        counters.record_open_other_reject();
+        return Err(EipError::Protocol(format!(
+            "unknown O->T assembly {}",
+            output_asm
+        )));
+    }
+    // Refuse if the originator asked for the same instance in both
+    // directions — matches the guard the C++ port added after the
+    // duplicate-assembly bug.
+    if input_asm == output_asm {
+        counters.record_open_other_reject();
+        return Err(EipError::Protocol(format!(
+            "Forward_Open uses assembly {} in both directions",
+            input_asm
+        )));
+    }
+
+    let assigned_oto_t = next_conn_id.fetch_add(1, Ordering::SeqCst);
+
+    // Shared, mutable peer_udp — the consumer updates it to the actual
+    // source of received O→T frames once the scanner starts producing,
+    // so the producer sends T→O back to the port the peer is actually
+    // listening on (typically ephemeral, not 2222).
+    let peer_udp = Arc::new(std::sync::RwLock::new(ctx.peer_udp));
+
+    let spawner = producer_spawner
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            counters.record_open_other_reject();
+            EipError::Protocol("Connection Manager: no producer spawner registered".into())
+        })?;
+
+    let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
+    let producer_task = (spawner)(
+        ProducerSpawnArgs {
+            connection_id: req.t_to_o_connection_id,
+            udp: ctx.udp.clone(),
+            peer_udp: peer_udp.clone(),
+            rpi_us: req.t_to_o_rpi_us,
+            assemblies: ctx.assemblies.clone(),
+            input_assembly: input_asm,
+            run_idle: ctx.run_idle,
+        },
+        producer_shutdown_rx,
+    );
+
+    {
+        let mut table = connections.lock().unwrap();
+        table.rows.insert(
+            assigned_oto_t,
+            ConnectionRow {
+                o_to_t_conn_id: assigned_oto_t,
+                t_to_o_conn_id: req.t_to_o_connection_id,
+                input_assembly: input_asm,
+                output_assembly: output_asm,
+                peer_udp,
+                o_to_t_rpi_us: req.o_to_t_rpi_us,
+                t_to_o_rpi_us: req.t_to_o_rpi_us,
+                producer_shutdown: producer_shutdown_tx,
+                producer_task,
+            },
+        );
+    }
+
+    counters.record_open_success();
+    Ok(ForwardOpenResponse {
+        o_to_t_connection_id: assigned_oto_t,
+        t_to_o_connection_id: req.t_to_o_connection_id,
+        connection_serial: req.connection_serial,
+        originator_vendor: req.originator_vendor,
+        originator_serial: req.originator_serial,
+        o_to_t_actual_rpi_us: req.o_to_t_rpi_us,
+        t_to_o_actual_rpi_us: req.t_to_o_rpi_us,
+        app_reply: Vec::new(),
+    })
+}
+
+fn do_process_forward_close(
+    body: &[u8],
+    active_conn_id: Option<u32>,
+    connections: &Arc<Mutex<ConnectionTable>>,
+    counters: &Arc<ConnectionManagerCounters>,
+) -> Result<ForwardCloseResponse> {
+    let req = ForwardCloseRequest::decode(body).map_err(|e| {
+        counters.record_close_format();
+        e
+    })?;
+    if let Some(id) = active_conn_id {
+        let mut table = connections.lock().unwrap();
+        if let Some(row) = table.rows.remove(&id) {
+            // Signal the producer to stop. Drop the row's JoinHandle;
+            // the task's own tokio::select! will see shutdown_rx and
+            // exit its loop.
+            let _ = row.producer_shutdown.send(true);
+        }
+    }
+    counters.record_close_success();
+    Ok(ForwardCloseResponse {
+        connection_serial: req.connection_serial,
+        originator_vendor: req.originator_vendor,
+        originator_serial: req.originator_serial,
+        app_reply: Vec::new(),
+    })
 }
 
 // -------------------- CipServiceHandler implementations --------------------
@@ -513,30 +611,6 @@ fn handle_get_attribute_live(
         return CipServiceResponse::error(req.service_code, status::ATTRIBUTE_NOT_SUPPORTED);
     }
     CipServiceResponse::success_with(req.service_code, attr.data().into_owned())
-}
-
-fn handle_forward_open_dispatch_stub(
-    _inst: &mut CipInstance,
-    req: &CipServiceRequest,
-) -> CipServiceResponse {
-    tracing::warn!(
-        "Forward_Open (0x54) reached CipDispatcher on Connection Manager (0x06) — \
-         adapters must call ConnectionManagerObject::process_forward_open directly, \
-         since the sync CipServiceHandler signature can't carry the per-session \
-         context (peer_udp, udp socket, assembly registry) FO needs"
-    );
-    CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED)
-}
-
-fn handle_forward_close_dispatch_stub(
-    _inst: &mut CipInstance,
-    req: &CipServiceRequest,
-) -> CipServiceResponse {
-    tracing::warn!(
-        "Forward_Close (0x4E) reached CipDispatcher on Connection Manager (0x06) — \
-         adapters call ConnectionManagerObject::process_forward_close directly"
-    );
-    CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED)
 }
 
 // -------------------- shared helpers used by the FO handler --------------------
@@ -620,6 +694,11 @@ pub(crate) fn parse_connection_path(path: &[u8]) -> Result<(u16, u16)> {
 /// zero-counter attrs. Kept so callers that don't want the full CM
 /// (adapters that don't need FO/FC delegation) can register class 0x06
 /// with browse-visible attrs and nothing else.
+#[deprecated(
+    since = "0.1.0",
+    note = "prefer ConnectionManagerObject::new().into_cip_class() — the full CM \
+            owns the connection table and FO/FC, and its counters stay live"
+)]
 pub fn build() -> CipClass {
     let mut cls = CipClass::new(class_codes::CONNECTION_MANAGER, "Connection Manager", 1);
     cls.add_standard_instance_services();
@@ -638,6 +717,12 @@ pub fn build() -> CipClass {
 /// Legacy counters-only builder. Prefer [`ConnectionManagerObject::new`]
 /// for new code — it wires the counters up alongside the connection
 /// table and FO/FC dispatch.
+#[deprecated(
+    since = "0.1.0",
+    note = "prefer ConnectionManagerObject::new() — the full CM owns the connection \
+            table, gives you the same counters via .counters(), and hosts real FO/FC \
+            handlers on the class"
+)]
 pub fn build_with_counters() -> (CipClass, Arc<ConnectionManagerCounters>) {
     let mut cm = ConnectionManagerObject::new();
     let counters = cm.counters();
@@ -706,15 +791,146 @@ mod tests {
     }
 
     #[test]
-    fn fo_service_via_dispatcher_returns_service_not_supported() {
-        // Confirm the stub: FORWARD_OPEN routed through the dispatcher
-        // gets rejected with SERVICE_NOT_SUPPORTED. Adapters must call
-        // process_forward_open directly.
-        let (cls, _counters) = build_with_counters();
+    fn fo_via_dispatcher_without_context_returns_service_not_supported() {
+        // Old sanity check preserved: FORWARD_OPEN routed through
+        // plain `dispatch` (no context) hits the "no ForwardOpenContext
+        // supplied" diagnostic.
+        let mut cm = ConnectionManagerObject::new();
         let dispatcher = Arc::new(CipDispatcher::new());
-        dispatcher.register_class(cls);
+        dispatcher.register_class(cm.into_cip_class());
         let path = CipPath::parse(&[0x20, 0x06, 0x24, 0x01]).unwrap();
         let r = dispatcher.dispatch(0x54, path, Vec::new());
         assert_eq!(r.general_status, status::SERVICE_NOT_SUPPORTED);
+    }
+
+    // ---- FO / FC integration tests ----
+    //
+    // Exercise the real code path end to end: build a CM, register a
+    // fake ProducerSpawner that returns a no-op JoinHandle, feed the
+    // CM a hand-crafted Forward_Open body, verify a row lands in the
+    // connection table + the response is sane + counters bumped.
+
+    fn make_asm_registry() -> AssemblyRegistry {
+        let reg = AssemblyRegistry::new();
+        reg.insert(crate::Assembly::new(100, crate::AssemblyKind::Input, 8)).unwrap();
+        reg.insert(crate::Assembly::new(102, crate::AssemblyKind::Output, 8)).unwrap();
+        reg.insert(crate::Assembly::new(105, crate::AssemblyKind::Config, 4)).unwrap();
+        reg
+    }
+
+    /// Minimal Forward_Open body targeting instances 105 (config), 102
+    /// (O→T), 100 (T→O) — matches echo-adapter's assembly layout.
+    fn build_test_fo_body() -> Vec<u8> {
+        // Format: priority/tick(1), timeout_ticks(1), O→T conn id(4),
+        // T→O conn id(4), conn serial(2), orig vendor(2), orig serial(4),
+        // conn timeout mult(1), reserved(3), O→T rpi(4), O→T net params(2),
+        // T→O rpi(4), T→O net params(2), transport(1), conn path size (words)(1),
+        // conn path bytes.
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0x0A, 0x05]); // priority/tick, timeout_ticks
+        b.extend_from_slice(&0u32.to_le_bytes()); // O→T id (target assigns)
+        b.extend_from_slice(&0xBEEF_1234u32.to_le_bytes()); // T→O id (originator assigns)
+        b.extend_from_slice(&0x1111u16.to_le_bytes()); // conn serial
+        b.extend_from_slice(&0x0001u16.to_le_bytes()); // orig vendor
+        b.extend_from_slice(&0xC0FFEE01u32.to_le_bytes()); // orig serial
+        b.push(1); // conn timeout mult
+        b.extend_from_slice(&[0, 0, 0]); // reserved
+        b.extend_from_slice(&10_000u32.to_le_bytes()); // O→T rpi
+        b.extend_from_slice(&0x4400u16.to_le_bytes()); // O→T params
+        b.extend_from_slice(&10_000u32.to_le_bytes()); // T→O rpi
+        b.extend_from_slice(&0x4400u16.to_le_bytes()); // T→O params
+        b.push(0xA0); // transport
+        // Connection path: Class 0x04 (Assembly), Instance 105 (config),
+        //                  Connection 102 (O→T), Connection 100 (T→O).
+        let conn_path = [0x20, 0x04, 0x24, 0x69, 0x2C, 0x66, 0x2C, 0x64];
+        b.push((conn_path.len() / 2) as u8); // path size in words
+        b.extend_from_slice(&conn_path);
+        b
+    }
+
+    fn install_noop_spawner(cm: &ConnectionManagerObject) {
+        cm.set_producer_spawner(|_args, _shutdown_rx| {
+            // Return a task that immediately exits.
+            tokio::spawn(async {})
+        });
+    }
+
+    #[tokio::test]
+    async fn process_forward_open_inserts_row_and_bumps_counter() {
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+        let body = build_test_fo_body();
+        let resp = cm.process_forward_open(&body, &ctx).unwrap();
+
+        assert_eq!(resp.t_to_o_connection_id, 0xBEEF_1234);
+        assert!(resp.o_to_t_connection_id >= 0x8000_0000);
+        assert_eq!(cm.connection_count(), 1);
+        assert_eq!(cm.counters().open_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn process_forward_close_removes_row_and_bumps_counter() {
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+        let resp = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap();
+        assert_eq!(cm.connection_count(), 1);
+
+        // FC body: conn_serial(2) + orig vendor(2) + orig serial(4) +
+        // conn timeout mult(1) + reserved(1) + conn path words(1) + reserved(1)
+        // + conn path.
+        let mut fc = Vec::new();
+        fc.extend_from_slice(&[0x0A, 0x05]); // priority/tick, timeout_ticks
+        fc.extend_from_slice(&0x1111u16.to_le_bytes()); // conn serial
+        fc.extend_from_slice(&0x0001u16.to_le_bytes()); // orig vendor
+        fc.extend_from_slice(&0xC0FFEE01u32.to_le_bytes()); // orig serial
+        fc.push(2); // path words
+        fc.push(0); // reserved
+        fc.extend_from_slice(&[0x20, 0x06, 0x24, 0x01]);
+
+        cm.process_forward_close(&fc, Some(resp.o_to_t_connection_id)).unwrap();
+        assert_eq!(cm.connection_count(), 0);
+        assert_eq!(cm.counters().close_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn fo_via_dispatcher_with_context_works() {
+        // Real end-to-end: FO routed through CipDispatcher with a
+        // ForwardOpenContext lands in the table just like the direct
+        // process_forward_open call.
+        let mut cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        let counters_handle = cm.counters();
+        let connections_handle = cm.connections();
+        let dispatcher = Arc::new(CipDispatcher::new());
+        dispatcher.register_class(cm.into_cip_class());
+
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx: Arc<dyn Any + Send + Sync> = Arc::new(ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        });
+
+        let path = CipPath::parse(&[0x20, 0x06, 0x24, 0x01]).unwrap();
+        let r = dispatcher.dispatch_with_context(0x54, path, build_test_fo_body(), Some(ctx));
+        assert_eq!(r.general_status, status::SUCCESS);
+        assert_eq!(connections_handle.lock().unwrap().rows.len(), 1);
+        assert_eq!(counters_handle.open_requests.load(Ordering::Relaxed), 1);
     }
 }

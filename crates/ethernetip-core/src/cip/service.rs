@@ -2,6 +2,7 @@
 //! dispatcher and the per-instance handlers, plus the handler function type
 //! and the definition record registered on a class.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use crate::cip::instance::CipInstance;
@@ -9,7 +10,7 @@ use crate::cip::path::CipPath;
 use crate::cip::service_codes;
 
 /// A CIP service request routed to a specific class + instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CipServiceRequest {
     /// Original service code (without the reply bit).
     pub service_code: u8,
@@ -18,6 +19,31 @@ pub struct CipServiceRequest {
     pub path: CipPath,
     /// Service-specific body (what followed the path in the MR request).
     pub data: Vec<u8>,
+    /// Optional per-request context. Handlers that need per-session state
+    /// (peer socket address, an assembly registry, a transport socket)
+    /// downcast this to whatever type the caller registered. Populated by
+    /// [`crate::cip::CipDispatcher::dispatch_with_context`]; `None` when
+    /// the request came through the plain `dispatch` entry point.
+    pub context: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl CipServiceRequest {
+    /// Downcast the context to a concrete type. Returns `None` when the
+    /// request has no context or when the concrete type doesn't match.
+    pub fn context<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.context.as_ref().and_then(|arc| arc.downcast_ref::<T>())
+    }
+}
+
+impl std::fmt::Debug for CipServiceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CipServiceRequest")
+            .field("service_code", &self.service_code)
+            .field("path", &self.path)
+            .field("data_len", &self.data.len())
+            .field("has_context", &self.context.is_some())
+            .finish()
+    }
 }
 
 /// A CIP service response — reply service code with the reply bit set, a

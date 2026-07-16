@@ -45,6 +45,21 @@ impl CipDispatcher {
     /// * `SERVICE_NOT_SUPPORTED` (0x08) when the class + instance resolves
     ///   but the service code has no handler.
     pub fn dispatch(&self, service_code: u8, path: CipPath, data: Vec<u8>) -> CipServiceResponse {
+        self.dispatch_with_context(service_code, path, data, None)
+    }
+
+    /// Same as [`dispatch`] but passes a per-request context to the
+    /// handler. Handlers that need per-session state (Forward_Open needs
+    /// an assembly registry + a task spawner, for example) downcast the
+    /// context via [`crate::cip::CipServiceRequest::context`] to whatever
+    /// type the caller registered.
+    pub fn dispatch_with_context(
+        &self,
+        service_code: u8,
+        path: CipPath,
+        data: Vec<u8>,
+        context: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> CipServiceResponse {
         let Some(class_id) = path.class_id else {
             return CipServiceResponse::error(service_code, status::PATH_DESTINATION_UNKNOWN);
         };
@@ -73,6 +88,7 @@ impl CipDispatcher {
             service_code,
             path,
             data,
+            context,
         };
         handler(instance, &request)
     }

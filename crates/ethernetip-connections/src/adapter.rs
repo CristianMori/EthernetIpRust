@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{watch, Mutex};
+use std::sync::Mutex;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -143,15 +144,16 @@ impl AdapterHandle {
     }
 
     /// Snapshot the number of live Class 1 connections. Convenience for
-    /// callers who don't want to reach through `self.cm`.
-    pub async fn connection_count(&self) -> usize {
-        self.cm.connection_count().await
+    /// callers who don't want to reach through `self.cm`. Sync now — the
+    /// CM's connection table is behind a `std::sync::Mutex`.
+    pub fn connection_count(&self) -> usize {
+        self.cm.connection_count()
     }
 
     /// Snapshot every live connection. Convenience for callers who don't
     /// want to reach through `self.cm`.
-    pub async fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
-        self.cm.snapshot_connections().await
+    pub fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
+        self.cm.snapshot_connections()
     }
 }
 
@@ -316,11 +318,11 @@ impl SessionState {
         // down and the row leaves the table.
         if let Some(id) = self.active_conn_id.take() {
             let table = self.cm.connections();
-            let mut table = table.lock().await;
+            let mut table = table.lock().unwrap();
             if let Some(row) = table.rows.remove(&id) {
                 let _ = row.producer_shutdown.send(true);
-                drop(table);
-                let _ = row.producer_task.await;
+                // Task shuts down on its own tick — we drop the
+                // JoinHandle rather than blocking on it.
             }
         }
     }
@@ -384,11 +386,11 @@ impl SessionState {
                 );
                 let ctx = ForwardOpenContext {
                     peer_udp,
-                    assemblies: &self.assemblies,
+                    assemblies: self.assemblies.clone(),
                     udp: self.udp.clone(),
                     run_idle: self.run_idle,
                 };
-                match self.cm.process_forward_open(&body, ctx).await {
+                match self.cm.process_forward_open(&body, &ctx) {
                     Ok(resp) => {
                         include_sockaddr_reply = true;
                         self.active_conn_id = Some(resp.o_to_t_connection_id);
@@ -410,7 +412,7 @@ impl SessionState {
             }
             s if s == service::FORWARD_CLOSE => {
                 let active = self.active_conn_id.take();
-                match self.cm.process_forward_close(&body, active).await {
+                match self.cm.process_forward_close(&body, active) {
                     Ok(resp) => (
                         service::FORWARD_CLOSE | service::REPLY_FLAG,
                         status::SUCCESS,
@@ -587,7 +589,7 @@ impl ConsumerState {
                         }
                     };
                     let target = {
-                        let table = self.connections.lock().await;
+                        let table = self.connections.lock().unwrap();
                         table.rows
                             .values()
                             .find(|row| row.o_to_t_conn_id == frame.connection_id)

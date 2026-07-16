@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
                 } else {
                     0
                 };
-                let conns = handle.connection_count().await;
+                let conns = handle.connection_count();
                 print!(
                     "\r[tick {tick_count:>6}] Out[0]={out0:>10}  Conns={conns}  "
                 );

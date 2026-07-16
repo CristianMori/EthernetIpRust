@@ -12,7 +12,6 @@
 //! connection per TCP session. Extending it to multi-connection is a matter
 //! of moving `active` from `Option` to `HashMap<connection_id, _>`.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -30,11 +29,12 @@ use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEAD
 use ethernetip_core::error::{EipError, Result};
 
 use crate::assembly::AssemblyRegistry;
-use crate::connection_manager_object::ConnectionManagerCounters;
-use crate::epio::{self, Frame};
-use crate::forward_open::{
-    ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
+use crate::connection_manager_object::{
+    ConnectionManagerObject, ConnectionSummary, ConnectionTable, ForwardOpenContext,
+    ProducerSpawnArgs,
 };
+use crate::epio::{self, Frame};
+use crate::forward_open::{ForwardCloseResponse, ForwardOpenResponse};
 
 /// Default cyclic I/O UDP port (well-known EtherNet/IP value).
 pub const IO_UDP_PORT: u16 = 2222;
@@ -60,11 +60,14 @@ pub struct AdapterConfig {
     /// `SERVICE_NOT_SUPPORTED`. Shared `Arc` so the same dispatcher can
     /// serve multiple sessions.
     pub dispatcher: Option<Arc<CipDispatcher>>,
-    /// Optional live counter block for the Connection Manager class
-    /// (0x06). When populated, every FO success / reject and FC success
-    /// bumps the corresponding attribute so a client reading class 0x06
-    /// / instance 1 sees real numbers.
-    pub cm_counters: Option<Arc<ConnectionManagerCounters>>,
+    /// Optional pre-built Connection Manager (class 0x06). The CM owns
+    /// the connection table, the counters, the T→O connection-id
+    /// allocator, and the FO / FC processing. When not supplied,
+    /// [`start`] builds one internally and exposes it via
+    /// [`AdapterHandle::cm`]. Supply an external CM when you want to
+    /// register its class on your dispatcher yourself (typical) or share
+    /// one CM across multiple adapters.
+    pub connection_manager: Option<Arc<ConnectionManagerObject>>,
 }
 
 impl AdapterConfig {
@@ -76,7 +79,7 @@ impl AdapterConfig {
             run_idle_header: true,
             peer_udp_port: IO_UDP_PORT,
             dispatcher: None,
-            cm_counters: None,
+            connection_manager: None,
         }
     }
 
@@ -89,11 +92,11 @@ impl AdapterConfig {
         self
     }
 
-    /// Install a shared [`ConnectionManagerCounters`] so the FO / FC
-    /// handlers below bump the appropriate class-0x06 counter attribute
-    /// on every event.
-    pub fn cm_counters(mut self, counters: Arc<ConnectionManagerCounters>) -> Self {
-        self.cm_counters = Some(counters);
+    /// Install a pre-built Connection Manager (class 0x06). The CM will
+    /// own the connection table and handle FO / FC delegation. If not
+    /// supplied, [`start`] builds one internally.
+    pub fn connection_manager(mut self, cm: Arc<ConnectionManagerObject>) -> Self {
+        self.connection_manager = Some(cm);
         self
     }
 
@@ -123,7 +126,11 @@ impl AdapterConfig {
 pub struct AdapterHandle {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
-    pub connections: Arc<Mutex<ConnectionTable>>,
+    /// The Connection Manager owns the live connection table, the T→O
+    /// connection-id allocator, and the counters. Access snapshots via
+    /// [`ConnectionManagerObject::snapshot_connections`] and the total
+    /// live count via [`ConnectionManagerObject::connection_count`].
+    pub cm: Arc<ConnectionManagerObject>,
     shutdown_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -135,82 +142,58 @@ impl AdapterHandle {
         let _ = self.task.await;
     }
 
-    /// Snapshot the number of live Class 1 connections.
+    /// Snapshot the number of live Class 1 connections. Convenience for
+    /// callers who don't want to reach through `self.cm`.
     pub async fn connection_count(&self) -> usize {
-        self.connections.lock().await.rows.len()
+        self.cm.connection_count().await
     }
-}
 
-/// Publicly-visible summary of one live connection.
-#[derive(Debug, Clone)]
-pub struct ConnectionSummary {
-    pub o_to_t_conn_id: u32,
-    pub t_to_o_conn_id: u32,
-    pub o_to_t_rpi_us: u32,
-    pub t_to_o_rpi_us: u32,
-    pub input_assembly: u16,
-    pub output_assembly: u16,
-    pub peer_udp: SocketAddr,
-}
-
-/// Shared connection registry for the adapter.
-#[derive(Debug, Default)]
-pub struct ConnectionTable {
-    rows: HashMap<u32, ConnectionRow>,
-}
-
-#[derive(Debug)]
-struct ConnectionRow {
-    o_to_t_conn_id: u32,
-    t_to_o_conn_id: u32,
-    input_assembly: u16,
-    output_assembly: u16,
-    /// Live peer UDP endpoint — updated by the consumer to the actual source
-    /// of received O→T frames so the producer sends T→O back to the port the
-    /// scanner is actually receiving on (typically an ephemeral port, not the
-    /// well-known 2222).
-    peer_udp: Arc<std::sync::RwLock<SocketAddr>>,
-    o_to_t_rpi_us: u32,
-    t_to_o_rpi_us: u32,
-    producer_shutdown: watch::Sender<bool>,
-    producer_task: JoinHandle<()>,
-}
-
-impl ConnectionTable {
-    fn summaries(&self) -> Vec<ConnectionSummary> {
-        self.rows
-            .values()
-            .map(|r| ConnectionSummary {
-                o_to_t_conn_id: r.o_to_t_conn_id,
-                t_to_o_conn_id: r.t_to_o_conn_id,
-                o_to_t_rpi_us: r.o_to_t_rpi_us,
-                t_to_o_rpi_us: r.t_to_o_rpi_us,
-                input_assembly: r.input_assembly,
-                output_assembly: r.output_assembly,
-                peer_udp: *r.peer_udp.read().unwrap(),
-            })
-            .collect()
-    }
-}
-
-impl AdapterHandle {
+    /// Snapshot every live connection. Convenience for callers who don't
+    /// want to reach through `self.cm`.
     pub async fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
-        self.connections.lock().await.summaries()
+        self.cm.snapshot_connections().await
     }
 }
 
-/// Start an adapter using the provided configuration.
+/// Start an adapter using the provided configuration. If no Connection
+/// Manager was supplied in `cfg`, one is built here — call
+/// [`AdapterHandle::cm`] on the returned handle to register its class on
+/// a dispatcher and read snapshots.
 pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
     let tcp = TcpListener::bind(cfg.tcp_bind).await?;
     let tcp_addr = tcp.local_addr()?;
     let udp = Arc::new(UdpSocket::bind(cfg.udp_bind).await?);
     let udp_addr = udp.local_addr()?;
 
-    let connections: Arc<Mutex<ConnectionTable>> = Arc::new(Mutex::new(ConnectionTable::default()));
-    let next_conn_id = Arc::new(AtomicU32::new(0x8000_0000));
+    let cm = cfg
+        .connection_manager
+        .clone()
+        .unwrap_or_else(|| Arc::new(ConnectionManagerObject::new()));
+    // The CM owns the connection table and the T→O id allocator now —
+    // the adapter borrows shared handles for its tasks.
+    let connections = cm.connections();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let assemblies = cfg.assemblies.clone();
     let run_idle = cfg.run_idle_header;
+
+    // Install the producer-task spawner on the CM. When the CM accepts a
+    // Forward_Open it needs to launch the T→O tokio task, but the class
+    // itself is transport-agnostic — the adapter is where the socket
+    // types live, so we hand the CM a closure that spawns the task.
+    cm.set_producer_spawner(|args: ProducerSpawnArgs, shutdown_rx| {
+        let producer = ProducerState {
+            connection_id: args.connection_id,
+            udp: args.udp,
+            peer_udp: args.peer_udp,
+            rpi_us: args.rpi_us,
+            assemblies: args.assemblies,
+            input_assembly: args.input_assembly,
+            run_idle: args.run_idle,
+            seq: AtomicU32::new(0),
+        };
+        let _ = args.run_idle; // producer captures its own copy
+        tokio::spawn(producer.run(shutdown_rx))
+    });
 
     // UDP consumer: decode incoming O→T frames and update the right assembly.
     let consumer_state = ConsumerState {
@@ -222,14 +205,12 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
     let consumer_task = tokio::spawn(consumer_state.run(shutdown_rx.clone()));
 
     let accept_state = AcceptState {
-        connections: connections.clone(),
+        cm: cm.clone(),
         assemblies: assemblies.clone(),
         udp: udp.clone(),
-        next_conn_id,
         run_idle,
         peer_udp_port: cfg.peer_udp_port,
         dispatcher: cfg.dispatcher.clone(),
-        cm_counters: cfg.cm_counters.clone(),
     };
     let accept_task = tokio::spawn(accept_state.run(tcp, shutdown_rx));
 
@@ -240,21 +221,19 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
     Ok(AdapterHandle {
         tcp_addr,
         udp_addr,
-        connections,
+        cm,
         shutdown_tx,
         task: combined,
     })
 }
 
 struct AcceptState {
-    connections: Arc<Mutex<ConnectionTable>>,
+    cm: Arc<ConnectionManagerObject>,
     assemblies: AssemblyRegistry,
     udp: Arc<UdpSocket>,
-    next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
-    cm_counters: Option<Arc<ConnectionManagerCounters>>,
 }
 
 impl AcceptState {
@@ -275,14 +254,12 @@ impl AcceptState {
                     let session = SessionState {
                         stream,
                         peer,
-                        connections: self.connections.clone(),
+                        cm: self.cm.clone(),
                         assemblies: self.assemblies.clone(),
                         udp: self.udp.clone(),
-                        next_conn_id: self.next_conn_id.clone(),
                         run_idle: self.run_idle,
                         peer_udp_port: self.peer_udp_port,
                         dispatcher: self.dispatcher.clone(),
-                        cm_counters: self.cm_counters.clone(),
                         session_handle: 0,
                         active_conn_id: None,
                     };
@@ -296,14 +273,12 @@ impl AcceptState {
 struct SessionState {
     stream: TcpStream,
     peer: SocketAddr,
-    connections: Arc<Mutex<ConnectionTable>>,
+    cm: Arc<ConnectionManagerObject>,
     assemblies: AssemblyRegistry,
     udp: Arc<UdpSocket>,
-    next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
-    cm_counters: Option<Arc<ConnectionManagerCounters>>,
     session_handle: u32,
     active_conn_id: Option<u32>,
 }
@@ -335,8 +310,13 @@ impl SessionState {
                 break;
             }
         }
+        // TCP session ended without an explicit Forward_Close (peer
+        // dropped the socket, or the loop broke on error). Remove the
+        // dangling connection through the CM so its producer task shuts
+        // down and the row leaves the table.
         if let Some(id) = self.active_conn_id.take() {
-            let mut table = self.connections.lock().await;
+            let table = self.cm.connections();
+            let mut table = table.lock().await;
             if let Some(row) = table.rows.remove(&id) {
                 let _ = row.producer_shutdown.send(true);
                 drop(table);
@@ -402,12 +382,16 @@ impl SessionState {
                     self.peer.ip(),
                     self.peer_udp_port,
                 );
-                match self.handle_forward_open(&body, peer_udp).await {
+                let ctx = ForwardOpenContext {
+                    peer_udp,
+                    assemblies: &self.assemblies,
+                    udp: self.udp.clone(),
+                    run_idle: self.run_idle,
+                };
+                match self.cm.process_forward_open(&body, ctx).await {
                     Ok(resp) => {
                         include_sockaddr_reply = true;
-                        if let Some(c) = self.cm_counters.as_ref() {
-                            c.record_open_success();
-                        }
+                        self.active_conn_id = Some(resp.o_to_t_connection_id);
                         (
                             service::FORWARD_OPEN | service::REPLY_FLAG,
                             status::SUCCESS,
@@ -416,9 +400,6 @@ impl SessionState {
                     }
                     Err(err) => {
                         tracing::warn!("Forward_Open rejected: {err}");
-                        if let Some(c) = self.cm_counters.as_ref() {
-                            c.record_open_other_reject();
-                        }
                         (
                             service::FORWARD_OPEN | service::REPLY_FLAG,
                             status::CONNECTION_FAILURE,
@@ -428,27 +409,18 @@ impl SessionState {
                 }
             }
             s if s == service::FORWARD_CLOSE => {
-                match self.handle_forward_close(&body).await {
-                    Ok(resp) => {
-                        if let Some(c) = self.cm_counters.as_ref() {
-                            c.record_close_success();
-                        }
-                        (
-                            service::FORWARD_CLOSE | service::REPLY_FLAG,
-                            status::SUCCESS,
-                            resp.encode(),
-                        )
-                    }
-                    Err(_) => {
-                        if let Some(c) = self.cm_counters.as_ref() {
-                            c.record_close_other();
-                        }
-                        (
-                            service::FORWARD_CLOSE | service::REPLY_FLAG,
-                            status::CONNECTION_FAILURE,
-                            Vec::new(),
-                        )
-                    }
+                let active = self.active_conn_id.take();
+                match self.cm.process_forward_close(&body, active).await {
+                    Ok(resp) => (
+                        service::FORWARD_CLOSE | service::REPLY_FLAG,
+                        status::SUCCESS,
+                        resp.encode(),
+                    ),
+                    Err(_) => (
+                        service::FORWARD_CLOSE | service::REPLY_FLAG,
+                        status::CONNECTION_FAILURE,
+                        Vec::new(),
+                    ),
                 }
             }
             other => {
@@ -515,114 +487,6 @@ impl SessionState {
         .await
     }
 
-    async fn handle_forward_open(
-        &mut self,
-        body: &[u8],
-        peer_udp: SocketAddr,
-    ) -> Result<ForwardOpenResponse> {
-        let req = ForwardOpenRequest::decode(body)?;
-        let (input_asm, output_asm) = parse_connection_path(&req.connection_path)?;
-
-        // Sanity check: both assemblies must exist.
-        if self.assemblies.snapshot(input_asm).is_none() {
-            return Err(EipError::Protocol(format!(
-                "unknown T->O assembly {}",
-                input_asm
-            )));
-        }
-        if self.assemblies.snapshot(output_asm).is_none() {
-            return Err(EipError::Protocol(format!(
-                "unknown O->T assembly {}",
-                output_asm
-            )));
-        }
-
-        // Refuse if the originator asked for the same instance in both
-        // directions — matches the guard the C++ port added after the
-        // duplicate-assembly bug.
-        if input_asm == output_asm {
-            return Err(EipError::Protocol(format!(
-                "Forward_Open uses assembly {} in both directions",
-                input_asm
-            )));
-        }
-
-        let assigned_oto_t = self.next_conn_id.fetch_add(1, Ordering::SeqCst);
-        self.active_conn_id = Some(assigned_oto_t);
-
-        // Producer task uses the SAME UDP socket for send — matches how
-        // the C#/C++/Python ports organize their UDP transports, and lets
-        // outgoing frames carry our advertised bind address as source so a
-        // peer that filters on it sees a match. (Earlier we split into an
-        // ephemeral send socket to dodge a suspected Windows loopback
-        // quirk; the actual fix was Sockaddr Info hand-off, so we can
-        // share the socket cleanly again.)
-        let send_udp = self.udp.clone();
-        let (producer_shutdown_tx, producer_shutdown_rx) = watch::channel(false);
-        // Shared, mutable peer_udp — the consumer will update it to the
-        // actual source of received O→T frames once the scanner starts
-        // producing, so the producer sends T→O back to the port the peer
-        // is actually listening on (typically ephemeral, not 2222).
-        let peer_udp = Arc::new(std::sync::RwLock::new(peer_udp));
-        let producer = ProducerState {
-            connection_id: req.t_to_o_connection_id,
-            udp: send_udp,
-            peer_udp: peer_udp.clone(),
-            rpi_us: req.t_to_o_rpi_us,
-            assemblies: self.assemblies.clone(),
-            input_assembly: input_asm,
-            run_idle: self.run_idle,
-            seq: AtomicU32::new(0),
-        };
-        let producer_task = tokio::spawn(producer.run(producer_shutdown_rx));
-
-        {
-            let mut table = self.connections.lock().await;
-            table.rows.insert(
-                assigned_oto_t,
-                ConnectionRow {
-                    o_to_t_conn_id: assigned_oto_t,
-                    t_to_o_conn_id: req.t_to_o_connection_id,
-                    input_assembly: input_asm,
-                    output_assembly: output_asm,
-                    peer_udp,
-                    o_to_t_rpi_us: req.o_to_t_rpi_us,
-                    t_to_o_rpi_us: req.t_to_o_rpi_us,
-                    producer_shutdown: producer_shutdown_tx,
-                    producer_task,
-                },
-            );
-        }
-
-        Ok(ForwardOpenResponse {
-            o_to_t_connection_id: assigned_oto_t,
-            t_to_o_connection_id: req.t_to_o_connection_id,
-            connection_serial: req.connection_serial,
-            originator_vendor: req.originator_vendor,
-            originator_serial: req.originator_serial,
-            o_to_t_actual_rpi_us: req.o_to_t_rpi_us,
-            t_to_o_actual_rpi_us: req.t_to_o_rpi_us,
-            app_reply: Vec::new(),
-        })
-    }
-
-    async fn handle_forward_close(&mut self, body: &[u8]) -> Result<ForwardCloseResponse> {
-        let req = ForwardCloseRequest::decode(body)?;
-        if let Some(id) = self.active_conn_id.take() {
-            let mut table = self.connections.lock().await;
-            if let Some(row) = table.rows.remove(&id) {
-                let _ = row.producer_shutdown.send(true);
-                drop(table);
-                let _ = row.producer_task.await;
-            }
-        }
-        Ok(ForwardCloseResponse {
-            connection_serial: req.connection_serial,
-            originator_vendor: req.originator_vendor,
-            originator_serial: req.originator_serial,
-            app_reply: Vec::new(),
-        })
-    }
 }
 
 fn split_mr_request(bytes: &[u8]) -> Result<(u8, Vec<u8>, Vec<u8>)> {
@@ -646,79 +510,6 @@ fn split_mr_request(bytes: &[u8]) -> Result<(u8, Vec<u8>, Vec<u8>)> {
         bytes[2..path_end].to_vec(),
         bytes[path_end..].to_vec(),
     ))
-}
-
-/// Extract the O→T and T→O assembly instances from a Forward_Open
-/// connection path. The Logix / Generic Ethernet Module convention is
-/// `[route*] Class(4) Instance(config) Connection(consumed) Connection(produced)`,
-/// with the class-and-instance segments identifying the config assembly and
-/// two more logical-connection-point segments (0x2C) naming the O→T and T→O
-/// assemblies.
-fn parse_connection_path(path: &[u8]) -> Result<(u16, u16)> {
-    let mut i = 0;
-    let mut assemblies = Vec::new();
-    while i < path.len() {
-        let seg = path[i];
-        match seg {
-            // Port segment (route bytes) — skip.
-            0x00..=0x0F => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                i += 2;
-            }
-            // Logical class segment (8-bit).
-            0x20 => i += 2,
-            0x21 => i += 4,
-            // Logical instance segment (8-bit / 16-bit).
-            0x24 => i += 2,
-            0x25 => i += 4,
-            // Logical connection point (assembly instance) — this is what we want.
-            0x2C => {
-                if i + 1 >= path.len() {
-                    return Err(EipError::Short {
-                        expected: i + 2,
-                        actual: path.len(),
-                    });
-                }
-                assemblies.push(path[i + 1] as u16);
-                i += 2;
-            }
-            0x2D => {
-                if i + 3 >= path.len() {
-                    return Err(EipError::Short {
-                        expected: i + 4,
-                        actual: path.len(),
-                    });
-                }
-                assemblies.push(u16::from_le_bytes([path[i + 2], path[i + 3]]));
-                i += 4;
-            }
-            // Data segments — skip inline config bytes.
-            0x80 => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                let word_size = path[i + 1] as usize;
-                i += 2 + word_size * 2;
-            }
-            _ => {
-                // Unknown segment — bail out with what we've got.
-                break;
-            }
-        }
-    }
-    if assemblies.len() < 2 {
-        return Err(EipError::Protocol(format!(
-            "Forward_Open connection path did not yield 2 assembly instances (got {})",
-            assemblies.len()
-        )));
-    }
-    // Convention: first connection-point segment = O→T (consumed by adapter),
-    // second = T→O (produced by adapter).
-    let output_asm = assemblies[assemblies.len() - 2]; // O→T
-    let input_asm = assemblies[assemblies.len() - 1]; // T→O
-    Ok((input_asm, output_asm))
 }
 
 struct ProducerState {

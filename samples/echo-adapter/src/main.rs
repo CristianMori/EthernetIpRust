@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ethernetip_connections::{
-    build_connection_manager_with_counters, device, start_adapter, Assembly, AssemblyKind,
-    AssemblyRegistry, AdapterConfig, CipDispatcher, IO_UDP_PORT,
+    device, start_adapter, AdapterConfig, Assembly, AssemblyKind, AssemblyRegistry, CipDispatcher,
+    ConnectionManagerObject, IO_UDP_PORT,
 };
 
 const INPUT_INSTANCE: u16 = 100;
@@ -102,8 +102,9 @@ async fn main() -> Result<()> {
     dispatcher.register_class(device::build_ethernet_link(
         device::EthernetLinkConfig::probe(bind_ip),
     ));
-    let (cm_cls, cm_counters) = build_connection_manager_with_counters();
-    dispatcher.register_class(cm_cls);
+    let mut cm = ConnectionManagerObject::new();
+    dispatcher.register_class(cm.into_cip_class());
+    let cm = Arc::new(cm);
     let mut assembly_cls = device::build_assembly();
     for &(inst, size) in &[
         (INPUT_INSTANCE, INPUT_SIZE),
@@ -124,7 +125,7 @@ async fn main() -> Result<()> {
             .udp_bind(udp_bind)
             .peer_udp_port(peer_udp_port)
             .dispatcher(dispatcher)
-            .cm_counters(cm_counters),
+            .connection_manager(cm),
     )
     .await?;
 

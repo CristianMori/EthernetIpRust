@@ -17,7 +17,7 @@ pub mod scanner;
 
 pub use connection_manager_object::{
     build as build_connection_manager, build_with_counters as build_connection_manager_with_counters,
-    ConnectionManagerCounters,
+    ConnectionManagerCounters, ConnectionManagerObject, ConnectionSummary,
 };
 // Re-export the CIP object framework + device classes so downstream
 // samples don't need to pull in ethernetip-core just to register a
@@ -25,9 +25,7 @@ pub use connection_manager_object::{
 pub use ethernetip_core::cip::{CipClass, CipDispatcher, CipPath};
 pub use ethernetip_core::device;
 
-pub use adapter::{
-    start as start_adapter, AdapterConfig, AdapterHandle, ConnectionSummary, IO_UDP_PORT,
-};
+pub use adapter::{start as start_adapter, AdapterConfig, AdapterHandle, IO_UDP_PORT};
 pub use scanner::{open_connection as open_scanner_connection, ScannerConfig, ScannerConnection};
 pub use assembly::{Assembly, AssemblyKind, AssemblyRegistry};
 pub use epio::{decode_frame, encode_frame, Frame};

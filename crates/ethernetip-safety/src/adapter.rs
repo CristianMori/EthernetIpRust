@@ -29,7 +29,7 @@ use tokio::time;
 use ethernetip_connections::epio::{
     decode_frame_raw as decode_epio, encode_frame_raw as encode_epio, Frame,
 };
-use ethernetip_core::cip::{service_codes as service, status};
+use ethernetip_core::cip::{service_codes as service, status, CipDispatcher, CipPath};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
@@ -63,6 +63,13 @@ pub struct SafetyAdapterConfig {
     /// TCOO cadence in microseconds — how often we emit a target TCOO to keep
     /// the scanner's consumer_active latch alive.
     pub tcoo_period_us: u32,
+    /// Optional CIP object dispatcher for services that aren't
+    /// FORWARD_OPEN / FORWARD_CLOSE. When populated, MR requests targeted
+    /// at a registered class (e.g. Safety Supervisor 0x39) are routed
+    /// through [`CipDispatcher::dispatch`] instead of returning
+    /// `SERVICE_NOT_SUPPORTED`. Shared `Arc` so a single dispatcher can be
+    /// used across multiple sessions.
+    pub dispatcher: Option<Arc<CipDispatcher>>,
 }
 
 impl SafetyAdapterConfig {
@@ -77,7 +84,16 @@ impl SafetyAdapterConfig {
             format: SafetyFormat::Base,
             peer_udp_port: IO_UDP_PORT,
             tcoo_period_us: 100_000,
+            dispatcher: None,
         }
+    }
+
+    /// Install a [`CipDispatcher`] so MR requests for registered classes
+    /// (e.g. Safety Supervisor 0x39) are routed to their handlers instead
+    /// of returning `SERVICE_NOT_SUPPORTED`.
+    pub fn dispatcher(mut self, dispatcher: Arc<CipDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
     }
 
     pub fn tcp_bind(mut self, addr: SocketAddr) -> Self {
@@ -335,6 +351,7 @@ async fn handle_send_rr_data(
             None,
         ));
     }
+    let path_bytes = &mr[2..path_end];
     let body = &mr[path_end..];
 
     let mut sockaddr_reply_bytes: Option<Vec<u8>> = None;
@@ -392,7 +409,28 @@ async fn handle_send_rr_data(
             r.push(0);
             (s | service::REPLY_FLAG, status::SUCCESS, r)
         }
-        other => (other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, Vec::new()),
+        other => {
+            // Route through the CIP object dispatcher if one is registered.
+            // Its own encode() produces the full MR reply (service byte,
+            // reserved, status, ext_words, body), but here we only feed the
+            // reply body / status back to build_reply_envelope, which
+            // rebuilds the MR reply prefix itself. So we split the encoded
+            // response back into its parts.
+            if let Some(dispatcher) = cfg.dispatcher.as_ref() {
+                match CipPath::parse(path_bytes) {
+                    Ok(path) => {
+                        let response = dispatcher.dispatch(other, path, body.to_vec());
+                        (response.service_code, response.general_status, response.data)
+                    }
+                    Err(err) => {
+                        tracing::debug!("safety adapter path parse failed for service 0x{other:02X}: {err}");
+                        (other | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, Vec::new())
+                    }
+                }
+            } else {
+                (other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, Vec::new())
+            }
+        }
     };
 
     Ok(build_reply_envelope(

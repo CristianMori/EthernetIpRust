@@ -220,6 +220,27 @@ pub struct ProducerSpawnArgs {
     pub run_idle: bool,
 }
 
+/// Callback invoked from `process_forward_open` when the FO's connection
+/// path contains a CIP Safety network segment (leader byte `0x50`).
+/// Mirrors C# `ConnectionManagerObject.SafetyHandler` / the
+/// `ISafetyConnectionHandler` interface: the safety layer decides whether
+/// to accept the safety-specific bits (TUNID match, SCID check, ownership)
+/// and either returns `None` to accept or `Some(reject_code)` to reject
+/// with a CIP extended-status code (e.g. `0x080E` for TUNID mismatch).
+///
+/// A safety module registers a handler via
+/// [`ConnectionManagerObject::set_safety_handler`]. Without a handler,
+/// the CM treats safety-segmented FOs as unknown paths and rejects them
+/// with `RESOURCE_UNAVAILABLE` — matching what the C# CM does when no
+/// SafetyHandler is set.
+pub type SafetyHandler = Arc<
+    dyn Fn(&[u8]) -> Option<u16> + Send + Sync,
+>;
+
+/// Byte value of the safety network segment leader. Detected in the FO's
+/// connection path when the CM needs to route through a `SafetyHandler`.
+const SAFETY_SEGMENT_LEADER: u8 = 0x50;
+
 // -------------------- Connection Manager object --------------------
 
 /// CIP Connection Manager Object (class 0x06). Construct once at adapter
@@ -234,6 +255,7 @@ pub struct ConnectionManagerObject {
     counters: Arc<ConnectionManagerCounters>,
     next_conn_id: Arc<AtomicU32>,
     producer_spawner: Arc<Mutex<Option<ProducerSpawner>>>,
+    safety_handler: Arc<Mutex<Option<SafetyHandler>>>,
 }
 
 impl std::fmt::Debug for ConnectionManagerObject {
@@ -296,6 +318,9 @@ impl ConnectionManagerObject {
         let counters_for_fo = counters.clone();
         let next_id_for_fo = next_conn_id.clone();
         let spawner_for_fo = producer_spawner.clone();
+        let safety_handler_for_fo: Arc<Mutex<Option<SafetyHandler>>> =
+            Arc::new(Mutex::new(None));
+        let safety_slot_for_ctor = safety_handler_for_fo.clone();
         cls.add_instance_service(CipServiceDefinition::new(
             0x54,
             "Forward_Open",
@@ -307,13 +332,15 @@ impl ConnectionManagerObject {
                     );
                     return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
                 };
-                match do_process_forward_open(
+                let handler = safety_handler_for_fo.lock().unwrap().as_ref().cloned();
+                match do_process_forward_open_with_safety(
                     &req.data,
                     ctx,
                     &connections_for_fo,
                     &counters_for_fo,
                     &next_id_for_fo,
                     &spawner_for_fo,
+                    handler,
                 ) {
                     Ok(resp) => CipServiceResponse::success_with(req.service_code, resp.encode()),
                     Err(err) => {
@@ -355,7 +382,19 @@ impl ConnectionManagerObject {
             counters,
             next_conn_id,
             producer_spawner,
+            safety_handler: safety_slot_for_ctor,
         }
+    }
+
+    /// Install a safety-connection handler. The CM calls this callback
+    /// from `process_forward_open` whenever the FO's connection path
+    /// contains a CIP Safety network segment (leader byte 0x50). See
+    /// [`SafetyHandler`] for the accept / reject contract.
+    pub fn set_safety_handler<F>(&self, handler: F)
+    where
+        F: Fn(&[u8]) -> Option<u16> + Send + Sync + 'static,
+    {
+        *self.safety_handler.lock().unwrap() = Some(Arc::new(handler));
     }
 
     /// Take the built CipClass so it can be registered on a dispatcher.
@@ -419,13 +458,15 @@ impl ConnectionManagerObject {
         body: &[u8],
         ctx: &ForwardOpenContext,
     ) -> Result<ForwardOpenResponse> {
-        do_process_forward_open(
+        let handler = self.safety_handler.lock().unwrap().as_ref().cloned();
+        do_process_forward_open_with_safety(
             body,
             ctx,
             &self.connections,
             &self.counters,
             &self.next_conn_id,
             &self.producer_spawner,
+            handler,
         )
     }
 
@@ -465,10 +506,57 @@ fn do_process_forward_open(
     next_conn_id: &Arc<AtomicU32>,
     producer_spawner: &Arc<Mutex<Option<ProducerSpawner>>>,
 ) -> Result<ForwardOpenResponse> {
+    do_process_forward_open_with_safety(
+        body,
+        ctx,
+        connections,
+        counters,
+        next_conn_id,
+        producer_spawner,
+        None,
+    )
+}
+
+/// Same as `do_process_forward_open` but with optional safety hook. When
+/// present, the safety handler is called for any FO whose connection
+/// path carries a safety network segment (leader byte 0x50). This is
+/// what the CM's class-registered FO handler uses.
+fn do_process_forward_open_with_safety(
+    body: &[u8],
+    ctx: &ForwardOpenContext,
+    connections: &Arc<Mutex<ConnectionTable>>,
+    counters: &Arc<ConnectionManagerCounters>,
+    next_conn_id: &Arc<AtomicU32>,
+    producer_spawner: &Arc<Mutex<Option<ProducerSpawner>>>,
+    safety_handler: Option<SafetyHandler>,
+) -> Result<ForwardOpenResponse> {
     let req = ForwardOpenRequest::decode(body).map_err(|e| {
         counters.record_open_format_reject();
         e
     })?;
+
+    // If the connection path contains a safety network segment (leader
+    // 0x50), delegate to the registered SafetyHandler. The handler
+    // decides accept-or-reject on the safety-specific bits (TUNID / SCID
+    // / ownership); we still handle the assembly / connection-table
+    // parts down below.
+    if let Some(safety_seg) = find_safety_segment(&req.connection_path) {
+        if let Some(handler) = safety_handler {
+            if let Some(reject_ext) = handler(safety_seg) {
+                counters.record_open_other_reject();
+                return Err(EipError::Cip {
+                    status: 0x01, // CONNECTION_FAILURE
+                    ext: vec![reject_ext],
+                });
+            }
+        } else {
+            counters.record_open_other_reject();
+            return Err(EipError::Protocol(
+                "safety FO received but no SafetyHandler registered".into(),
+            ));
+        }
+    }
+
     let (input_asm, output_asm) = parse_connection_path(&req.connection_path).map_err(|e| {
         counters.record_open_format_reject();
         e
@@ -614,6 +702,50 @@ fn handle_get_attribute_live(
 }
 
 // -------------------- shared helpers used by the FO handler --------------------
+
+/// If a CIP Safety network segment (leader 0x50) is present anywhere in
+/// the connection path, return the slice starting at that leader.
+/// Otherwise `None`. Used by [`do_process_forward_open_with_safety`] to
+/// route safety FOs through a registered SafetyHandler.
+pub(crate) fn find_safety_segment(path: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < path.len() {
+        if path[i] == SAFETY_SEGMENT_LEADER {
+            return Some(&path[i..]);
+        }
+        // Skip whatever segment is here — we only care about locating
+        // the safety leader, not fully parsing every segment.
+        let step = match path[i] {
+            0x00..=0x0F => 2,
+            0x20 | 0x24 | 0x28 | 0x2C | 0x30 => 2,
+            0x21 | 0x25 | 0x29 | 0x2D | 0x31 => 4,
+            0x22 | 0x26 | 0x2A | 0x2E | 0x32 => 6,
+            // Electronic key — 2 + length_byte * 2 bytes.
+            0x34 => {
+                if i + 1 >= path.len() {
+                    break;
+                }
+                2 + path[i + 1] as usize * 2
+            }
+            // ANSI symbolic / Simple data — length in bytes at i+1.
+            0x80 | 0x91 => {
+                if i + 1 >= path.len() {
+                    break;
+                }
+                let word_len = path[i + 1] as usize;
+                if path[i] == 0x91 {
+                    let raw = 2 + word_len;
+                    raw + (raw & 1)
+                } else {
+                    2 + word_len * 2
+                }
+            }
+            _ => 2,
+        };
+        i += step;
+    }
+    None
+}
 
 /// Extract the O→T and T→O assembly instances from a Forward_Open
 /// connection path. The Logix / Generic Ethernet Module convention is
@@ -905,6 +1037,96 @@ mod tests {
         cm.process_forward_close(&fc, Some(resp.o_to_t_connection_id)).unwrap();
         assert_eq!(cm.connection_count(), 0);
         assert_eq!(cm.counters().close_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn find_safety_segment_locates_leader_after_ekey() {
+        // 4-word electronic key + safety segment.
+        let path = [
+            0x34, 0x04, 0x01, 0x00, 0x23, 0x00, 0x10, 0x00, 0x82, 0x02, // ekey
+            0x50, 0x01, 0x02, 0x03, // safety segment leader + first bytes
+        ];
+        let found = find_safety_segment(&path).unwrap();
+        assert_eq!(found[0], 0x50);
+        assert_eq!(&found[..4], &[0x50, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn find_safety_segment_returns_none_when_absent() {
+        let path = [0x20, 0x04, 0x24, 0x69, 0x2C, 0x66, 0x2C, 0x64];
+        assert!(find_safety_segment(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn safety_handler_rejection_short_circuits_fo() {
+        // Wire a safety handler that rejects with a specific extended-
+        // status code (0x080E, TUNID mismatch). An FO whose path
+        // contains a safety segment leader should get that rejection.
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        cm.set_safety_handler(|_seg| Some(0x080E));
+
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+        // Build an FO body with a safety-segmented connection path.
+        let mut body = build_test_fo_body();
+        // Rewrite the conn path to include a safety segment leader.
+        // Easiest: append a fake safety segment (leader byte + length + data)
+        // to the existing path. Re-encoding the path length header would
+        // be a re-write; instead build a minimal fresh body with the
+        // right shape.
+        // Locate the path_size byte (25 bytes into the FO body, since
+        // FO header is fixed 26 bytes ending with transport + path_size).
+        // Simpler: swap the assembly instances for a safety leader.
+        // Path today: [0x20, 0x04, 0x24, 0x69, 0x2C, 0x66, 0x2C, 0x64] (8 bytes / 4 words).
+        // Replace it with: [0x20, 0x04, 0x24, 0x69, 0x50, 0x01, 0x00, 0x00]
+        // (8 bytes / 4 words), which has a safety leader after the
+        // config instance.
+        let path_start = body.len() - 8; // last 8 bytes are the conn path
+        body[path_start..].copy_from_slice(&[0x20, 0x04, 0x24, 0x69, 0x50, 0x01, 0x00, 0x00]);
+
+        let err = cm.process_forward_open(&body, &ctx).unwrap_err();
+        match err {
+            EipError::Cip { status, ext } => {
+                assert_eq!(status, 0x01);
+                assert_eq!(ext, vec![0x080E]);
+            }
+            other => panic!("expected Cip{{0x01, [0x080E]}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_fo_without_handler_returns_protocol_error() {
+        // No SafetyHandler installed. An FO with a safety segment
+        // should be rejected with a Protocol error so the caller knows
+        // the safety layer isn't wired up.
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        let udp_thread = std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { UdpSocket::bind("127.0.0.1:0").await.unwrap() })
+        });
+        let udp = Arc::new(udp_thread.join().unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+        let mut body = build_test_fo_body();
+        let path_start = body.len() - 8;
+        body[path_start..].copy_from_slice(&[0x20, 0x04, 0x24, 0x69, 0x50, 0x01, 0x00, 0x00]);
+
+        let err = cm.process_forward_open(&body, &ctx).unwrap_err();
+        assert!(matches!(err, EipError::Protocol(_)));
     }
 
     #[tokio::test]

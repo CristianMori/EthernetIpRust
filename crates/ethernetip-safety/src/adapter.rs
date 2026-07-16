@@ -204,6 +204,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
         rx_crc_fail: rx_crc_fail.clone(),
         shared: shared.clone(),
         format: cfg.format,
+        validator: cfg.validator.clone(),
     };
     let consumer_task = tokio::spawn(consumer.run(shutdown_rx.clone()));
 
@@ -214,6 +215,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
         tcoo_period_us: cfg.tcoo_period_us,
         tx_tcoo: tx_tcoo.clone(),
         shared: shared.clone(),
+        validator: cfg.validator.clone(),
     };
     let producer_task = tokio::spawn(producer.run(shutdown_rx.clone()));
 
@@ -768,6 +770,13 @@ struct ConsumerLoop {
     rx_crc_fail: Arc<AtomicU64>,
     shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
     format: SafetyFormat,
+    /// Optional Validator handle — when present, per-connection counters
+    /// (`packets_consumed`, `crc_errors`, `rollover_count`, `timestamp`)
+    /// on the corresponding `SafetyValidatorInstanceState` get ticked as
+    /// frames arrive. This is what makes `Get_Attribute_Single` on a
+    /// Validator instance return live numbers instead of the zero
+    /// defaults the instance was created with.
+    validator: Option<Arc<SafetyValidatorObject>>,
 }
 
 impl ConsumerLoop {
@@ -810,7 +819,7 @@ impl ConsumerLoop {
             return;
         };
 
-        let (seeds, conn_format) = {
+        let (seeds, conn_format, sv_inst) = {
             let mut guard = self.shared.lock().await;
             let Some(conn) = guard.get_mut(&frame.connection_id) else { return };
             // Track the scanner's actual UDP source — its port is typically
@@ -823,6 +832,7 @@ impl ConsumerLoop {
             (
                 (conn.pid_seed_s1, conn.pid_seed_s3, conn.pid_seed_s5),
                 conn.format,
+                conn.sv_inst,
             )
         };
 
@@ -875,7 +885,7 @@ impl ConsumerLoop {
         }
 
         match result {
-            Ok(DecodedFrame { actual_data, mode, .. }) => {
+            Ok(DecodedFrame { actual_data, mode, timestamp, .. }) => {
                 let ping = (mode.0 & 0x03) as u16;
                 {
                     let mut guard = self.shared.lock().await;
@@ -884,6 +894,17 @@ impl ConsumerLoop {
                     }
                 }
                 self.rx_valid.fetch_add(1, Ordering::Relaxed);
+                // Tick the per-connection Validator runtime counters so
+                // a scanner's Get_Attribute_Single(0x3A/n/...) can read
+                // live values.
+                if let Some(v) = self.validator.as_ref() {
+                    v.with_runtime_state(sv_inst, |s| {
+                        s.packets_consumed = s.packets_consumed.wrapping_add(1);
+                        s.rollover_count = rollover_now;
+                        s.timestamp = timestamp;
+                        s.ping_count = (mode.0 & 0x03) as u8;
+                    });
+                }
                 let mut w = self.input_data.lock().await;
                 let n = actual_data.len().min(w.len());
                 w[..n].copy_from_slice(&actual_data[..n]);
@@ -891,6 +912,11 @@ impl ConsumerLoop {
             Err(err) => {
                 if !matches!(err, SafetyDecodeError::TooShort { .. }) {
                     self.rx_crc_fail.fetch_add(1, Ordering::Relaxed);
+                    if let Some(v) = self.validator.as_ref() {
+                        v.with_runtime_state(sv_inst, |s| {
+                            s.crc_errors = s.crc_errors.wrapping_add(1);
+                        });
+                    }
                 }
             }
         }
@@ -905,6 +931,9 @@ struct TcooLoop {
     tcoo_period_us: u32,
     tx_tcoo: Arc<AtomicU64>,
     shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
+    /// Optional Validator — per-connection `packets_produced` on the
+    /// `SafetyValidatorInstanceState` gets ticked on each TCOO send.
+    validator: Option<Arc<SafetyValidatorObject>>,
 }
 
 impl TcooLoop {
@@ -921,7 +950,7 @@ impl TcooLoop {
                 _ = ticker.tick() => {
                     // Snapshot every active connection under one lock, then
                     // send TCOOs outside the critical section.
-                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8, u16)> = {
+                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8, u16, u32)> = {
                         let guard = self.shared.lock().await;
                         guard.values().map(|conn| {
                             // consumer_time = monotonic elapsed since FO
@@ -939,10 +968,11 @@ impl TcooLoop {
                                 conn.format,
                                 (conn.last_ping & 0x03) as u8,
                                 consumer_time,
+                                conn.sv_inst,
                             )
                         }).collect()
                     };
-                    for (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping, consumer_time_value) in rows {
+                    for (conn_id, peer, cid_seed_s3, cid_seed_s5, format, ping, consumer_time_value, sv_inst) in rows {
                         let mut buf = [0u8; 8];
                         // TCOO CRC family must match the connection's safety
                         // format: Base = CRC-S3, Extended = CRC-S5. Both seed
@@ -974,6 +1004,11 @@ impl TcooLoop {
                         let bytes = encode_epio(&epio);
                         if self.udp.send_to(&bytes, peer).await.is_ok() {
                             self.tx_tcoo.fetch_add(1, Ordering::Relaxed);
+                            if let Some(v) = self.validator.as_ref() {
+                                v.with_runtime_state(sv_inst, |s| {
+                                    s.packets_produced = s.packets_produced.wrapping_add(1);
+                                });
+                            }
                         }
                     }
                 }

@@ -7,10 +7,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::net::Ipv4Addr;
+
 use anyhow::{Context, Result};
 use ethernetip_safety::{
-    start_safety_adapter, CipDispatcher, SafetyAdapterConfig, SafetyNetworkNumber,
-    SafetySupervisorObject, SafetyValidatorObject,
+    build_connection_manager, device, start_safety_adapter, CipDispatcher, SafetyAdapterConfig,
+    SafetyNetworkNumber, SafetySupervisorObject, SafetyValidatorObject,
 };
 
 #[tokio::main]
@@ -36,18 +38,38 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Build a Safety Supervisor (class 0x39, instance 1) and a Safety
-    // Validator (class 0x3A). Register both on a shared dispatcher. The
-    // adapter routes any MR service that isn't FORWARD_OPEN / FORWARD_CLOSE
-    // through the dispatcher, AND allocates a fresh Validator instance on
-    // every accepted safety FO — the instance id becomes the target-side
-    // sv_inst that feeds the PID / CID seed derivation.
+    // Build the standard device CIP classes so browsers see something on
+    // discovery: Identity (0x01), TCP/IP Interface (0xF5), Ethernet Link
+    // (0xF6), Connection Manager (0x06). All read-only, all zero-cost —
+    // they just answer Get_Attribute_Single.
+    let dispatcher = Arc::new(CipDispatcher::new());
+    dispatcher.register_class(device::build_identity(device::IdentityInfo {
+        vendor_id: 0x0001,
+        device_type: 0x000C, // Communications Adapter
+        product_code: 26,
+        major_revision: 1,
+        minor_revision: 1,
+        status: 0x0030, // Owned + Configured
+        serial_number: 0xC0FFEE01,
+        product_name: "Rust Safety Adapter".into(),
+    }));
+    dispatcher.register_class(device::build_tcpip_interface(device::TcpIpConfig::new(
+        Ipv4Addr::new(192, 168, 1, 84),
+    )));
+    dispatcher.register_class(device::build_ethernet_link(
+        device::EthernetLinkConfig::default(),
+    ));
+    dispatcher.register_class(build_connection_manager());
+
+    // Safety-specific classes on the same dispatcher: Supervisor (0x39,
+    // instance 1) and Validator (0x3A, one instance per accepted safety
+    // FO — the instance id becomes the target-side sv_inst that feeds
+    // PID / CID seed derivation).
     let mut supervisor = SafetySupervisorObject::new(
         SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
         0xC0A80154,
     );
     supervisor.start();
-    let dispatcher = Arc::new(CipDispatcher::new());
     dispatcher.register_class(supervisor.into_cip_class());
 
     let mut validator = SafetyValidatorObject::new();

@@ -33,4 +33,6 @@ pub use types::{
 };
 
 pub use ethernetip_core::cip::{CipClass, CipDispatcher, CipPath};
+pub use ethernetip_core::device;
 pub use ethernetip_core::{EipError, Result};
+pub use ethernetip_connections::build_connection_manager;

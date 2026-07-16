@@ -10,6 +10,8 @@
 //! connection at register time and rides `SendUnitData` for every subsequent
 //! request.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ethernetip_core::cip::{class_codes as class, service_codes as service, status, ReplyHeader};
@@ -26,6 +28,11 @@ use crate::request::{
     wrap_unconnected_send,
 };
 use crate::tag_path::{encode_with_cache, AtomCache};
+use crate::template::{
+    build_read_template_request, build_template_header_request, decode_struct,
+    expected_definition_bytes, parse_read_template_reply, parse_template_definition,
+    parse_template_header_reply, SymType, TemplateDefinition, TypedValue, READ_TEMPLATE_CHUNK,
+};
 use crate::types::{decode_read_tag, CipType, TagValue};
 
 /// Timeout advertised to the target on each unconnected request.
@@ -124,6 +131,8 @@ impl TagClientBuilder {
             orig_vendor: DEFAULT_ORIG_VENDOR,
             orig_serial: 0,
             seq_count: 0,
+            template_cache: Arc::new(Mutex::new(HashMap::new())),
+            sym_types: HashMap::new(),
         };
         if client.use_connected {
             client.open_class3().await?;
@@ -146,6 +155,13 @@ pub struct TagClient {
     orig_vendor: u16,
     orig_serial: u32,
     seq_count: u16,
+    // Template Object cache: instance id → parsed definition. Shared via Arc
+    // so callers who clone the cache handle for offline decoding still see
+    // fresh entries the client fetches later.
+    template_cache: Arc<Mutex<HashMap<u16, TemplateDefinition>>>,
+    // sym_type map keyed by tag name — populated by browse_tags so
+    // read_tag_typed can resolve template ids without a second round trip.
+    sym_types: HashMap<String, SymType>,
 }
 
 impl TagClient {
@@ -397,6 +413,8 @@ impl TagClient {
         let all = self.enumerate_symbols(None).await?;
         for entry in &all {
             self.atoms.insert_controller(&entry.name, entry.instance_id);
+            self.sym_types
+                .insert(entry.name.clone(), SymType(entry.sym_type));
         }
         Ok(all)
     }
@@ -409,8 +427,124 @@ impl TagClient {
             entry.category = TagCategory::Program;
             self.atoms
                 .insert_program(program, &entry.name, entry.instance_id);
+            self.sym_types.insert(
+                format!("Program:{}.{}", program, entry.name),
+                SymType(entry.sym_type),
+            );
         }
         Ok(all)
+    }
+
+    /// Shared handle to the parsed-template cache. Cloning the returned
+    /// `Arc` is cheap; the client and the caller see the same entries.
+    /// Useful when decoding raw `TagValue::Struct` payloads offline (e.g.
+    /// replaying a capture through [`decode_struct`]).
+    pub fn template_cache(&self) -> Arc<Mutex<HashMap<u16, TemplateDefinition>>> {
+        Arc::clone(&self.template_cache)
+    }
+
+    /// Fetch the Template Object metadata + definition for `template_id`
+    /// and cache it. Idempotent — subsequent calls return the cached copy.
+    pub async fn fetch_template(&mut self, template_id: u16) -> Result<TemplateDefinition> {
+        if let Some(cached) = self
+            .template_cache
+            .lock()
+            .expect("template cache poisoned")
+            .get(&template_id)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        // Metadata: attrs 1/2/4/5.
+        let (svc, path, body) = build_template_header_request(template_id);
+        let mr = build_mr_request(svc, &path, &body);
+        let reply = self.dispatch(mr).await?;
+        let header = parse_template_header_reply(&reply)?;
+
+        // Chunked Read_Template loop until we have the whole definition.
+        let expected = expected_definition_bytes(&header);
+        let mut acc = Vec::with_capacity(expected);
+        let mut offset: u32 = 0;
+        while acc.len() < expected {
+            let want = READ_TEMPLATE_CHUNK.min((expected - acc.len()) as u16);
+            let (svc, path, body) = build_read_template_request(template_id, offset, want);
+            let mr = build_mr_request(svc, &path, &body);
+            let reply = self.dispatch(mr).await?;
+            let (chunk, done) = parse_read_template_reply(&reply)?;
+            if chunk.is_empty() {
+                return Err(EipError::Protocol(
+                    "Read_Template stalled: empty chunk".into(),
+                ));
+            }
+            offset = offset.saturating_add(chunk.len() as u32);
+            acc.extend_from_slice(&chunk);
+            if done && acc.len() >= expected {
+                break;
+            }
+        }
+        acc.truncate(expected);
+        let def = parse_template_definition(&header, &acc)?;
+        self.template_cache
+            .lock()
+            .expect("template cache poisoned")
+            .insert(template_id, def.clone());
+        Ok(def)
+    }
+
+    /// Read a tag and decode it against its Template Object definition when
+    /// it's a structure. Atomic tags come back as the matching
+    /// `TypedValue::*` scalar. Structures require a preceding [`Self::browse_tags`]
+    /// (or `browse_program_tags`) call so the tag's `sym_type` is known —
+    /// otherwise the caller has to supply a template id directly via
+    /// [`Self::read_tag_typed_with_template`].
+    pub async fn read_tag_typed(&mut self, name: &str) -> Result<TypedValue> {
+        let sym = self.sym_types.get(name).copied();
+        let raw = self.read_tag(name).await?;
+        match raw {
+            TagValue::Struct { .. } => {
+                let sym = sym.ok_or_else(|| {
+                    EipError::Protocol(format!(
+                        "read_tag_typed({name}): structure decode needs sym_type — call browse_tags first"
+                    ))
+                })?;
+                let template_id = sym.template_id().ok_or_else(|| {
+                    EipError::Protocol(format!(
+                        "read_tag_typed({name}): sym_type reports struct-bit clear"
+                    ))
+                })?;
+                self.read_tag_typed_with_template(name, template_id).await
+            }
+            _ => Ok(atomic_to_typed(raw)),
+        }
+    }
+
+    /// Read a tag and decode it as a structure of the given template id.
+    /// Bypasses the sym_type cache — useful when you already know the
+    /// template (e.g. from a saved layout).
+    pub async fn read_tag_typed_with_template(
+        &mut self,
+        name: &str,
+        template_id: u16,
+    ) -> Result<TypedValue> {
+        let def = self.fetch_template(template_id).await?;
+        let raw = self.read_tag_raw(name, 1).await?;
+        // read_tag_raw prepends the 4-byte struct header (type + crc); skip it.
+        if raw.len() < 4 {
+            return Err(EipError::Short {
+                expected: 4,
+                actual: raw.len(),
+            });
+        }
+        let type_code = u16::from_le_bytes([raw[0], raw[1]]);
+        if type_code != CipType::Struct as u16 {
+            return Err(EipError::Protocol(format!(
+                "read_tag_typed_with_template({name}): reply type 0x{type_code:04X} is not a struct"
+            )));
+        }
+        let payload = &raw[4..];
+        let cache = Arc::clone(&self.template_cache);
+        let resolve = move |id: u16| cache.lock().ok().and_then(|c| c.get(&id).cloned());
+        decode_struct(&def, payload, &resolve)
     }
 
     /// Read-only view of the instance-ID cache.
@@ -664,6 +798,28 @@ fn is_class3_dead(err: &EipError) -> bool {
             status::CONNECTION_FAILURE | status::DEVICE_STATE_CONFLICT
         ),
         _ => false,
+    }
+}
+
+/// Convert a scalar [`TagValue`] into the matching [`TypedValue`].
+/// Structs are handled separately in [`TagClient::read_tag_typed`] — this
+/// function panics if called with a struct.
+fn atomic_to_typed(v: TagValue) -> TypedValue {
+    match v {
+        TagValue::Bool(x) => TypedValue::Bool(x),
+        TagValue::Sint(x) => TypedValue::Sint(x),
+        TagValue::Int(x) => TypedValue::Int(x),
+        TagValue::Dint(x) => TypedValue::Dint(x),
+        TagValue::Lint(x) => TypedValue::Lint(x),
+        TagValue::Usint(x) => TypedValue::Usint(x),
+        TagValue::Uint(x) => TypedValue::Uint(x),
+        TagValue::Udint(x) => TypedValue::Udint(x),
+        TagValue::Ulint(x) => TypedValue::Ulint(x),
+        TagValue::Real(x) => TypedValue::Real(x),
+        TagValue::Lreal(x) => TypedValue::Lreal(x),
+        TagValue::Struct { .. } => {
+            unreachable!("atomic_to_typed called with a struct — caller bug")
+        }
     }
 }
 

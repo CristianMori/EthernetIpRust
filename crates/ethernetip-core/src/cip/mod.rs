@@ -34,6 +34,8 @@ pub use service::{
 pub mod service_codes {
     pub const GET_ATTRIBUTES_ALL: u8 = 0x01;
     pub const SET_ATTRIBUTES_ALL: u8 = 0x02;
+    pub const GET_ATTRIBUTE_LIST: u8 = 0x03;
+    pub const SET_ATTRIBUTE_LIST: u8 = 0x04;
     pub const RESET: u8 = 0x05;
     pub const START: u8 = 0x06;
     pub const STOP: u8 = 0x07;

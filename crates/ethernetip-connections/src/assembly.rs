@@ -21,13 +21,20 @@ pub enum AssemblyKind {
     Config,
 }
 
-/// One registered assembly.
+/// One registered assembly. The data buffer is behind an `Arc<RwLock<..>>`
+/// so it can be shared with a `CipAttribute` created via
+/// `CipAttribute::new_shared` — that's what lets a client's
+/// `Set_Attribute_Single(class=0x04, attr=3)` reach the same bytes the
+/// adapter's I/O producer is streaming to the wire.
 #[derive(Debug, Clone)]
 pub struct Assembly {
     pub instance: u16,
     pub kind: AssemblyKind,
     pub size: usize,
-    pub data: Vec<u8>,
+    /// Shared byte buffer. Callers that want to bridge to CIP go through
+    /// [`Assembly::shared_buffer`]; direct-write callers use
+    /// [`AssemblyRegistry::update`].
+    data: Arc<RwLock<Vec<u8>>>,
 }
 
 impl Assembly {
@@ -36,8 +43,15 @@ impl Assembly {
             instance,
             kind,
             size,
-            data: vec![0u8; size],
+            data: Arc::new(RwLock::new(vec![0u8; size])),
         }
+    }
+
+    /// Clone the shared byte handle. Two owners of the same handle see
+    /// each other's writes — used to back a CipAttribute with the same
+    /// bytes an I/O loop is reading from.
+    pub fn shared_buffer(&self) -> Arc<RwLock<Vec<u8>>> {
+        self.data.clone()
     }
 }
 
@@ -82,8 +96,8 @@ impl AssemblyRegistry {
     /// `EipError::Protocol` if the instance is not registered or the buffer
     /// length doesn't match.
     pub fn update(&self, instance: u16, data: &[u8]) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
-        let Some(asm) = guard.get_mut(&instance) else {
+        let guard = self.inner.read().unwrap();
+        let Some(asm) = guard.get(&instance) else {
             return Err(EipError::Protocol(format!(
                 "assembly instance {} not registered",
                 instance
@@ -97,7 +111,7 @@ impl AssemblyRegistry {
                 data.len()
             )));
         }
-        asm.data.copy_from_slice(data);
+        asm.data.write().unwrap().copy_from_slice(data);
         Ok(())
     }
 
@@ -107,7 +121,17 @@ impl AssemblyRegistry {
             .read()
             .unwrap()
             .get(&instance)
-            .map(|a| a.data.clone())
+            .map(|a| a.data.read().unwrap().clone())
+    }
+
+    /// Return the shared byte handle for an assembly so a caller (typically
+    /// a `CipAttribute::new_shared`) can point at the same bytes.
+    pub fn shared_buffer(&self, instance: u16) -> Option<Arc<RwLock<Vec<u8>>>> {
+        self.inner
+            .read()
+            .unwrap()
+            .get(&instance)
+            .map(|a| a.shared_buffer())
     }
 
     pub fn len(&self) -> usize {

@@ -29,7 +29,7 @@ pub fn handle_get_attribute_single(
     if !attr.access.contains(AttributeAccess::GET_SINGLE) {
         return CipServiceResponse::error(request.service_code, status::ATTRIBUTE_NOT_SUPPORTED);
     }
-    CipServiceResponse::success_with(request.service_code, attr.data().to_vec())
+    CipServiceResponse::success_with(request.service_code, attr.data().into_owned())
 }
 
 /// Handle `Set_Attribute_Single`: attribute id from the path, new bytes from
@@ -65,7 +65,7 @@ pub fn handle_get_attributes_all(
     let mut body = Vec::new();
     for attr in instance.attributes() {
         if attr.access.contains(AttributeAccess::GET_ALL) {
-            body.extend_from_slice(attr.data());
+            body.extend_from_slice(attr.data().as_ref());
         }
     }
     CipServiceResponse::success_with(request.service_code, body)

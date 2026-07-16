@@ -15,7 +15,10 @@ pub mod epio;
 pub mod forward_open;
 pub mod scanner;
 
-pub use connection_manager_object::build as build_connection_manager;
+pub use connection_manager_object::{
+    build as build_connection_manager, build_with_counters as build_connection_manager_with_counters,
+    ConnectionManagerCounters,
+};
 // Re-export the CIP object framework + device classes so downstream
 // samples don't need to pull in ethernetip-core just to register a
 // dispatcher.

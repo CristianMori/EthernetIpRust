@@ -30,6 +30,7 @@ use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEAD
 use ethernetip_core::error::{EipError, Result};
 
 use crate::assembly::AssemblyRegistry;
+use crate::connection_manager_object::ConnectionManagerCounters;
 use crate::epio::{self, Frame};
 use crate::forward_open::{
     ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
@@ -59,6 +60,11 @@ pub struct AdapterConfig {
     /// `SERVICE_NOT_SUPPORTED`. Shared `Arc` so the same dispatcher can
     /// serve multiple sessions.
     pub dispatcher: Option<Arc<CipDispatcher>>,
+    /// Optional live counter block for the Connection Manager class
+    /// (0x06). When populated, every FO success / reject and FC success
+    /// bumps the corresponding attribute so a client reading class 0x06
+    /// / instance 1 sees real numbers.
+    pub cm_counters: Option<Arc<ConnectionManagerCounters>>,
 }
 
 impl AdapterConfig {
@@ -70,6 +76,7 @@ impl AdapterConfig {
             run_idle_header: true,
             peer_udp_port: IO_UDP_PORT,
             dispatcher: None,
+            cm_counters: None,
         }
     }
 
@@ -79,6 +86,14 @@ impl AdapterConfig {
     /// instead of returning `SERVICE_NOT_SUPPORTED`.
     pub fn dispatcher(mut self, dispatcher: Arc<CipDispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Install a shared [`ConnectionManagerCounters`] so the FO / FC
+    /// handlers below bump the appropriate class-0x06 counter attribute
+    /// on every event.
+    pub fn cm_counters(mut self, counters: Arc<ConnectionManagerCounters>) -> Self {
+        self.cm_counters = Some(counters);
         self
     }
 
@@ -214,6 +229,7 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
         run_idle,
         peer_udp_port: cfg.peer_udp_port,
         dispatcher: cfg.dispatcher.clone(),
+        cm_counters: cfg.cm_counters.clone(),
     };
     let accept_task = tokio::spawn(accept_state.run(tcp, shutdown_rx));
 
@@ -238,6 +254,7 @@ struct AcceptState {
     run_idle: bool,
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
+    cm_counters: Option<Arc<ConnectionManagerCounters>>,
 }
 
 impl AcceptState {
@@ -265,6 +282,7 @@ impl AcceptState {
                         run_idle: self.run_idle,
                         peer_udp_port: self.peer_udp_port,
                         dispatcher: self.dispatcher.clone(),
+                        cm_counters: self.cm_counters.clone(),
                         session_handle: 0,
                         active_conn_id: None,
                     };
@@ -285,6 +303,7 @@ struct SessionState {
     run_idle: bool,
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
+    cm_counters: Option<Arc<ConnectionManagerCounters>>,
     session_handle: u32,
     active_conn_id: Option<u32>,
 }
@@ -386,6 +405,9 @@ impl SessionState {
                 match self.handle_forward_open(&body, peer_udp).await {
                     Ok(resp) => {
                         include_sockaddr_reply = true;
+                        if let Some(c) = self.cm_counters.as_ref() {
+                            c.record_open_success();
+                        }
                         (
                             service::FORWARD_OPEN | service::REPLY_FLAG,
                             status::SUCCESS,
@@ -394,6 +416,9 @@ impl SessionState {
                     }
                     Err(err) => {
                         tracing::warn!("Forward_Open rejected: {err}");
+                        if let Some(c) = self.cm_counters.as_ref() {
+                            c.record_open_other_reject();
+                        }
                         (
                             service::FORWARD_OPEN | service::REPLY_FLAG,
                             status::CONNECTION_FAILURE,
@@ -404,16 +429,26 @@ impl SessionState {
             }
             s if s == service::FORWARD_CLOSE => {
                 match self.handle_forward_close(&body).await {
-                    Ok(resp) => (
-                        service::FORWARD_CLOSE | service::REPLY_FLAG,
-                        status::SUCCESS,
-                        resp.encode(),
-                    ),
-                    Err(_) => (
-                        service::FORWARD_CLOSE | service::REPLY_FLAG,
-                        status::CONNECTION_FAILURE,
-                        Vec::new(),
-                    ),
+                    Ok(resp) => {
+                        if let Some(c) = self.cm_counters.as_ref() {
+                            c.record_close_success();
+                        }
+                        (
+                            service::FORWARD_CLOSE | service::REPLY_FLAG,
+                            status::SUCCESS,
+                            resp.encode(),
+                        )
+                    }
+                    Err(_) => {
+                        if let Some(c) = self.cm_counters.as_ref() {
+                            c.record_close_other();
+                        }
+                        (
+                            service::FORWARD_CLOSE | service::REPLY_FLAG,
+                            status::CONNECTION_FAILURE,
+                            Vec::new(),
+                        )
+                    }
                 }
             }
             other => {

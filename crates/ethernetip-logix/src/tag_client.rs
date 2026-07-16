@@ -21,7 +21,10 @@ use ethernetip_core::{EipSession, EIP_PORT};
 use crate::browse::{
     build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo,
 };
-use crate::request::{build_mr_request, wrap_unconnected_send};
+use crate::request::{
+    build_mr_request, build_multiple_service_packet, parse_multiple_service_packet,
+    wrap_unconnected_send,
+};
 use crate::tag_path::{encode_with_cache, AtomCache};
 use crate::types::{decode_read_tag, CipType, TagValue};
 
@@ -262,6 +265,93 @@ impl TagClient {
         body.extend_from_slice(&1u16.to_le_bytes()); // one element
         body.extend_from_slice(&value.encode_body());
         self.write_tag_raw(name, &body).await
+    }
+
+    /// Read many tags in one round-trip via Multiple Service Packet
+    /// (0x0A). Returns one `Result<TagValue>` per input name in order.
+    /// The whole request is a single MR service to the target's Message
+    /// Router; each embedded `Read_Tag` returns its own per-sub-service
+    /// status so a single bad tag name doesn't fail the batch.
+    ///
+    /// The batch is limited by the target's max MR request size — a
+    /// ControlLogix typically handles 500 bytes of embedded services
+    /// before responding `REPLY_TOO_LARGE`, which comes back as `Err`
+    /// on the batch as a whole. Split large batches yourself if you
+    /// hit that.
+    pub async fn read_tags_batch(&mut self, names: &[&str]) -> Result<Vec<Result<TagValue>>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut embedded = Vec::with_capacity(names.len());
+        for name in names {
+            let path = encode_with_cache(name, &self.atoms)?;
+            let body = 1u16.to_le_bytes();
+            embedded.push(build_mr_request(service::READ_TAG, &path, &body));
+        }
+        let mr = build_multiple_service_packet(&embedded);
+        let bytes = self.dispatch(mr).await?;
+        let header = ReplyHeader::parse(&bytes)?;
+        if header.general_status != status::SUCCESS {
+            return Err(EipError::Cip {
+                status: header.general_status,
+                ext: header.extended_status,
+            });
+        }
+        let msp_body = &bytes[header.body_offset..];
+        let replies = parse_multiple_service_packet(msp_body)?;
+        let mut out = Vec::with_capacity(replies.len());
+        for reply in replies {
+            out.push(decode_read_tag_reply(&reply));
+        }
+        Ok(out)
+    }
+
+    /// Write many tags in one round-trip via Multiple Service Packet.
+    /// Each entry is `(name, value_body)` where `value_body` is the raw
+    /// `type + count + data` slice a normal `write_tag_raw` would send.
+    /// Returns one `Result<()>` per entry in order.
+    pub async fn write_tags_batch(
+        &mut self,
+        writes: &[(&str, &[u8])],
+    ) -> Result<Vec<Result<()>>> {
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut embedded = Vec::with_capacity(writes.len());
+        for (name, body) in writes {
+            let path = encode_with_cache(name, &self.atoms)?;
+            embedded.push(build_mr_request(service::WRITE_TAG, &path, body));
+        }
+        let mr = build_multiple_service_packet(&embedded);
+        let bytes = self.dispatch(mr).await?;
+        let header = ReplyHeader::parse(&bytes)?;
+        if header.general_status != status::SUCCESS {
+            return Err(EipError::Cip {
+                status: header.general_status,
+                ext: header.extended_status,
+            });
+        }
+        let msp_body = &bytes[header.body_offset..];
+        let replies = parse_multiple_service_packet(msp_body)?;
+        let mut out = Vec::with_capacity(replies.len());
+        for reply in replies {
+            let hdr = match ReplyHeader::parse(&reply) {
+                Ok(h) => h,
+                Err(e) => {
+                    out.push(Err(e));
+                    continue;
+                }
+            };
+            if hdr.general_status == status::SUCCESS {
+                out.push(Ok(()));
+            } else {
+                out.push(Err(EipError::Cip {
+                    status: hdr.general_status,
+                    ext: hdr.extended_status,
+                }));
+            }
+        }
+        Ok(out)
     }
 
     /// Send a `Write_Tag` with an already-built body (`type + count + data`).
@@ -507,4 +597,18 @@ impl TagClient {
         let _ = self.dispatch_unconnected(&mr, &[]).await;
         Ok(())
     }
+}
+
+/// Peel a Multiple Service Packet sub-reply — an embedded Read_Tag
+/// response — into a decoded `TagValue`. Returns the CIP error for
+/// non-success sub-replies so a batch can carry per-tag results.
+fn decode_read_tag_reply(reply: &[u8]) -> Result<TagValue> {
+    let header = ReplyHeader::parse(reply)?;
+    if header.general_status != status::SUCCESS {
+        return Err(EipError::Cip {
+            status: header.general_status,
+            ext: header.extended_status,
+        });
+    }
+    decode_read_tag(&reply[header.body_offset..])
 }

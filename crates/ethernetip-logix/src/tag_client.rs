@@ -52,6 +52,7 @@ pub struct TagClientBuilder {
     port: u16,
     route_path: Option<String>,
     use_connected: bool,
+    reopen_on_drop: bool,
 }
 
 impl TagClientBuilder {
@@ -61,7 +62,19 @@ impl TagClientBuilder {
             port: EIP_PORT,
             route_path: None,
             use_connected: false,
+            reopen_on_drop: false,
         }
+    }
+
+    /// When a Class 3 request fails with a "connection dead" CIP status
+    /// (`CONNECTION_FAILURE` 0x01 or `DEVICE_STATE_CONFLICT` 0x10) or the
+    /// underlying I/O returns an error, transparently close the Class 3
+    /// connection, re-Forward_Open it, and retry the request once.
+    /// Off by default so long-running processes that expect an
+    /// idle-timeout can decide themselves whether silent retry is safe.
+    pub fn reopen_on_drop(mut self, on: bool) -> Self {
+        self.reopen_on_drop = on;
+        self
     }
 
     /// Override the TCP port (default `44818`).
@@ -103,6 +116,7 @@ impl TagClientBuilder {
             route_path: route,
             atoms: AtomCache::new(),
             use_connected: self.use_connected,
+            reopen_on_drop: self.reopen_on_drop,
             class3_open: false,
             oto_t_conn_id: 0,
             tto_o_conn_id: 0,
@@ -124,6 +138,7 @@ pub struct TagClient {
     route_path: Vec<u8>,
     atoms: AtomCache,
     use_connected: bool,
+    reopen_on_drop: bool,
     class3_open: bool,
     oto_t_conn_id: u32,
     tto_o_conn_id: u32,
@@ -452,10 +467,31 @@ impl TagClient {
 
     async fn dispatch(&mut self, mr: Vec<u8>) -> Result<Vec<u8>> {
         if self.class3_open {
-            return self.send_connected(mr).await;
+            // First try. If it fails with a symptom of a dead Class 3
+            // connection AND reopen_on_drop is on, close + re-Forward_Open
+            // + retry once. Non-connection failures (SERVICE_NOT_SUPPORTED,
+            // ATTRIBUTE_NOT_SUPPORTED, ...) bubble up as-is.
+            let first = self.send_connected(mr.clone()).await;
+            if !self.reopen_on_drop {
+                return first;
+            }
+            match first {
+                Ok(bytes) => Ok(bytes),
+                Err(err) if is_class3_dead(&err) => {
+                    tracing::debug!("Class 3 connection appears dead ({err}); reopening");
+                    // Best-effort teardown; ignore errors (peer may already
+                    // have dropped both sides).
+                    let _ = self.close_class3().await;
+                    self.class3_open = false;
+                    self.open_class3().await?;
+                    self.send_connected(mr).await
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            let route = self.route_path.clone();
+            self.dispatch_unconnected(&mr, &route).await
         }
-        let route = self.route_path.clone();
-        self.dispatch_unconnected(&mr, &route).await
     }
 
     async fn dispatch_unconnected(&mut self, mr: &[u8], route: &[u8]) -> Result<Vec<u8>> {
@@ -596,6 +632,38 @@ impl TagClient {
         let mr = build_mr_request(service::FORWARD_CLOSE, &cm_path, &close_data);
         let _ = self.dispatch_unconnected(&mr, &[]).await;
         Ok(())
+    }
+}
+
+/// True when an error from `send_connected` looks like the Class 3
+/// connection died on the peer's side and a reopen might recover it.
+/// Covers the common flavors:
+///
+///  * `EipError::Io` — socket-level failure (peer closed, timeout).
+///  * `EipError::Encap` with a status other than 0 — session got
+///    invalidated on the peer.
+///  * CIP `CONNECTION_FAILURE` (0x01) — the classic "your connection
+///    id doesn't match anything I know about".
+///  * CIP `DEVICE_STATE_CONFLICT` (0x10) — some Logix firmware
+///    variants return this after an idle timeout.
+///  * `EipError::Protocol` — usually the connected reply parser
+///    couldn't find CONNECTED_DATA, which happens when the peer
+///    responded with UNCONNECTED_DATA because it forgot the connection.
+///
+/// Kept intentionally narrow — protocol-level errors that indicate a
+/// bad request (SERVICE_NOT_SUPPORTED, ATTRIBUTE_NOT_SUPPORTED, ...)
+/// aren't included so those bubble up rather than causing a pointless
+/// reopen loop.
+fn is_class3_dead(err: &EipError) -> bool {
+    match err {
+        EipError::Io(_) => true,
+        EipError::Encap(status) if *status != 0 => true,
+        EipError::Protocol(_) => true,
+        EipError::Cip { status: s, .. } => matches!(
+            *s,
+            status::CONNECTION_FAILURE | status::DEVICE_STATE_CONFLICT
+        ),
+        _ => false,
     }
 }
 

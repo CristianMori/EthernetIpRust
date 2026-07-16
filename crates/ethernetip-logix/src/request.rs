@@ -8,7 +8,7 @@
 
 use bytes::{BufMut, BytesMut};
 
-use ethernetip_core::cip::{class, service};
+use ethernetip_core::cip::{class_codes as class, service_codes as service};
 use ethernetip_core::path::EpathWriter;
 
 /// Build a Message Router request: `service | path_size | path | body`.

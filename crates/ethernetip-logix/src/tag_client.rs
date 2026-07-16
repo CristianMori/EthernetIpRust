@@ -12,7 +12,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ethernetip_core::cip::{class, service, status, ReplyHeader};
+use ethernetip_core::cip::{class_codes as class, service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Item};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::{parse_route_path, EpathWriter};

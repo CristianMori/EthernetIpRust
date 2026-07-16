@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use ethernetip_core::cip::{class, service, status, ReplyHeader};
+use ethernetip_core::cip::{class_codes as class, service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};

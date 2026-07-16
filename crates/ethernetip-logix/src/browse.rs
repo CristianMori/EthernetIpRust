@@ -7,7 +7,7 @@
 //! a per-program class hierarchy that we recurse into.
 
 use bytes::Buf;
-use ethernetip_core::cip::{class, service, status, ReplyHeader};
+use ethernetip_core::cip::{class_codes as class, service_codes as service, status, ReplyHeader};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
 

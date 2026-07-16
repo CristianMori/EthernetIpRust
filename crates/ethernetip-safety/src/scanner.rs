@@ -22,7 +22,7 @@ use tokio::time;
 use ethernetip_connections::epio::{
     decode_frame_raw as decode_epio, encode_frame_raw as encode_epio, Frame,
 };
-use ethernetip_core::cip::{service, status, ReplyHeader};
+use ethernetip_core::cip::{service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};

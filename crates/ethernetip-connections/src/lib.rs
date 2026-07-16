@@ -10,9 +10,12 @@
 
 pub mod adapter;
 pub mod assembly;
+pub mod connection_manager_object;
 pub mod epio;
 pub mod forward_open;
 pub mod scanner;
+
+pub use connection_manager_object::build as build_connection_manager;
 
 pub use adapter::{
     start as start_adapter, AdapterConfig, AdapterHandle, ConnectionSummary, IO_UDP_PORT,

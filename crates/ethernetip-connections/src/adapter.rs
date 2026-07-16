@@ -24,7 +24,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use ethernetip_core::cip::{service_codes as service, status};
+use ethernetip_core::cip::{service_codes as service, status, CipDispatcher, CipPath};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
@@ -52,6 +52,13 @@ pub struct AdapterConfig {
     /// well-known [`IO_UDP_PORT`]. Overriding is useful for host-local
     /// interop tests where the scanner has to bind a different port.
     pub peer_udp_port: u16,
+    /// Optional CIP object dispatcher for services that aren't FORWARD_OPEN
+    /// / FORWARD_CLOSE. When populated, MR requests targeted at a
+    /// registered class (Identity 0x01, Assembly 0x04, TCP/IP 0xF5, ...)
+    /// are routed through [`CipDispatcher::dispatch`] instead of returning
+    /// `SERVICE_NOT_SUPPORTED`. Shared `Arc` so the same dispatcher can
+    /// serve multiple sessions.
+    pub dispatcher: Option<Arc<CipDispatcher>>,
 }
 
 impl AdapterConfig {
@@ -62,7 +69,17 @@ impl AdapterConfig {
             assemblies,
             run_idle_header: true,
             peer_udp_port: IO_UDP_PORT,
+            dispatcher: None,
         }
+    }
+
+    /// Install a [`CipDispatcher`] so MR requests for registered classes
+    /// (Identity 0x01, Assembly 0x04, Connection Manager 0x06, TCP/IP
+    /// 0xF5, Ethernet Link 0xF6, ...) are routed to their handlers
+    /// instead of returning `SERVICE_NOT_SUPPORTED`.
+    pub fn dispatcher(mut self, dispatcher: Arc<CipDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
     }
 
     pub fn tcp_bind(mut self, addr: SocketAddr) -> Self {
@@ -196,6 +213,7 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
         next_conn_id,
         run_idle,
         peer_udp_port: cfg.peer_udp_port,
+        dispatcher: cfg.dispatcher.clone(),
     };
     let accept_task = tokio::spawn(accept_state.run(tcp, shutdown_rx));
 
@@ -219,6 +237,7 @@ struct AcceptState {
     next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
     peer_udp_port: u16,
+    dispatcher: Option<Arc<CipDispatcher>>,
 }
 
 impl AcceptState {
@@ -245,6 +264,7 @@ impl AcceptState {
                         next_conn_id: self.next_conn_id.clone(),
                         run_idle: self.run_idle,
                         peer_udp_port: self.peer_udp_port,
+                        dispatcher: self.dispatcher.clone(),
                         session_handle: 0,
                         active_conn_id: None,
                     };
@@ -264,6 +284,7 @@ struct SessionState {
     next_conn_id: Arc<AtomicU32>,
     run_idle: bool,
     peer_udp_port: u16,
+    dispatcher: Option<Arc<CipDispatcher>>,
     session_handle: u32,
     active_conn_id: Option<u32>,
 }
@@ -350,6 +371,7 @@ impl SessionState {
         let (service_code, path, body) = split_mr_request(&mr_item.data)?;
 
         let mut include_sockaddr_reply = false;
+        let mut reply_ext_status: Vec<u16> = Vec::new();
         let (reply_service, reply_status, reply_body) = match service_code {
             s if s == service::FORWARD_OPEN => {
                 // Scanner may have advertised its UDP endpoint in a Sockaddr
@@ -395,23 +417,45 @@ impl SessionState {
                 }
             }
             other => {
-                tracing::warn!("adapter: unsupported service 0x{:02X}", other);
-                (
-                    other | service::REPLY_FLAG,
-                    status::SERVICE_NOT_SUPPORTED,
-                    Vec::new(),
-                )
+                if let Some(dispatcher) = self.dispatcher.as_ref() {
+                    match CipPath::parse(&path) {
+                        Ok(cip_path) => {
+                            let response = dispatcher.dispatch(other, cip_path, body.to_vec());
+                            reply_ext_status = response.extended_status.clone();
+                            (response.service_code, response.general_status, response.data)
+                        }
+                        Err(err) => {
+                            tracing::debug!("adapter path parse failed for service 0x{other:02X}: {err}");
+                            (
+                                other | service::REPLY_FLAG,
+                                status::PATH_SEGMENT_ERROR,
+                                Vec::new(),
+                            )
+                        }
+                    }
+                } else {
+                    tracing::warn!("adapter: unsupported service 0x{:02X}", other);
+                    (
+                        other | service::REPLY_FLAG,
+                        status::SERVICE_NOT_SUPPORTED,
+                        Vec::new(),
+                    )
+                }
             }
         };
 
         // Path is echoed back untouched.
         let _ = path;
 
-        let mut mr_reply = Vec::with_capacity(4 + reply_body.len());
+        let mut mr_reply =
+            Vec::with_capacity(4 + reply_ext_status.len() * 2 + reply_body.len());
         mr_reply.push(reply_service);
         mr_reply.push(0); // reserved
         mr_reply.push(reply_status);
-        mr_reply.push(0); // ext status size
+        mr_reply.push(reply_ext_status.len() as u8);
+        for w in &reply_ext_status {
+            mr_reply.extend_from_slice(&w.to_le_bytes());
+        }
         mr_reply.extend_from_slice(&reply_body);
 
         // Build reply CPF items; on a successful Forward_Open reply, tack a

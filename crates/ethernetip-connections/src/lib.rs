@@ -16,6 +16,11 @@ pub mod forward_open;
 pub mod scanner;
 
 pub use connection_manager_object::build as build_connection_manager;
+// Re-export the CIP object framework + device classes so downstream
+// samples don't need to pull in ethernetip-core just to register a
+// dispatcher.
+pub use ethernetip_core::cip::{CipClass, CipDispatcher, CipPath};
+pub use ethernetip_core::device;
 
 pub use adapter::{
     start as start_adapter, AdapterConfig, AdapterHandle, ConnectionSummary, IO_UDP_PORT,

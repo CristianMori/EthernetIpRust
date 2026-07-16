@@ -5,12 +5,14 @@
 //! scanner (this repo's, the C#, C++, or Python ports') can point at
 //! `<host>:44818` and open a Class 1 connection.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ethernetip_connections::{
-    start_adapter, Assembly, AssemblyKind, AssemblyRegistry, AdapterConfig, IO_UDP_PORT,
+    build_connection_manager, device, start_adapter, Assembly, AssemblyKind, AssemblyRegistry,
+    AdapterConfig, CipDispatcher, IO_UDP_PORT,
 };
 
 const INPUT_INSTANCE: u16 = 100;
@@ -71,11 +73,49 @@ async fn main() -> Result<()> {
     }
     assemblies.update(INPUT_INSTANCE, &ramp)?;
 
+    // Register the standard CIP object classes so browsers (RSLinx,
+    // Wireshark ENIP discovery, PLC config screens) see something on
+    // discovery. Assembly class 0x04 uses the *shared* variant so a
+    // client's Set_Attribute_Single(class=0x04, attr=3) on any of the
+    // three instances lands in the same bytes the I/O producer streams.
+    let dispatcher = Arc::new(CipDispatcher::new());
+    dispatcher.register_class(device::build_identity(device::IdentityInfo {
+        vendor_id: 0x0001,
+        device_type: 0x000C, // Communications Adapter
+        product_code: 25,
+        major_revision: 1,
+        minor_revision: 1,
+        status: 0x0030,
+        serial_number: 0xC0FFEE00,
+        product_name: "Rust Echo Adapter".into(),
+    }));
+    dispatcher.register_class(device::build_tcpip_interface(device::TcpIpConfig::new(
+        Ipv4Addr::new(127, 0, 0, 1),
+    )));
+    dispatcher.register_class(device::build_ethernet_link(
+        device::EthernetLinkConfig::default(),
+    ));
+    dispatcher.register_class(build_connection_manager());
+    let mut assembly_cls = device::build_assembly();
+    for &(inst, size) in &[
+        (INPUT_INSTANCE, INPUT_SIZE),
+        (OUTPUT_INSTANCE, OUTPUT_SIZE),
+        (CONFIG_INSTANCE, CONFIG_SIZE),
+    ] {
+        let shared = assemblies
+            .shared_buffer(inst)
+            .expect("assembly registered above");
+        device::add_assembly_instance_shared(&mut assembly_cls, inst as u32, shared);
+        let _ = size; // size read for future validation, unused here
+    }
+    dispatcher.register_class(assembly_cls);
+
     let handle = start_adapter(
         AdapterConfig::new(assemblies.clone())
             .tcp_bind(tcp_bind)
             .udp_bind(udp_bind)
-            .peer_udp_port(peer_udp_port),
+            .peer_udp_port(peer_udp_port)
+            .dispatcher(dispatcher),
     )
     .await?;
 

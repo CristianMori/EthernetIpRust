@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use ethernetip_core::cip::class_codes as class;
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
 
@@ -106,6 +107,10 @@ pub fn encode_with_cache(name: &str, cache: &AtomCache) -> Result<Vec<u8>> {
             }
             if let Some(local_id) = cache.get_program(program_tail, local_name) {
                 writer.push_symbolic(program);
+                // Symbol Object class + instance — bare `[0x24, id]` after
+                // a Program: symbolic segment is not accepted by Logix
+                // Message Router (routes Unconnected_Send to a null class).
+                writer.push_class(class::SYMBOL_OBJECT);
                 writer.push_instance(local_id);
                 for idx in local_idx {
                     writer.push_element(idx);
@@ -130,6 +135,11 @@ pub fn encode_with_cache(name: &str, cache: &AtomCache) -> Result<Vec<u8>> {
         }
         if !first.starts_with("Program:") {
             if let Some(id) = cache.get_controller(first) {
+                // Symbol Object class + instance — controllers reject a
+                // bare `[0x24, id]` first segment through Unconnected_Send
+                // with CIP 0x05 (PATH_DESTINATION_UNKNOWN), even though
+                // connected sessions with the same path succeed.
+                writer.push_class(class::SYMBOL_OBJECT);
                 writer.push_instance(id);
                 for idx in first_idx {
                     writer.push_element(idx);
@@ -275,10 +285,13 @@ mod tests {
 
     #[test]
     fn cached_controller_tag_uses_instance_segment() {
+        // Cached first-level tag → Symbol Object class (0x6B) + instance.
+        // The class prefix is REQUIRED for Unconnected_Send to route the
+        // read; bare `[0x24, id]` reads succeed only over connected paths.
         let mut cache = AtomCache::new();
         cache.insert_controller("FreeRunningTimer", 0x42);
         let p = encode_with_cache("FreeRunningTimer", &cache).unwrap();
-        assert_eq!(p, vec![0x24, 0x42]);
+        assert_eq!(p, vec![0x20, 0x6B, 0x24, 0x42]);
     }
 
     #[test]
@@ -288,7 +301,7 @@ mod tests {
         let p = encode_with_cache("Motor.Speed", &cache).unwrap();
         assert_eq!(
             p,
-            vec![0x24, 0x07, 0x91, 0x05, b'S', b'p', b'e', b'e', b'd', 0x00]
+            vec![0x20, 0x6B, 0x24, 0x07, 0x91, 0x05, b'S', b'p', b'e', b'e', b'd', 0x00]
         );
     }
 
@@ -299,7 +312,7 @@ mod tests {
         let p = encode_with_cache("Arr[5].Sub", &cache).unwrap();
         assert_eq!(
             p,
-            vec![0x24, 0x03, 0x28, 0x05, 0x91, 0x03, b'S', b'u', b'b', 0x00]
+            vec![0x20, 0x6B, 0x24, 0x03, 0x28, 0x05, 0x91, 0x03, b'S', b'u', b'b', 0x00]
         );
     }
 
@@ -312,7 +325,8 @@ mod tests {
         assert_eq!(&p[..2], &[0x91, 0x13]);
         assert_eq!(&p[2..21], b"Program:MainProgram");
         assert_eq!(p[21], 0x00);
-        assert_eq!(&p[22..24], &[0x24, 0x02]);
+        // Symbol Object class + instance for the local tag.
+        assert_eq!(&p[22..26], &[0x20, 0x6B, 0x24, 0x02]);
     }
 
     #[test]
@@ -333,5 +347,21 @@ mod tests {
         let p = encode_with_cache("Program:MainProgram.Framework", &cache).unwrap();
         assert_eq!(&p[..2], &[0x91, 0x13]);
         assert_eq!(&p[2..21], b"Program:MainProgram");
+    }
+
+    #[test]
+    fn cached_first_segment_carries_class_prefix() {
+        // Regression: bare `[0x24, id]` first segments are rejected by
+        // Logix over Unconnected_Send with CIP 0x05 even though they work
+        // over connected sessions. Every cached first-level tag must be
+        // prefixed with the Symbol Object class (0x20 0x6B).
+        let mut cache = AtomCache::new();
+        cache.insert_controller("Foo", 9);
+        let p = encode_with_cache("Foo", &cache).unwrap();
+        assert!(
+            p.starts_with(&[0x20, 0x6B]),
+            "expected Symbol Object class prefix, got {:02X?}",
+            p
+        );
     }
 }

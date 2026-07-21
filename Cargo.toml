@@ -6,6 +6,7 @@ members = [
     "crates/ethernetip-connections",
     "crates/ethernetip-safety",
     "samples/logix-tag-read",
+    "samples/logix-verify",
     "samples/echo-adapter",
     "samples/echo-scanner",
     "samples/logix-host",

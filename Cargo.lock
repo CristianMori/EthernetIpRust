@@ -162,6 +162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "logix-verify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ethernetip-logix",
+ "tokio",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

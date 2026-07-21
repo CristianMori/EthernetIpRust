@@ -137,9 +137,19 @@ pub struct ConnectionRow {
     pub t_to_o_conn_id: u32,
     pub input_assembly: u16,
     pub output_assembly: u16,
+    /// Config assembly instance from the FO path, or 0 if not carried.
+    pub config_assembly: u16,
+    /// Raw bytes from the FO path's Simple Data Segment — the config
+    /// assembly payload the originator pushed at connect time. Empty
+    /// when the FO path didn't carry a `0x80` segment.
+    pub config_data: Vec<u8>,
     pub peer_udp: Arc<std::sync::RwLock<SocketAddr>>,
     pub o_to_t_rpi_us: u32,
     pub t_to_o_rpi_us: u32,
+    /// Connection triad — used to detect duplicate Forward_Opens.
+    pub connection_serial: u16,
+    pub originator_vendor: u16,
+    pub originator_serial: u32,
     pub producer_shutdown: watch::Sender<bool>,
     pub producer_task: JoinHandle<()>,
 }
@@ -236,10 +246,6 @@ pub struct ProducerSpawnArgs {
 pub type SafetyHandler = Arc<
     dyn Fn(&[u8]) -> Option<u16> + Send + Sync,
 >;
-
-/// Byte value of the safety network segment leader. Detected in the FO's
-/// connection path when the CM needs to route through a `SafetyHandler`.
-const SAFETY_SEGMENT_LEADER: u8 = 0x50;
 
 // -------------------- Connection Manager object --------------------
 
@@ -535,12 +541,14 @@ fn do_process_forward_open_with_safety(
         e
     })?;
 
-    // If the connection path contains a safety network segment (leader
+    let path_result = crate::connection_path::parse(&req.connection_path, &req);
+
+    // If the connection path carried a Safety Network Segment (leader
     // 0x50), delegate to the registered SafetyHandler. The handler
-    // decides accept-or-reject on the safety-specific bits (TUNID / SCID
-    // / ownership); we still handle the assembly / connection-table
-    // parts down below.
-    if let Some(safety_seg) = find_safety_segment(&req.connection_path) {
+    // decides accept-or-reject on the safety-specific bits (TUNID /
+    // SCID / ownership); we still handle the assembly / connection-
+    // table parts below.
+    if let Some(safety_seg) = path_result.safety_segment.as_deref() {
         if let Some(handler) = safety_handler {
             if let Some(reject_ext) = handler(safety_seg) {
                 counters.record_open_other_reject();
@@ -557,10 +565,20 @@ fn do_process_forward_open_with_safety(
         }
     }
 
-    let (input_asm, output_asm) = parse_connection_path(&req.connection_path).map_err(|e| {
+    // Standard I/O paths must yield both an O→T and a T→O assembly.
+    let (Some(consumed_u32), Some(produced_u32)) =
+        (path_result.consumed_assembly, path_result.produced_assembly)
+    else {
         counters.record_open_format_reject();
-        e
-    })?;
+        return Err(EipError::Protocol(format!(
+            "Forward_Open connection path missing O->T / T->O assemblies (got consumed={:?} produced={:?}) — raw path {:02X?}",
+            path_result.consumed_assembly,
+            path_result.produced_assembly,
+            &req.connection_path,
+        )));
+    };
+    let output_asm: u16 = consumed_u32 as u16; // scanner produces, adapter consumes
+    let input_asm: u16 = produced_u32 as u16;  // scanner consumes, adapter produces
 
     if ctx.assemblies.snapshot(input_asm).is_none() {
         counters.record_open_other_reject();
@@ -576,15 +594,55 @@ fn do_process_forward_open_with_safety(
             output_asm
         )));
     }
-    // Refuse if the originator asked for the same instance in both
-    // directions — matches the guard the C++ port added after the
-    // duplicate-assembly bug.
+    // Reject only when the two DATA directions share the same instance —
+    // config/data overlap is legitimate (safety uses it). Matches C#.
     if input_asm == output_asm {
         counters.record_open_other_reject();
         return Err(EipError::Protocol(format!(
-            "Forward_Open uses assembly {} in both directions",
+            "Forward_Open uses assembly {} in both data directions",
             input_asm
         )));
+    }
+
+    // Duplicate-triad check — a second FO with the same
+    // (connSerial, origVendor, origSerial) is a "Connection In Use" (0x0100).
+    {
+        let table = connections.lock().unwrap();
+        for row in table.rows.values() {
+            if row.originator_vendor == req.originator_vendor
+                && row.originator_serial == req.originator_serial
+                && row.connection_serial == req.connection_serial
+            {
+                counters.record_open_other_reject();
+                return Err(EipError::Cip {
+                    status: 0x01,      // CONNECTION_FAILURE
+                    ext: vec![0x0100], // Connection In Use / Duplicate Forward Open
+                });
+            }
+        }
+    }
+
+    // Push the config-assembly payload the originator sent in the FO
+    // path's Simple Data Segment (0x80). This is the Generic Ethernet
+    // Module contract — the config assembly gets its initial contents
+    // from the originator at connect time. Skip when the path didn't
+    // carry a config assembly / config data, or when the target has no
+    // matching assembly instance registered.
+    if let Some(cfg_u32) = path_result.config_assembly {
+        let cfg_asm: u16 = cfg_u32 as u16;
+        if !path_result.config_data.is_empty()
+            && ctx.assemblies.snapshot(cfg_asm).is_some()
+        {
+            if let Err(e) = ctx.assemblies.update(cfg_asm, &path_result.config_data) {
+                counters.record_open_other_reject();
+                return Err(EipError::Protocol(format!(
+                    "config assembly {} rejected {} bytes: {}",
+                    cfg_asm,
+                    path_result.config_data.len(),
+                    e,
+                )));
+            }
+        }
     }
 
     let assigned_oto_t = next_conn_id.fetch_add(1, Ordering::SeqCst);
@@ -628,9 +686,14 @@ fn do_process_forward_open_with_safety(
                 t_to_o_conn_id: req.t_to_o_connection_id,
                 input_assembly: input_asm,
                 output_assembly: output_asm,
+                config_assembly: path_result.config_assembly.unwrap_or(0) as u16,
+                config_data: path_result.config_data.clone(),
                 peer_udp,
                 o_to_t_rpi_us: req.o_to_t_rpi_us,
                 t_to_o_rpi_us: req.t_to_o_rpi_us,
+                connection_serial: req.connection_serial,
+                originator_vendor: req.originator_vendor,
+                originator_serial: req.originator_serial,
                 producer_shutdown: producer_shutdown_tx,
                 producer_task,
             },
@@ -699,125 +762,6 @@ fn handle_get_attribute_live(
         return CipServiceResponse::error(req.service_code, status::ATTRIBUTE_NOT_SUPPORTED);
     }
     CipServiceResponse::success_with(req.service_code, attr.data().into_owned())
-}
-
-// -------------------- shared helpers used by the FO handler --------------------
-
-/// If a CIP Safety network segment (leader 0x50) is present anywhere in
-/// the connection path, return the slice starting at that leader.
-/// Otherwise `None`. Used by [`do_process_forward_open_with_safety`] to
-/// route safety FOs through a registered SafetyHandler.
-pub(crate) fn find_safety_segment(path: &[u8]) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < path.len() {
-        if path[i] == SAFETY_SEGMENT_LEADER {
-            return Some(&path[i..]);
-        }
-        // Skip whatever segment is here — we only care about locating
-        // the safety leader, not fully parsing every segment.
-        let step = match path[i] {
-            0x00..=0x0F => 2,
-            0x20 | 0x24 | 0x28 | 0x2C | 0x30 => 2,
-            0x21 | 0x25 | 0x29 | 0x2D | 0x31 => 4,
-            0x22 | 0x26 | 0x2A | 0x2E | 0x32 => 6,
-            // Electronic key — 2 + length_byte * 2 bytes.
-            0x34 => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                2 + path[i + 1] as usize * 2
-            }
-            // ANSI symbolic / Simple data — length in bytes at i+1.
-            0x80 | 0x91 => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                let word_len = path[i + 1] as usize;
-                if path[i] == 0x91 {
-                    let raw = 2 + word_len;
-                    raw + (raw & 1)
-                } else {
-                    2 + word_len * 2
-                }
-            }
-            _ => 2,
-        };
-        i += step;
-    }
-    None
-}
-
-/// Extract the O→T and T→O assembly instances from a Forward_Open
-/// connection path. The Logix / Generic Ethernet Module convention is
-/// `[route*] Class(4) Instance(config) Connection(consumed) Connection(produced)`,
-/// with the class-and-instance segments identifying the config assembly and
-/// two more logical-connection-point segments (0x2C) naming the O→T and T→O
-/// assemblies.
-pub(crate) fn parse_connection_path(path: &[u8]) -> Result<(u16, u16)> {
-    let mut i = 0;
-    let mut assemblies = Vec::new();
-    while i < path.len() {
-        let seg = path[i];
-        match seg {
-            // Port segment (route bytes) — skip.
-            0x00..=0x0F => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                i += 2;
-            }
-            // Logical class segment (8-bit).
-            0x20 => i += 2,
-            0x21 => i += 4,
-            // Logical instance segment (8-bit / 16-bit).
-            0x24 => i += 2,
-            0x25 => i += 4,
-            // Logical connection point (assembly instance) — this is what we want.
-            0x2C => {
-                if i + 1 >= path.len() {
-                    return Err(EipError::Short {
-                        expected: i + 2,
-                        actual: path.len(),
-                    });
-                }
-                assemblies.push(path[i + 1] as u16);
-                i += 2;
-            }
-            0x2D => {
-                if i + 3 >= path.len() {
-                    return Err(EipError::Short {
-                        expected: i + 4,
-                        actual: path.len(),
-                    });
-                }
-                assemblies.push(u16::from_le_bytes([path[i + 2], path[i + 3]]));
-                i += 4;
-            }
-            // Data segments — skip inline config bytes.
-            0x80 => {
-                if i + 1 >= path.len() {
-                    break;
-                }
-                let word_size = path[i + 1] as usize;
-                i += 2 + word_size * 2;
-            }
-            _ => {
-                // Unknown segment — bail out with what we've got.
-                break;
-            }
-        }
-    }
-    if assemblies.len() < 2 {
-        return Err(EipError::Protocol(format!(
-            "Forward_Open connection path did not yield 2 assembly instances (got {})",
-            assemblies.len()
-        )));
-    }
-    // Convention: first connection-point segment = O→T (consumed by adapter),
-    // second = T→O (produced by adapter). This matches the Logix generic
-    // Ethernet module Forward_Open path we've matched against the C#,
-    // C++, and Python ports.
-    Ok((assemblies[1], assemblies[0]))
 }
 
 // -------------------- backward-compat helpers --------------------
@@ -1039,23 +983,10 @@ mod tests {
         assert_eq!(cm.counters().close_requests.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn find_safety_segment_locates_leader_after_ekey() {
-        // 4-word electronic key + safety segment.
-        let path = [
-            0x34, 0x04, 0x01, 0x00, 0x23, 0x00, 0x10, 0x00, 0x82, 0x02, // ekey
-            0x50, 0x01, 0x02, 0x03, // safety segment leader + first bytes
-        ];
-        let found = find_safety_segment(&path).unwrap();
-        assert_eq!(found[0], 0x50);
-        assert_eq!(&found[..4], &[0x50, 0x01, 0x02, 0x03]);
-    }
-
-    #[test]
-    fn find_safety_segment_returns_none_when_absent() {
-        let path = [0x20, 0x04, 0x24, 0x69, 0x2C, 0x66, 0x2C, 0x64];
-        assert!(find_safety_segment(&path).is_none());
-    }
+    // (Safety-segment detection lives in `connection_path::parse` now;
+    // its coverage is in `connection_path::tests`. The FO handler exercises
+    // the integration below in `safety_handler_rejection_short_circuits_fo`
+    // and `safety_fo_without_handler_returns_protocol_error`.)
 
     #[tokio::test]
     async fn safety_handler_rejection_short_circuits_fo() {

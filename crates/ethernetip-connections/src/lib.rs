@@ -11,6 +11,7 @@
 pub mod adapter;
 pub mod assembly;
 pub mod connection_manager_object;
+pub mod connection_path;
 pub mod epio;
 pub mod forward_open;
 pub mod scanner;
@@ -28,6 +29,7 @@ pub use ethernetip_core::device;
 pub use adapter::{start as start_adapter, AdapterConfig, AdapterHandle, IO_UDP_PORT};
 pub use scanner::{open_connection as open_scanner_connection, ScannerConfig, ScannerConnection};
 pub use assembly::{Assembly, AssemblyKind, AssemblyRegistry};
+pub use connection_path::{parse as parse_connection_path, ConnectionPathResult};
 pub use epio::{decode_frame, encode_frame, Frame};
 pub use forward_open::{
     ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,

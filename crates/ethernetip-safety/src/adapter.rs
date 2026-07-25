@@ -709,10 +709,20 @@ async fn handle_safety_forward_open(
     // Actual RPIs — echo requested (they live at body[22..26] and body[28..32]).
     reply.extend_from_slice(&body[22..26]);
     reply.extend_from_slice(&body[28..32]);
-    // App reply — 5 words (10 bytes) for base format.
-    reply.push(5);
+    // App reply — 5 words (10 bytes) for Base format, 7 words (14 bytes)
+    // for Extended (adds InitialTimestamp + InitialRolloverValue that the
+    // scanner needs to seed its rollover-folded CRC-S5 producer). Without
+    // the extra two words an Extended-format scanner accepts the FO (first
+    // 5 words parse fine) but never starts producing — silent failure
+    // mode caught 2026-07-24 against a live ControlLogix. Matches
+    // C++ / C# / Python target implementations.
+    let is_extended = format == SafetyFormat::Extended;
+    let app_reply_words: u8 = if is_extended { 7 } else { 5 };
+    reply.push(app_reply_words);
     reply.push(0);
-    // SafetyAppReply:
+    // SafetyAppReply — for a target's server-direction connection we
+    // seed InitialTS = 0 and InitialRV = 0 (deterministic reference
+    // across reconnects, matching the C++ SafetyDevice `is_server` path).
     let app_reply = SafetyAppReply {
         consumer_number: 1,
         target_vendor_id: cfg.target_vendor,
@@ -725,6 +735,10 @@ async fn handle_safety_forward_open(
     reply.extend_from_slice(&app_reply.target_vendor_id.to_le_bytes());
     reply.extend_from_slice(&app_reply.target_device_serial.to_le_bytes());
     reply.extend_from_slice(&app_reply.target_connection_serial.to_le_bytes());
+    if is_extended {
+        reply.extend_from_slice(&app_reply.initial_timestamp.to_le_bytes());
+        reply.extend_from_slice(&app_reply.initial_rollover_value.to_le_bytes());
+    }
 
     // Seed the originator-side rollover from the safety segment's
     // initial_rollover_value (Extended format only — Base format doesn't fold

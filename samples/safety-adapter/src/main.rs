@@ -27,6 +27,14 @@ async fn main() -> Result<()> {
     let mut udp_bind: SocketAddr = "0.0.0.0:2222".parse().unwrap();
     let mut peer_udp_port: u16 = 2222;
     let mut input_size: usize = 8;
+    // Safety identity — defaults keep the historical values; override to
+    // match a live Studio 5000 config with --snn / --node / --vendor /
+    // --serial. `--bind` is convenience shorthand for --tcp <ip>:44818 +
+    // --udp <ip>:2222, since the safety adapter always uses those ports.
+    let mut snn = SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]);
+    let mut node_addr: u32 = 0xC0A80154;
+    let mut vendor_id: u16 = 0x0001;
+    let mut serial: u32 = 0xC0FFEE01;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -34,6 +42,31 @@ async fn main() -> Result<()> {
             "--udp" => udp_bind = args.next().context("--udp needs a bind")?.parse()?,
             "--peer-udp-port" => peer_udp_port = args.next().context("--peer-udp-port needs a number")?.parse()?,
             "--input-size" => input_size = args.next().context("--input-size needs a number")?.parse()?,
+            "--bind" => {
+                let ip: Ipv4Addr = args
+                    .next()
+                    .context("--bind needs an IPv4 address")?
+                    .parse()
+                    .context("--bind must be an IPv4 address")?;
+                tcp_bind = SocketAddr::from((ip, 44818));
+                udp_bind = SocketAddr::from((ip, 2222));
+            }
+            "--snn" => {
+                let s = args.next().context("--snn needs 12 hex chars")?;
+                snn = parse_snn(&s)?;
+            }
+            "--node" => {
+                let s = args.next().context("--node needs a number")?;
+                node_addr = parse_hex_or_dec(&s).context("--node parse")?;
+            }
+            "--vendor" => {
+                let s = args.next().context("--vendor needs a number")?;
+                vendor_id = parse_hex_or_dec(&s).context("--vendor parse")? as u16;
+            }
+            "--serial" => {
+                let s = args.next().context("--serial needs a number")?;
+                serial = parse_hex_or_dec(&s).context("--serial parse")?;
+            }
             other => anyhow::bail!("unexpected argument `{}`", other),
         }
     }
@@ -44,13 +77,13 @@ async fn main() -> Result<()> {
     // they just answer Get_Attribute_Single.
     let dispatcher = Arc::new(CipDispatcher::new());
     dispatcher.register_class(device::build_identity(device::IdentityInfo {
-        vendor_id: 0x0001,
+        vendor_id,
         device_type: 0x000C, // Communications Adapter
         product_code: 26,
         major_revision: 1,
         minor_revision: 1,
         status: 0x0030, // Owned + Configured
-        serial_number: 0xC0FFEE01,
+        serial_number: serial,
         product_name: "Rust Safety Adapter".into(),
     }));
     let bind_ip = match tcp_bind.ip() {
@@ -70,10 +103,7 @@ async fn main() -> Result<()> {
     // instance 1) and Validator (0x3A, one instance per accepted safety
     // FO — the instance id becomes the target-side sv_inst that feeds
     // PID / CID seed derivation).
-    let mut supervisor = SafetySupervisorObject::new(
-        SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
-        0xC0A80154,
-    );
+    let mut supervisor = SafetySupervisorObject::new(snn, node_addr);
     // No supervisor.start() here — the adapter transitions the state
     // machine Idle → Executing on the first accepted FO (matches the
     // C# SafetyDevice pattern) and back to Idle on the last FC.
@@ -84,7 +114,7 @@ async fn main() -> Result<()> {
     dispatcher.register_class(validator.into_cip_class());
     let validator = Arc::new(validator);
 
-    let cfg = SafetyAdapterConfig::new(0x0001, 0xC0FFEE01, input_size)
+    let cfg = SafetyAdapterConfig::new(vendor_id, serial, input_size)
         .tcp_bind(tcp_bind)
         .udp_bind(udp_bind)
         .peer_udp_port(peer_udp_port)
@@ -131,4 +161,33 @@ async fn main() -> Result<()> {
     println!("\nstopping...");
     handle.shutdown().await;
     Ok(())
+}
+
+/// Parse `"4D8D_00B4_12C9"` (visual high→low) into the wire-order byte
+/// array. Underscores/dashes/spaces stripped. Matches the C++ / C# /
+/// Python samples' `parse_snn` helper.
+fn parse_snn(s: &str) -> Result<SafetyNetworkNumber> {
+    let hex: String = s
+        .chars()
+        .filter(|c| !matches!(*c, '_' | '-' | ' '))
+        .collect();
+    if hex.len() != 12 {
+        anyhow::bail!("SNN needs 12 hex chars, got {}", hex.len());
+    }
+    let mut out = [0u8; 6];
+    for i in 0..6 {
+        out[5 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .context("SNN parse")?;
+    }
+    Ok(SafetyNetworkNumber(out))
+}
+
+/// Parse `"0xC0A8014B"` (hex) or `"123"` (decimal) into a u32.
+fn parse_hex_or_dec(s: &str) -> Result<u32> {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Ok(u32::from_str_radix(rest, 16)?)
+    } else {
+        Ok(t.parse()?)
+    }
 }

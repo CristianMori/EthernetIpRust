@@ -1,0 +1,12 @@
+[package]
+name = "safety-scanner"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ethernetip-safety = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

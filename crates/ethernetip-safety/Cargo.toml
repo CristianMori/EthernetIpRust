@@ -1,0 +1,17 @@
+[package]
+name = "ethernetip-safety"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CIP Safety primitives, safety segment, safety frame codec, safety scanner/adapter"
+
+[dependencies]
+ethernetip-core = { workspace = true }
+ethernetip-connections = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }

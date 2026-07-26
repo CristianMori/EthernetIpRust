@@ -1,0 +1,10 @@
+[package]
+name = "logix-verify"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+ethernetip-logix = { workspace = true }
+tokio = { workspace = true }
+anyhow = "1"

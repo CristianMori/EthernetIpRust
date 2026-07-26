@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ethernetip-core",
+    "crates/ethernetip-logix",
+    "crates/ethernetip-connections",
+    "crates/ethernetip-safety",
+    "samples/logix-tag-read",
+    "samples/logix-verify",
+    "samples/echo-adapter",
+    "samples/echo-scanner",
+    "samples/logix-host",
+    "samples/safety-adapter",
+    "samples/safety-scanner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+authors = ["Cristian Mori"]
+repository = "https://github.com/CristianMori/EthernetIPRust"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread", "macros", "sync", "signal"] }
+thiserror = "1"
+bytes = "1"
+tracing = "0.1"
+
+ethernetip-core = { path = "crates/ethernetip-core", version = "0.1.0" }
+ethernetip-logix = { path = "crates/ethernetip-logix", version = "0.1.0" }
+ethernetip-connections = { path = "crates/ethernetip-connections", version = "0.1.0" }
+ethernetip-safety = { path = "crates/ethernetip-safety", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

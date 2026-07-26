@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "EtherNet/IP Class 1 implicit I/O: assemblies, Forward_Open, EPIO framing"
+keywords = ["ethernet-ip", "cip", "industrial", "plc", "class-1"]
+categories = ["network-programming"]
 
 [dependencies]
 ethernetip-core = { workspace = true }

@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "CIP Safety primitives, safety segment, safety frame codec, safety scanner/adapter"
+keywords = ["cip-safety", "ethernet-ip", "safety", "industrial", "plc"]
+categories = ["network-programming"]
 
 [dependencies]
 ethernetip-core = { workspace = true }

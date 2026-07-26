@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "Allen-Bradley Logix tag client on top of ethernetip-core"
+keywords = ["ethernet-ip", "logix", "controllogix", "allen-bradley", "plc"]
+categories = ["network-programming"]
 
 [dependencies]
 ethernetip-core = { workspace = true }

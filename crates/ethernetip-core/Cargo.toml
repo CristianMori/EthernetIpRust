@@ -6,7 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
 description = "EtherNet/IP encapsulation and CIP transport primitives"
+keywords = ["ethernet-ip", "cip", "industrial", "plc", "automation"]
+categories = ["network-programming"]
 
 [dependencies]
 tokio = { workspace = true }

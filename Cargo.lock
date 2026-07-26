@@ -41,7 +41,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "echo-adapter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-connections",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "echo-scanner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-connections",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "ethernetip-connections"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ethernetip-core",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ethernetip-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "network-interface",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ethernetip-logix"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ethernetip-core",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "ethernetip-safety"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "ethernetip-connections",
@@ -143,7 +143,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "logix-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-logix",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "logix-tag-read"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-logix",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "logix-verify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-logix",
@@ -266,7 +266,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "safety-adapter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-safety",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "safety-scanner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ethernetip-safety",

@@ -57,6 +57,13 @@ impl TagEntry {
     pub fn element_size(&self) -> usize {
         self.atomic_size().unwrap_or(self.data.len())
     }
+
+    /// Resolve the backing template for this tag (None for atomics or when
+    /// the referenced template was never registered).  Exposed so a view
+    /// layer can compute member offsets without a second registry lookup.
+    pub fn template(&self, registry: &TagRegistry) -> Option<Arc<ServerTemplate>> {
+        self.template_id.and_then(|id| registry.get_template(id))
+    }
 }
 
 #[derive(Debug, Default)]

@@ -5,6 +5,7 @@
 //! request/response protocol on TCP 44818.
 
 pub mod cip;
+pub mod cip_crc;
 pub mod cpf;
 pub mod device;
 pub mod encap;

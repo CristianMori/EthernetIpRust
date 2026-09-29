@@ -124,6 +124,65 @@ impl EipSession {
         Envelope::parse(&reply.payload)
     }
 
+    /// Send an arbitrary CIP service to a class/instance/attribute (idiomatic
+    /// wrapper).  Wraps the inner MR in `Unconnected_Send` through the
+    /// Connection Manager when `route_path` is non-empty (for backplane
+    /// routing to a CPU in another slot); otherwise sends as bare MR.
+    ///
+    /// Returns `(reply_service, general_status, reply_data)`.
+    pub async fn send_generic(
+        &mut self,
+        service_code: u8,
+        class_id: u32,
+        instance_id: u32,
+        attribute_id: Option<u16>,
+        data: &[u8],
+        route_path: &[u8],
+    ) -> Result<(u8, u8, Vec<u8>)> {
+        use crate::cpf::{item_type, Item as CpfItem};
+        use crate::path::EpathWriter;
+        use crate::unconnected_send;
+
+        // Build the inner path: class(+instance(+attribute)) via the encoder.
+        let mut path = EpathWriter::new();
+        path.push_class(class_id as u16);
+        path.push_instance(instance_id);
+        if let Some(attr) = attribute_id {
+            path.push_attribute(attr);
+        }
+        let path_bytes = path.into_bytes();
+
+        let mr = if route_path.is_empty() {
+            unconnected_send::build_inner_mr(service_code, &path_bytes, data)?
+        } else {
+            let inner = unconnected_send::build_inner_mr(service_code, &path_bytes, data)?;
+            unconnected_send::wrap(&inner, route_path)?
+        };
+
+        let items = [
+            CpfItem::null_address(),
+            CpfItem::new(item_type::UNCONNECTED_DATA, mr),
+        ];
+        let envelope = self.send_rr_data(&items, 5).await?;
+        let reply = envelope
+            .find(item_type::UNCONNECTED_DATA)
+            .ok_or_else(|| crate::EipError::Protocol("SendRRData missing UnconnectedData".into()))?;
+        // MR reply: service(1) + reserved(1) + status(1) + additional_size(1) + rest.
+        if reply.data.len() < 4 {
+            return Err(crate::EipError::Protocol("MR reply too short".into()));
+        }
+        let reply_service = reply.data[0];
+        let status = reply.data[2];
+        let additional = reply.data[3] as usize;
+        let data_start = 4 + additional * 2;
+        let body = if reply.data.len() > data_start {
+            reply.data[data_start..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok((reply_service, status, body))
+    }
+
     /// Send a connected (Class 3) request via `SendUnitData`.
     pub async fn send_unit_data(&mut self, items: &[Item]) -> Result<Envelope> {
         self.require_registered()?;

@@ -12,6 +12,7 @@ pub mod error;
 pub mod path;
 pub mod path_parse;
 pub mod session;
+pub mod unconnected_send;
 
 pub use error::{EipError, Result};
 pub use session::EipSession;

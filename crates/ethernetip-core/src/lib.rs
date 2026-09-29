@@ -10,6 +10,7 @@ pub mod device;
 pub mod encap;
 pub mod error;
 pub mod path;
+pub mod path_parse;
 pub mod session;
 
 pub use error::{EipError, Result};

@@ -59,6 +59,18 @@ Sibling of [EthernetIPSharp](../EthernetIPSharp), [EthernetIPCpp](../EthernetIPC
 - Opt-in Class 3 connected explicit messaging (`use_connected(true)`) — opens a Forward_Open at `connect()` and rides `SendUnitData` for every subsequent request
 - Instance-ID cache populated transparently by `browse_tags` so later reads emit a short Symbol Object logical instance segment instead of the full ANSI symbolic name
 - `TagClient` for real PLCs; `TagServer` + `TagRegistry` for a Logix-style responder
+- `EipSession::send_generic(service, class, instance, attribute, data, route)` — idiomatic CIP request wrapper with optional `Unconnected_Send` backplane routing
+
+**Logix tag server (Studio-5000-compatible)**
+- Program-scoped tags — a request path prefixed with `Program:Cell` resolves against that program's per-scope tag table
+- Nested UDT templates via `ServerTemplate` + `TagRegistry::add_template` — pre-resolved layout registration for L5X exports (AOI backing structures with 32-per-DINT BOOL packing, STRING)
+- Segment-aware path walker (`walker::walk`) — member drilling, element indexing, BOOL bit access; a request for `Motor.Timer.PRE`, `Motor.DN`, `Line[2].Speed`, `Matrix[1,2,3]` returns the right bytes and type
+- Multi-dimensional arrays (`TagRegistry::add_multi_dim`) with row-major indexing and under-index detection
+- DWORD-packed BOOL arrays (`add_array(_, Bool, 32)` occupies 4 bytes; `Flags[5]` addresses bit 5 of byte 0)
+- `TagRegistry::atomic_set_bit` for concurrent-safe BOOL bit writes
+- `set_by_name_silent`, `set_suppress_events`, `enable_dirty_tracking` / `drain_dirty` for the transpiler-generated scan hot path
+- `persistence::save` / `load` — compact binary snapshot of every tag buffer, byte-for-byte compatible with the C#, Python, and C++ ports
+- Documented tearing model: aligned scalar reads/writes are atomic on x86/x64; multi-scalar struct reads may tear (matches 1756 behavior)
 
 **Diagnostics**
 - Structured tracing via the `tracing` crate — set `RUST_LOG=debug` for per-request detail
@@ -492,9 +504,9 @@ The Rust ↔ C# gap was where the last round of wire-format bugs was found — s
 - **No CIP Safety Validator object (class 0x3A)** — the safety adapter still fakes the connection-instance state that a real Validator would own; `Get_Attribute_Single` against class 0x3A does not respond. The Safety Supervisor (class 0x39) *is* implemented on the new CIP object framework — see [CIP Safety details](#cip-safety-details).
 - **CIP object framework only covers Safety Supervisor** — Identity (0x01), TCP/IP Interface (0xF5), Ethernet Link (0xF6), and Connection Manager (0x06) are still inlined into the adapter's request handler instead of being pluggable CIP objects on top of `ethernetip_core::cip::CipClass`.
 - **No Multiple Service Packet (0x0A)** batching in the tag client.
-- **No UDT template introspection** — struct reads return opaque bytes plus the type-CRC handle.
+- **No UDT template introspection on the client** — struct reads return opaque bytes plus the type-CRC handle (the server-side registry does understand templates via `ServerTemplate` for the walker's benefit).
 - **No reopen-on-drop** for Class 1 or Class 3 — connections that time out have to be reopened by the caller.
-- **In-memory only** — assembly contents, tag values, and connection state don't survive restart.
+- **Assembly contents don't survive restart.** Tag values do — use `persistence::save` / `load` for a compact cross-port binary snapshot.
 - **Single-connection per session** on both the standard adapter and the safety adapter (extending is a matter of moving `active_conn_id: Option<u32>` to `HashMap<u32, _>`).
 
 ---

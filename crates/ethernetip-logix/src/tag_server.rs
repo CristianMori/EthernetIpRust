@@ -18,9 +18,11 @@ use ethernetip_core::cip::{class_codes as class, service_codes as service, statu
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
+use ethernetip_core::path_parse::{parse_epath, PathSegment};
 
-use crate::tag_registry::TagRegistry;
+use crate::tag_registry::{TagEntry, TagRegistry};
 use crate::types::CipType;
+use crate::walker::{walk, WalkResult};
 
 /// Configuration for [`start`].
 #[derive(Debug, Clone)]
@@ -253,40 +255,79 @@ fn build_mr_reply(service_code: u8, status: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode a Logix tag reference from an MR path. Handles:
-/// * Full symbolic (`0x91` … chain)
-/// * Cached instance form (`0x24 <inst>` or `0x25 00 <lo> <hi>`)
-/// * Program-scope prefix (`0x91 "Program:X"` followed by more segments)
-///
-/// Returns the top-level tag entry looked up from the registry plus the
-/// residual member path (chain of ANSI symbolic names) — the residual is
-/// empty for a direct tag read.
-fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<crate::tag_registry::TagEntry> {
-    let mut i = 0;
-    // Skip a leading class-6B segment if present (some clients emit
-    // `Class(Symbol) + Instance(id)` explicitly).
-    if path.len() >= 4 && path[0] == 0x20 && path[1] == class::SYMBOL_OBJECT as u8 {
-        i = 2;
+/// Segment-based path resolution.  Returns the root tag plus a walker result
+/// covering any post-root member/element/BOOL-bit segments.  Also handles
+/// the Program:<name> prefix by looking up the program scope and resolving
+/// the next symbolic segment against its tag table.
+enum ResolvedPath {
+    /// Controller-scope tag with optional walker result (None → whole tag).
+    Controller(TagEntry, Option<WalkResult>),
+    /// Program-scope tag: (program_name, tag_entry, optional walker result).
+    Program(String, TagEntry, Option<WalkResult>),
+}
+
+fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath> {
+    let (segments, _) = parse_epath(path).ok()?;
+    // Try instance-only shortcut when the path is Class(0x6B) + Instance(N).
+    if segments.len() >= 2 {
+        if let (
+            PathSegment::Logical { kind: k1, value: v1 },
+            PathSegment::Logical { kind: k2, value: v2 },
+        ) = (&segments[0], &segments[1])
+        {
+            use ethernetip_core::path_parse::LogicalKind;
+            if matches!(k1, LogicalKind::ClassId)
+                && *v1 == class::SYMBOL_OBJECT as u32
+                && matches!(k2, LogicalKind::InstanceId)
+            {
+                let entry = registry.get_by_instance(*v2)?;
+                // No post-root symbolic drilling supported for instance-form paths
+                // (rare and typically used only for whole-tag reads).
+                return Some(ResolvedPath::Controller(entry, None));
+            }
+        }
     }
-    if i >= path.len() {
+    let first_sym_idx = segments.iter().position(|s| matches!(s, PathSegment::Symbolic(_)))?;
+    let PathSegment::Symbolic(first_name) = &segments[first_sym_idx] else {
         return None;
+    };
+
+    if let Some(program_tail) = first_name.strip_prefix("Program:") {
+        // Program-scope: next symbolic segment is the tag root inside the program.
+        let root_sym_idx = segments
+            .iter()
+            .enumerate()
+            .skip(first_sym_idx + 1)
+            .find_map(|(i, s)| matches!(s, PathSegment::Symbolic(_)).then_some(i))?;
+        let PathSegment::Symbolic(root_name) = &segments[root_sym_idx] else {
+            return None;
+        };
+        let entry = registry.get_program_tag(program_tail, root_name)?;
+        let post: Vec<PathSegment> = segments
+            .iter()
+            .skip(root_sym_idx + 1)
+            .filter(|s| !matches!(s, PathSegment::Logical { .. }))
+            .cloned()
+            .collect();
+        if post.is_empty() {
+            return Some(ResolvedPath::Program(program_tail.to_string(), entry, None));
+        }
+        let w = walk(&entry, &post, registry).ok()?;
+        return Some(ResolvedPath::Program(program_tail.to_string(), entry, Some(w)));
     }
-    match path[i] {
-        0x91 => {
-            let len = path[i + 1] as usize;
-            let name_bytes = &path[i + 2..i + 2 + len];
-            let name = std::str::from_utf8(name_bytes).ok()?;
-            registry.get_by_name(name)
-        }
-        0x24 => {
-            let inst = path[i + 1] as u32;
-            registry.get_by_instance(inst)
-        }
-        0x25 => {
-            let inst = u16::from_le_bytes([path[i + 2], path[i + 3]]) as u32;
-            registry.get_by_instance(inst)
-        }
-        _ => None,
+
+    let entry = registry.get_by_name(first_name)?;
+    let post: Vec<PathSegment> = segments
+        .iter()
+        .skip(first_sym_idx + 1)
+        .filter(|s| !matches!(s, PathSegment::Logical { .. }))
+        .cloned()
+        .collect();
+    if post.is_empty() {
+        Some(ResolvedPath::Controller(entry, None))
+    } else {
+        let w = walk(&entry, &post, registry).ok()?;
+        Some(ResolvedPath::Controller(entry, Some(w)))
     }
 }
 
@@ -299,8 +340,8 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
         );
     }
     let count = u16::from_le_bytes([body[0], body[1]]) as usize;
-    let entry = match resolve_tag_path(path, registry) {
-        Some(e) => e,
+    let resolved = match resolve_tag_path(path, registry) {
+        Some(r) => r,
         None => {
             return build_mr_reply(
                 service::READ_TAG | service::REPLY_FLAG,
@@ -309,13 +350,20 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
             );
         }
     };
+    let (entry, walked) = match resolved {
+        ResolvedPath::Controller(e, w) => (e, w),
+        ResolvedPath::Program(_, e, w) => (e, w),
+    };
 
+    // Walker path: member drilling, element indexing, BOOL bit access.
+    if let Some(w) = walked {
+        return build_walker_read_reply(&entry, w, count);
+    }
+
+    // Whole-tag / root-level read.
     let mut out = Vec::with_capacity(2 + entry.data.len());
     out.extend_from_slice(&(entry.cip_type as u16).to_le_bytes());
     if entry.cip_type == CipType::Struct {
-        // 2-byte struct CRC handle sits between the type and the data. Use
-        // the low byte of the sym_type as the handle when the caller didn't
-        // supply one.
         let handle = entry.sym_type & 0x0FFF;
         out.extend_from_slice(&handle.to_le_bytes());
         out.extend_from_slice(&entry.data);
@@ -325,6 +373,34 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
         let want = take.min(entry.data.len());
         out.extend_from_slice(&entry.data[..want]);
     }
+    build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
+}
+
+fn build_walker_read_reply(entry: &TagEntry, w: WalkResult, count: usize) -> Vec<u8> {
+    // BOOL bit read: single-byte 0x01/0x00 reply.
+    if let Some(bit) = w.bit_pos {
+        let host = entry.data.get(w.offset).copied().unwrap_or(0);
+        let value = (host >> bit) & 0x01;
+        let mut out = Vec::with_capacity(3);
+        out.extend_from_slice(&(CipType::Bool as u16).to_le_bytes());
+        out.push(value);
+        return build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out);
+    }
+    let bytes_to_read = count * w.element_size;
+    if w.offset + bytes_to_read > entry.data.len() {
+        return build_mr_reply(
+            service::READ_TAG | service::REPLY_FLAG,
+            status::PATH_DESTINATION_UNKNOWN,
+            &[],
+        );
+    }
+    let mut out = Vec::with_capacity(2 + bytes_to_read);
+    out.extend_from_slice(&w.type_code.to_le_bytes());
+    if w.type_code & 0x8000 != 0 {
+        // Nested struct member — emit struct handle in the same slot.
+        out.extend_from_slice(&(w.type_code & 0x0FFF).to_le_bytes());
+    }
+    out.extend_from_slice(&entry.data[w.offset..w.offset + bytes_to_read]);
     build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
 }
 
@@ -338,8 +414,8 @@ fn handle_read_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) 
     }
     let _count = u16::from_le_bytes([body[0], body[1]]) as usize;
     let offset = u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize;
-    let entry = match resolve_tag_path(path, registry) {
-        Some(e) => e,
+    let resolved = match resolve_tag_path(path, registry) {
+        Some(r) => r,
         None => {
             return build_mr_reply(
                 service::READ_TAG_FRAGMENTED | service::REPLY_FLAG,
@@ -347,6 +423,9 @@ fn handle_read_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) 
                 &[],
             );
         }
+    };
+    let entry = match resolved {
+        ResolvedPath::Controller(e, _) | ResolvedPath::Program(_, e, _) => e,
     };
     // Cap each chunk so a very large struct is naturally paged.
     const CHUNK: usize = 500;
@@ -378,8 +457,8 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
     let _type_code = u16::from_le_bytes([body[0], body[1]]);
     let count = u16::from_le_bytes([body[2], body[3]]) as usize;
     let value = &body[4..];
-    let entry = match resolve_tag_path(path, registry) {
-        Some(e) => e,
+    let resolved = match resolve_tag_path(path, registry) {
+        Some(r) => r,
         None => {
             return build_mr_reply(
                 service::WRITE_TAG | service::REPLY_FLAG,
@@ -388,6 +467,83 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             );
         }
     };
+
+    // Walker path — write into a specific member/element offset (with BOOL bit
+    // handling).  Program-scoped writes also flow through here since both
+    // resolutions produce the same walker result.
+    match resolved {
+        ResolvedPath::Controller(entry, Some(w))
+        | ResolvedPath::Program(_, entry, Some(w)) => {
+            if let Some(bit) = w.bit_pos {
+                if value.is_empty() {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::NOT_ENOUGH_DATA,
+                        &[],
+                    );
+                }
+                let new = value[0] & 0x01 != 0;
+                if registry
+                    .atomic_set_bit(entry.instance, w.offset, bit, new)
+                    .is_err()
+                {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::INVALID_ATTRIBUTE_VALUE,
+                        &[],
+                    );
+                }
+                return build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[]);
+            }
+            let bytes_to_write = count.max(1) * w.element_size;
+            if value.len() < bytes_to_write {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::NOT_ENOUGH_DATA,
+                    &[],
+                );
+            }
+            if registry
+                .set_bytes_at(entry.instance, w.offset, &value[..bytes_to_write])
+                .is_err()
+            {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::INVALID_ATTRIBUTE_VALUE,
+                    &[],
+                );
+            }
+            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+        }
+        ResolvedPath::Controller(entry, None) => {
+            write_whole_tag(&entry, value, count, registry)
+        }
+        ResolvedPath::Program(program, entry, None) => {
+            let per = entry.atomic_size().unwrap_or(entry.data.len());
+            let take = per * count.max(1);
+            if value.len() < take {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::NOT_ENOUGH_DATA,
+                    &[],
+                );
+            }
+            if registry
+                .set_program_tag_bytes(&program, &entry.name, 0, &value[..take])
+                .is_err()
+            {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::INVALID_ATTRIBUTE_VALUE,
+                    &[],
+                );
+            }
+            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+        }
+    }
+}
+
+fn write_whole_tag(entry: &TagEntry, value: &[u8], count: usize, registry: &TagRegistry) -> Vec<u8> {
     let per = entry.atomic_size().unwrap_or(entry.data.len());
     let take = per * count.max(1);
     if value.len() < take {
@@ -397,7 +553,6 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             &[],
         );
     }
-    // Write into position 0 for the requested `count` elements.
     let mut new_data = entry.data.clone();
     let n = take.min(new_data.len());
     new_data[..n].copy_from_slice(&value[..n]);

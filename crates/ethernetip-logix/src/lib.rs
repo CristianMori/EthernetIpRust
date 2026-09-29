@@ -4,6 +4,7 @@
 //! providing symbolic tag reads/writes and Symbol Object enumeration.
 
 pub mod browse;
+pub mod persistence;
 pub mod request;
 pub mod server_template;
 pub mod tag_client;

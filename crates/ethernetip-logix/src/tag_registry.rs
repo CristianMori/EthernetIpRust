@@ -512,6 +512,20 @@ impl TagRegistry {
         Ok(())
     }
 
+    /// Snapshot of every tag inside a program scope.  Returns
+    /// `(local_instance, entry)` pairs.
+    pub fn program_tags(&self, program: &str) -> Vec<(u32, TagEntry)> {
+        let guard = self.inner.read().unwrap();
+        let Some(scope) = guard.programs.get(program) else {
+            return Vec::new();
+        };
+        scope
+            .tags
+            .values()
+            .map(|e| (e.instance, e.clone()))
+            .collect()
+    }
+
     pub fn all_programs(&self) -> Vec<(String, u32)> {
         self.inner
             .read()

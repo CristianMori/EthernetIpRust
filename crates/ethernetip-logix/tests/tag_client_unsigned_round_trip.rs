@@ -174,3 +174,83 @@ async fn type_mismatch_rejected_by_server() {
 
     h.shutdown().await;
 }
+
+// --- Struct write path (gap called out in 146a4af, fixed in the follow-up) ---
+
+// The structure handle lives in the low 12 bits of sym_type (bit 15 marks
+// "struct", bits 14-13 carry array dims, bit 12 is the system-tag flag),
+// so Logix handles always fit in 12 bits. The server's Read_Tag reply
+// emits `sym_type & 0x0FFF` as the handle; a Write_Tag must send the
+// same value back. Tests use a 12-bit-safe handle below.
+const TEST_STRUCT_HANDLE: u16 = 0x0ABC;
+
+#[tokio::test]
+async fn struct_write_wrong_handle_rejected_by_server() {
+    // The on-wire write shape is [type=0x02A0][struct_handle][count][data].
+    // If the client sends the wrong struct_handle, the server must reject
+    // with 0xFF / 0x2107 — the same code atomic mismatches use, so
+    // cross-port tests can assert the same reply shape.
+    let reg = TagRegistry::new();
+    reg.add_struct("blob", TEST_STRUCT_HANDLE, vec![0u8; 8]).unwrap();
+    let (h, addr) = spawn_server(reg).await;
+    let mut c = client(addr).await;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x02A0u16.to_le_bytes());
+    body.extend_from_slice(&0x0BEEu16.to_le_bytes()); // wrong 12-bit handle
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&[0u8; 8]);
+    let err = c.write_tag_raw("blob", &body).await;
+    assert!(err.is_err(), "expected handle-mismatch error, got {:?}", err);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn struct_write_correct_handle_succeeds_and_count_uses_right_offset() {
+    // The historically-broken path: before this fix, the server read
+    // `count` out of body[2..4], which actually held `struct_handle` for a
+    // struct write, and reached into `value` starting at body[4..] which
+    // was still inside the write header. Correctly-formed struct writes
+    // would misalign and the server would silently store the wrong bytes.
+    let reg = TagRegistry::new();
+    reg.add_struct("blob", TEST_STRUCT_HANDLE, vec![0u8; 8]).unwrap();
+    let reg_probe = reg.clone();
+    let (h, addr) = spawn_server(reg).await;
+    let mut c = client(addr).await;
+
+    let payload = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x02A0u16.to_le_bytes());
+    body.extend_from_slice(&TEST_STRUCT_HANDLE.to_le_bytes()); // correct
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&payload);
+    c.write_tag_raw("blob", &body).await.unwrap();
+
+    // Bytes landed at offset 0 verbatim; nothing from the header leaked in.
+    let entry = reg_probe.get_by_name("blob").unwrap();
+    assert_eq!(&entry.data[..], &payload[..]);
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn struct_marker_against_atomic_tag_rejected() {
+    // Client sends the struct marker (0x02A0) against an atomic UDINT
+    // tag. Can't possibly be valid — must fail with the same wrong-type
+    // reply shape.
+    let reg = TagRegistry::new();
+    reg.add_atomic("u32", CipType::Udint).unwrap();
+    let (h, addr) = spawn_server(reg).await;
+    let mut c = client(addr).await;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x02A0u16.to_le_bytes());
+    body.extend_from_slice(&0x1234u16.to_le_bytes()); // some fake handle
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let err = c.write_tag_raw("u32", &body).await;
+    assert!(err.is_err(), "expected rejection, got {:?}", err);
+
+    h.shutdown().await;
+}

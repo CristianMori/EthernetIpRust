@@ -471,8 +471,36 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         );
     }
     let type_code = u16::from_le_bytes([body[0], body[1]]);
-    let count = u16::from_le_bytes([body[2], body[3]]) as usize;
-    let value = &body[4..];
+
+    // Two write shapes land here:
+    //   atomic:  [type (UINT)][count (UINT)][data...]
+    //   struct:  [type=0x02A0][struct_handle (UINT)][count (UINT)][data...]
+    // The struct shape carries an extra UINT between the type marker and the
+    // element count. Reading `count` out of the wrong byte offset was the
+    // bug the earlier atomic-only path hid.
+    const CIP_TYPE_STRUCT_MARKER: u16 = 0x02A0;
+    let (client_struct_handle, count, value): (Option<u16>, usize, &[u8]) =
+        if type_code == CIP_TYPE_STRUCT_MARKER {
+            if body.len() < 6 {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::NOT_ENOUGH_DATA,
+                    &[],
+                );
+            }
+            (
+                Some(u16::from_le_bytes([body[2], body[3]])),
+                u16::from_le_bytes([body[4], body[5]]) as usize,
+                &body[6..],
+            )
+        } else {
+            (
+                None,
+                u16::from_le_bytes([body[2], body[3]]) as usize,
+                &body[4..],
+            )
+        };
+
     let resolved = match resolve_tag_path(path, registry) {
         Some(r) => r,
         None => {
@@ -484,22 +512,40 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         }
     };
 
-    // Reject client-side `tag_type` that doesn't match the target.  Logix
-    // controllers return `0xFF / 0x2107` (general error + extended "wrong
-    // type") for this; matching that bytes-for-bytes keeps the Rust
-    // server interchangeable with C#/C++/Python under the same test
-    // assertions. Struct writes (tag_type == 0x02A0) carry the struct
-    // handle in the next two bytes rather than matching the atomic code
-    // directly, so skip the atomic check for them — the struct-write
-    // path has its own handle check elsewhere (TODO: wire the struct
-    // handle validation here once Rust gains the two-u16 struct write
-    // header parse).
-    const CIP_TYPE_STRUCT_MARKER: u16 = 0x02A0;
-    let expected_type: u16 = match &resolved {
-        ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => w.type_code,
-        ResolvedPath::Controller(e, None) | ResolvedPath::Program(_, e, None) => e.cip_type as u16,
+    // Validate the client-supplied type against the resolved target. Four
+    // cases, because the walker-aware path and the whole-tag path both have
+    // atomic and struct variants:
+    //
+    //   walker + atomic member:   type_code must equal w.type_code
+    //   walker + struct member:   struct_handle must equal (w.type_code & 0x0FFF)
+    //                             and w.type_code must have the 0x8000 bit set
+    //   whole-tag + atomic:       type_code must equal entry.cip_type as u16
+    //   whole-tag + struct:       struct_handle must equal (sym_type & 0x0FFF)
+    //                             and entry.cip_type must be Struct
+    //
+    // Mismatch returns 0xFF / 0x2107 — the Logix-standard "wrong type for
+    // attribute" reply, bytes-identical to the other three ports' servers.
+    let type_check_failed = match &resolved {
+        ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
+            let member_is_struct = (w.type_code & 0x8000) != 0;
+            match (client_struct_handle, member_is_struct) {
+                (None, false)  => type_code != w.type_code,
+                (Some(h), true) => h != (w.type_code & 0x0FFF),
+                // Struct marker against an atomic member, or atomic code
+                // against a struct member — categorically wrong.
+                _ => true,
+            }
+        }
+        ResolvedPath::Controller(e, None) | ResolvedPath::Program(_, e, None) => {
+            let tag_is_struct = e.cip_type == CipType::Struct;
+            match (client_struct_handle, tag_is_struct) {
+                (None, false)  => type_code != e.cip_type as u16,
+                (Some(h), true) => h != (e.sym_type & 0x0FFF),
+                _ => true,
+            }
+        }
     };
-    if type_code != CIP_TYPE_STRUCT_MARKER && type_code != expected_type {
+    if type_check_failed {
         return build_mr_reply_ext(
             service::WRITE_TAG | service::REPLY_FLAG,
             0xFF,

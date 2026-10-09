@@ -154,30 +154,23 @@ async fn all_added_types_round_trip_in_one_session() {
 }
 
 #[tokio::test]
-async fn type_mismatch_currently_accepted_by_server_documents_gap() {
-    // The Rust `tag_server` write handler currently ignores the
-    // client-supplied `tag_type` on the wire (see
-    // `handle_write_tag` in `tag_server.rs`), so writing with a
-    // different-but-same-width type code silently succeeds. This is a
-    // divergence from the C# port, which enforces
-    // `tag_type != tag.TagType` → status 0xFF, extended 0x2107.
-    //
-    // Tracked separately from this follow-up. This test pins the current
-    // Rust behavior so a future enforcement commit flips the assertion.
+async fn type_mismatch_rejected_by_server() {
+    // Writing a different CIP code than the tag's registered type MUST
+    // fail at the server. This is what proves the type-aware round-trip
+    // works for the right reason (not accidental tolerance): the exact
+    // tag_type check the client's typed path leans on is exercised.
+    // Server returns status 0xFF with extended 0x2107 (matches C#,
+    // C++, and Python ports byte-for-byte so a cross-port cross-check
+    // can assert the same reply).
     let reg = TagRegistry::new();
     reg.add_atomic("u32", CipType::Udint).unwrap();
-    let reg_probe = reg.clone();
     let (h, addr) = spawn_server(reg).await;
     let mut c = client(addr).await;
 
-    // Dint shares the width of Udint. Current behavior: server accepts.
-    c.write_tag("u32", &TagValue::Dint(42)).await.unwrap();
-
-    // What matters for correctness: the registered tag_type is unchanged
-    // and the raw bytes land verbatim. Readers see Udint(42) regardless
-    // of what the writer claimed on the wire.
-    assert_eq!(c.read_tag("u32").await.unwrap(), TagValue::Udint(42));
-    assert_eq!(reg_probe.get_by_name("u32").unwrap().cip_type, CipType::Udint);
+    // Dint has the same width as Udint but a different type code; server
+    // must refuse rather than silently accept the bytes.
+    let err = c.write_tag("u32", &TagValue::Dint(42)).await;
+    assert!(err.is_err(), "expected type-mismatch error, got {:?}", err);
 
     h.shutdown().await;
 }

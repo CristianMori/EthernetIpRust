@@ -817,6 +817,10 @@ fn atomic_to_typed(v: TagValue) -> TypedValue {
         TagValue::Ulint(x) => TypedValue::Ulint(x),
         TagValue::Real(x) => TypedValue::Real(x),
         TagValue::Lreal(x) => TypedValue::Lreal(x),
+        TagValue::Byte(x) => TypedValue::Byte(x),
+        TagValue::Word(x) => TypedValue::Word(x),
+        TagValue::Dword(x) => TypedValue::Dword(x),
+        TagValue::Lword(x) => TypedValue::Lword(x),
         TagValue::Struct { .. } => {
             unreachable!("atomic_to_typed called with a struct — caller bug")
         }

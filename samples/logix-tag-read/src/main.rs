@@ -131,6 +131,10 @@ fn print_value(name: &str, v: &TagValue) {
         TagValue::Ulint(x) => println!("  {name} = {x}u64"),
         TagValue::Real(x) => println!("  {name} = {x}f32"),
         TagValue::Lreal(x) => println!("  {name} = {x}f64"),
+        TagValue::Byte(x) => println!("  {name} = 0x{x:02X} (BYTE)"),
+        TagValue::Word(x) => println!("  {name} = 0x{x:04X} (WORD)"),
+        TagValue::Dword(x) => println!("  {name} = 0x{x:08X} (DWORD)"),
+        TagValue::Lword(x) => println!("  {name} = 0x{x:016X} (LWORD)"),
         TagValue::Struct { crc, bytes } => {
             println!(
                 "  {name} = struct(crc=0x{crc:04X}, {} bytes)",

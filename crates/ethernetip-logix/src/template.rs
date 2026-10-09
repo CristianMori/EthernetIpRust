@@ -138,6 +138,10 @@ pub enum TypedValue {
     Ulint(u64),
     Real(f32),
     Lreal(f64),
+    Byte(u8),
+    Word(u16),
+    Dword(u32),
+    Lword(u64),
     /// Any type code not covered above — carried as raw bytes with the
     /// wire type. Common cases: SHORT_STRING, opaque vendor types.
     Raw {
@@ -475,12 +479,17 @@ where
             Ok(match ty {
                 CipType::Sint => TypedValue::Sint(i8::from_le_bytes([slice[0]])),
                 CipType::Usint => TypedValue::Usint(slice[0]),
+                CipType::Byte => TypedValue::Byte(slice[0]),
                 CipType::Int => TypedValue::Int(i16::from_le_bytes([slice[0], slice[1]])),
                 CipType::Uint => TypedValue::Uint(u16::from_le_bytes([slice[0], slice[1]])),
+                CipType::Word => TypedValue::Word(u16::from_le_bytes([slice[0], slice[1]])),
                 CipType::Dint => TypedValue::Dint(i32::from_le_bytes([
                     slice[0], slice[1], slice[2], slice[3],
                 ])),
                 CipType::Udint => TypedValue::Udint(u32::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3],
+                ])),
+                CipType::Dword => TypedValue::Dword(u32::from_le_bytes([
                     slice[0], slice[1], slice[2], slice[3],
                 ])),
                 CipType::Real => TypedValue::Real(f32::from_le_bytes([
@@ -491,6 +500,10 @@ where
                     slice[7],
                 ])),
                 CipType::Ulint => TypedValue::Ulint(u64::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
+                    slice[7],
+                ])),
+                CipType::Lword => TypedValue::Lword(u64::from_le_bytes([
                     slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
                     slice[7],
                 ])),

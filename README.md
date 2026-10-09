@@ -62,6 +62,7 @@ Sibling of [EthernetIPSharp](../EthernetIPSharp), [EthernetIPCpp](../EthernetIPC
 - `EipSession::send_generic(service, class, instance, attribute, data, route)` — idiomatic CIP request wrapper with optional `Unconnected_Send` backplane routing
 
 **Logix tag server (Studio-5000-compatible)**
+- Full CIP Vol 1 §C-6.1 elementary type family — `CipType::Bool`, signed integers (`Sint`/`Int`/`Dint`/`Lint`), unsigned integers (`Usint`/`Uint`/`Udint`/`Ulint`), floats (`Real`/`Lreal`), and bit strings (`Byte`/`Word`/`Dword`/`Lword`)
 - Program-scoped tags — a request path prefixed with `Program:Cell` resolves against that program's per-scope tag table
 - Nested UDT templates via `ServerTemplate` + `TagRegistry::add_template` — pre-resolved layout registration for L5X exports (AOI backing structures with 32-per-DINT BOOL packing, STRING)
 - Segment-aware path walker (`walker::walk`) — member drilling, element indexing, BOOL bit access; a request for `Motor.Timer.PRE`, `Motor.DN`, `Line[2].Speed`, `Matrix[1,2,3]` returns the right bytes and type

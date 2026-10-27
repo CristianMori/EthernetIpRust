@@ -2,7 +2,7 @@
 
 An idiomatic async Rust implementation of EtherNet/IP and CIP Safety, focused on communicating with Allen-Bradley Logix controllers and building interoperable **adapters** (targets / I/O slaves) and **scanners** (originators / I/O masters).
 
-Sibling of [EthernetIPSharp](../EthernetIPSharp), [EthernetIPCpp](../EthernetIPCpp), and [EthernetIPPython](../EthernetIPPython). Same wire behavior, Rust API on top of tokio.
+Sibling of [EthernetIpSharp](https://github.com/CristianMori/EthernetIpSharp), [EthernetIpCpp](https://github.com/CristianMori/EthernetIpCpp), and [EthernetIpPython](https://github.com/CristianMori/EthernetIpPython). Same wire behavior, Rust API on top of tokio.
 
 ---
 

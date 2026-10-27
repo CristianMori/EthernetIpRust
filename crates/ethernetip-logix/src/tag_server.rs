@@ -373,14 +373,24 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
 
     // Walker path: member drilling, element indexing, BOOL bit access.
     if let Some(w) = walked {
-        return build_walker_read_reply(&entry, w, count);
+        return build_walker_read_reply(&entry, w, count, registry);
     }
 
     // Whole-tag / root-level read.
     let mut out = Vec::with_capacity(2 + entry.data.len());
     out.extend_from_slice(&(entry.cip_type as u16).to_le_bytes());
     if entry.cip_type == CipType::Struct {
-        let handle = entry.sym_type & 0x0FFF;
+        // The authoritative structure handle lives on the template; derive
+        // from sym_type only as a fallback. Default-registered templates
+        // keep structure_handle == 0x8000 | instance_id so the low 12 bits
+        // of sym_type and of structure_handle match, but a caller using
+        // add_template_prebuilt may install a custom handle (CRC-16, Logix
+        // Studio export) and the stored value is what belongs on the wire.
+        let handle = entry
+            .template_id
+            .and_then(|tid| registry.get_template(tid))
+            .map(|t| t.structure_handle)
+            .unwrap_or(entry.sym_type & 0x0FFF);
         out.extend_from_slice(&handle.to_le_bytes());
         out.extend_from_slice(&entry.data);
     } else {
@@ -392,7 +402,12 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
     build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
 }
 
-fn build_walker_read_reply(entry: &TagEntry, w: WalkResult, count: usize) -> Vec<u8> {
+fn build_walker_read_reply(
+    entry: &TagEntry,
+    w: WalkResult,
+    count: usize,
+    registry: &TagRegistry,
+) -> Vec<u8> {
     // BOOL bit read: single-byte 0x01/0x00 reply.
     if let Some(bit) = w.bit_pos {
         let host = entry.data.get(w.offset).copied().unwrap_or(0);
@@ -410,12 +425,29 @@ fn build_walker_read_reply(entry: &TagEntry, w: WalkResult, count: usize) -> Vec
             &[],
         );
     }
+    // Struct members land on the wire with the 4-byte prefix
+    // [0x02A0][structure_handle]; atomic members keep the 2-byte [type_code].
+    // Older code emitted [member.data_type][template_id] which is neither
+    // shape libplctag or pycomm3 accept — tracked against C# issue #2.
+    let is_struct_member = w.type_code & 0x8000 != 0;
+    if is_struct_member {
+        // Look the handle up from the walker's recorded template id; falling
+        // back to CipType::Struct keeps us Lucifer-safe if the template was
+        // garbage-collected between walk and reply, though in practice the
+        // registry holds Arc<ServerTemplate> for the lifetime of a request.
+        let handle = w
+            .template
+            .and_then(|tid| registry.get_template(tid))
+            .map(|t| t.structure_handle)
+            .unwrap_or(w.type_code & 0x0FFF);
+        let mut out = Vec::with_capacity(4 + bytes_to_read);
+        out.extend_from_slice(&(CipType::Struct as u16).to_le_bytes());
+        out.extend_from_slice(&handle.to_le_bytes());
+        out.extend_from_slice(&entry.data[w.offset..w.offset + bytes_to_read]);
+        return build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out);
+    }
     let mut out = Vec::with_capacity(2 + bytes_to_read);
     out.extend_from_slice(&w.type_code.to_le_bytes());
-    if w.type_code & 0x8000 != 0 {
-        // Nested struct member — emit struct handle in the same slot.
-        out.extend_from_slice(&(w.type_code & 0x0FFF).to_le_bytes());
-    }
     out.extend_from_slice(&entry.data[w.offset..w.offset + bytes_to_read]);
     build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
 }
@@ -517,20 +549,26 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
     // atomic and struct variants:
     //
     //   walker + atomic member:   type_code must equal w.type_code
-    //   walker + struct member:   struct_handle must equal (w.type_code & 0x0FFF)
-    //                             and w.type_code must have the 0x8000 bit set
+    //   walker + struct member:   struct_handle must equal the nested
+    //                             template's structure_handle (looked up
+    //                             via w.template)
     //   whole-tag + atomic:       type_code must equal entry.cip_type as u16
-    //   whole-tag + struct:       struct_handle must equal (sym_type & 0x0FFF)
-    //                             and entry.cip_type must be Struct
+    //   whole-tag + struct:       struct_handle must equal the root
+    //                             template's structure_handle
     //
     // Mismatch returns 0xFF / 0x2107 — the Logix-standard "wrong type for
     // attribute" reply, bytes-identical to the other three ports' servers.
+    let lookup_handle = |tid: u16| registry.get_template(tid).map(|t| t.structure_handle);
     let type_check_failed = match &resolved {
         ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
             let member_is_struct = (w.type_code & 0x8000) != 0;
             match (client_struct_handle, member_is_struct) {
                 (None, false)  => type_code != w.type_code,
-                (Some(h), true) => h != (w.type_code & 0x0FFF),
+                (Some(h), true) => {
+                    let expected = w.template.and_then(lookup_handle)
+                        .unwrap_or(w.type_code & 0x0FFF);
+                    h != expected
+                }
                 // Struct marker against an atomic member, or atomic code
                 // against a struct member — categorically wrong.
                 _ => true,
@@ -540,7 +578,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             let tag_is_struct = e.cip_type == CipType::Struct;
             match (client_struct_handle, tag_is_struct) {
                 (None, false)  => type_code != e.cip_type as u16,
-                (Some(h), true) => h != (e.sym_type & 0x0FFF),
+                (Some(h), true) => {
+                    let expected = e.template_id.and_then(lookup_handle)
+                        .unwrap_or(e.sym_type & 0x0FFF);
+                    h != expected
+                }
                 _ => true,
             }
         }

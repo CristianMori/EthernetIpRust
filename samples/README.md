@@ -1,15 +1,16 @@
 # EthernetIPRust Samples
 
-Six runnable binaries that exercise the library as either an EtherNet/IP **adapter** (target / I/O slave) or a **scanner** (originator / I/O master), with and without CIP Safety, plus a Logix tag client and a Logix tag server.
+Seven runnable binaries that exercise the library as either an EtherNet/IP **adapter** (target / I/O slave) or a **scanner** (originator / I/O master), with and without CIP Safety, plus Logix tag clients and a Logix tag server.
 
 | Sample | Role | Safety | What it does |
 |---|---|---|---|
 | [`logix-tag-read`](logix-tag-read/) | Client | No | Browses a Logix controller's tag list and reads one tag by name; auto-uses `Read_Tag_Fragmented` for structures |
+| [`logix-verify`](logix-verify/) | Client | No | One session against a live controller: browse, atomic reads, raw and typed struct reads, Multiple Service Packet, fragmented read, Class 3, Class 3 reopen-on-drop. Writes only a DINT whose name contains `SCRATCH`, `TEST`, `TMP`, or `DEBUG` (value+1, then restores the original). |
 | [`logix-host`](logix-host/) | Target | No | Tiny Logix-style tag server — hosts DINT / REAL / INT[10] / STRUCT tags and answers `Read_Tag` / `Write_Tag` / `Get_Instance_Attribute_List` |
 | [`echo-adapter`](echo-adapter/) | Target | No | Generic-Ethernet-Module adapter — 100/102/105 assemblies, input 100 seeded with a 1..125 ramp |
 | [`echo-scanner`](echo-scanner/) | Scanner | No | Class 1 scanner — pairs with `echo-adapter` for an end-to-end loopback |
 | [`safety-adapter`](safety-adapter/) | Target | Yes | Safety adapter — accepts a safety Forward_Open, decodes O→T with target-timestamp rollover tracking, emits base-format TCOO |
-| [`safety-scanner`](safety-scanner/) | Scanner | Yes | Safety scanner (server direction) — produces O→T safety frames with rollover-seeded CRCs |
+| [`safety-scanner`](safety-scanner/) | Scanner | Yes | Safety scanner — produces O→T safety frames with rollover-seeded CRCs; `--client` also consumes T→O |
 
 ## Running
 
@@ -24,6 +25,7 @@ Then run them with `cargo run --release -p <name> -- [args]` or invoke the built
 ```sh
 # Logix tag client — points at a real PLC on the LAN
 cargo run --release -p logix-tag-read -- 192.168.1.96 --tag rate
+cargo run --release -p logix-verify -- 192.168.1.96 --path 1,0
 cargo run --release -p logix-tag-read -- 192.168.1.96 --no-path --tag temperature
 cargo run --release -p logix-tag-read -- 192.168.1.96 --connected --tag Program:MainProgram.Framework
 
@@ -92,8 +94,9 @@ cargo run --release -p logix-tag-read -- 127.0.0.1 --no-path --tag rate
 ## What you need on the other end
 
 - **`logix-tag-read`** — A real Allen-Bradley PLC on the LAN, or the bundled `logix-host` sample. For a routed ControlLogix use `--path 1,0` (backplane, slot 0); for direct connect use `--no-path`.
+- **`logix-verify`** — A live controller (default host `192.168.1.96`, default path `1,0`). The write step runs only when a controller-scope DINT's name contains `SCRATCH`, `TEST`, `TMP`, or `DEBUG`: it writes that value plus one, reads it back, then restores the original.
 - **`logix-host`** — Any Logix-style client. `logix-tag-read` is the natural pair; pycomm3, RSLogix MSG instructions, and pyeeip also work against it.
 - **`echo-adapter`** — Any EtherNet/IP scanner. In Studio 5000, add the adapter as a "Generic Ethernet Module" with Data-DINT format, Input Assembly = 100 (size 125), Output Assembly = 102 (size 124), Config = 105 (size 10). The defaults match.
 - **`echo-scanner`** — Any Class 1 adapter (this repo's `echo-adapter`, the C#/C++/Python echo modules, or a real device configured to expose Class 1 assemblies).
 - **`safety-adapter`** — A safety scanner (this repo's `safety-scanner`, the C# `SampleSafetyScanner`, or a real ControlLogix with a safety I/O module configured to target this adapter's IP + SNN + electronic key + SCID). Verified against the C# scanner over a 3-min soak (~9000 frames, ~21 rollover boundaries, 0 CRC failures) — see the top-level [README](../README.md#interop-matrix) for the full status.
-- **`safety-scanner`** — A safety adapter (this repo's `safety-adapter`, the C# `SafetyAdapterSample`, or a real 1734-IB8S once the Safety Validator objects land). Adapters that validate the target's UNID or that only expose specific assembly instances need `--snn` / `--node` / `--consumed` / `--produced` / `--config` overrides.
+- **`safety-scanner`** — A safety adapter (this repo's `safety-adapter` or the C# `SafetyAdapterSample`). `--client` opens the T→O consumer leg as well. Adapters that validate the target's UNID or that only expose specific assembly instances need `--snn` / `--node` / `--consumed` / `--produced` / `--config` overrides. The top-level interop matrix has no recorded run against a live 1734-IB8S.

@@ -1521,15 +1521,36 @@ fn handle_get_instance_attribute_list(
     registry: &TagRegistry,
 ) -> Vec<u8> {
     let reply_svc = service::GET_INSTANCE_ATTRIBUTE_LIST | service::REPLY_FLAG;
-    // Path must at least contain the class segment.
-    if path.len() < 4 || path[0] != 0x20 || path[1] != class::SYMBOL_OBJECT as u8 {
+    // Parse the EPATH so we can also accept a leading ANSI Symbolic segment
+    // `Program:<name>` — pycomm3 (and Studio 5000) prepends that before the
+    // Class(0x6B) + Instance segments to scope a browse into a program's
+    // tag table.  Controller-scope requests omit the symbolic prefix.
+    use ethernetip_core::path_parse::LogicalKind;
+    let segments = match parse_epath(path) {
+        Ok((segs, _)) => segs,
+        Err(_) => return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]),
+    };
+    let mut program_prefix: Option<String> = None;
+    let mut class_id: Option<u32> = None;
+    let mut start_instance: u32 = 0;
+    for seg in &segments {
+        match seg {
+            PathSegment::Symbolic(name) => {
+                if program_prefix.is_none() {
+                    program_prefix = Some(name.clone());
+                }
+            }
+            PathSegment::Logical { kind, value } => match kind {
+                LogicalKind::ClassId => class_id = Some(*value),
+                LogicalKind::InstanceId => start_instance = *value,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if class_id != Some(class::SYMBOL_OBJECT as u32) {
         return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
     }
-    let start_instance = match path[2] {
-        0x24 => path[3] as u32,
-        0x25 if path.len() >= 6 => u16::from_le_bytes([path[4], path[5]]) as u32,
-        _ => 0,
-    };
     // Parse the attribute-id list from the request body. Logix clients send
     // `[count:UINT][attr_id:UINT * count]`. pycomm3's canonical set is
     // {1, 2, 3, 5, 6, 8, 10}, our own TagClient sends {1, 2}. The response
@@ -1551,7 +1572,31 @@ fn handle_get_instance_attribute_list(
         vec![1, 2]
     };
 
-    let entries = registry.browse_entries();
+    // Source rows depend on scope:
+    //   * `Program:<name>` prefix  → only that program's tag table.
+    //   * no prefix                → controller-scope tags + a synthesized
+    //     `Program:<name>` pseudo-tag per registered program so pycomm3's
+    //     `init_program_tags` can discover each program and then scope a
+    //     follow-up browse into it.  `browse_entries` already emits those
+    //     program pseudo-tags with sym_type 0x1068.
+    let entries: Vec<(u32, String, u16)> = match program_prefix
+        .as_deref()
+        .and_then(|p| p.strip_prefix("Program:"))
+    {
+        Some(prog) => {
+            if registry.program_pseudo_id(prog).is_none() {
+                return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
+            }
+            let mut rows: Vec<_> = registry
+                .program_tags(prog)
+                .into_iter()
+                .map(|(inst, e)| (inst, e.name, e.sym_type))
+                .collect();
+            rows.sort_by_key(|r| r.0);
+            rows
+        }
+        None => registry.browse_entries(),
+    };
     let mut cursor = entries
         .into_iter()
         .filter(|(inst, _, _)| *inst >= start_instance)

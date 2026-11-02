@@ -400,6 +400,79 @@ impl TagClient {
         Ok(())
     }
 
+    /// Fragmented write (service 0x53).  Pairs with `read_tag_fragmented`:
+    /// splits `payload` into capped chunks and re-sends each with a growing
+    /// byte offset until all bytes are delivered.
+    ///
+    /// `tag_type` is the atomic type code (e.g. `CipType::Dint as u16`) or
+    /// `0x02A0` for a structure.  For a structure, pass the structure handle
+    /// in `struct_handle`; for atomic writes pass `None`.  `count` is the
+    /// declared element-count window the server uses to bound the write
+    /// (the C#/C++/Python ports emit 0xFF/0x2104 when the payload exceeds
+    /// `count * element_size`).
+    pub async fn write_tag_fragmented(
+        &mut self,
+        name: &str,
+        tag_type: u16,
+        struct_handle: Option<u16>,
+        count: u16,
+        payload: &[u8],
+    ) -> Result<()> {
+        let path = encode_with_cache(name, &self.atoms)?;
+        let header_len = if struct_handle.is_some() { 10 } else { 8 };
+        // Keep each MR under 500 bytes so Logix targets never return 0x11.
+        const BODY_CAP: usize = 480;
+        let max_chunk = BODY_CAP.saturating_sub(header_len).max(1);
+
+        let mut offset: u32 = 0;
+        if payload.is_empty() {
+            // Nothing to write — a legitimate degenerate case.  Still send a
+            // single zero-length fragment so the server validates the type.
+            let mut body = Vec::with_capacity(header_len);
+            body.extend_from_slice(&tag_type.to_le_bytes());
+            if let Some(h) = struct_handle {
+                body.extend_from_slice(&h.to_le_bytes());
+            }
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&offset.to_le_bytes());
+            let mr = build_mr_request(service::WRITE_TAG_FRAGMENTED, &path, &body);
+            let bytes = self.dispatch(mr).await?;
+            let header = ReplyHeader::parse(&bytes)?;
+            if header.general_status != status::SUCCESS {
+                return Err(EipError::Cip {
+                    status: header.general_status,
+                    ext: header.extended_status,
+                });
+            }
+            return Ok(());
+        }
+
+        while (offset as usize) < payload.len() {
+            let end = ((offset as usize) + max_chunk).min(payload.len());
+            let chunk = &payload[offset as usize..end];
+
+            let mut body = Vec::with_capacity(header_len + chunk.len());
+            body.extend_from_slice(&tag_type.to_le_bytes());
+            if let Some(h) = struct_handle {
+                body.extend_from_slice(&h.to_le_bytes());
+            }
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&offset.to_le_bytes());
+            body.extend_from_slice(chunk);
+            let mr = build_mr_request(service::WRITE_TAG_FRAGMENTED, &path, &body);
+            let bytes = self.dispatch(mr).await?;
+            let header = ReplyHeader::parse(&bytes)?;
+            if header.general_status != status::SUCCESS {
+                return Err(EipError::Cip {
+                    status: header.general_status,
+                    ext: header.extended_status,
+                });
+            }
+            offset = end as u32;
+        }
+        Ok(())
+    }
+
     /// Enumerate every controller-scope tag and cache their instance IDs.
     ///
     /// After this returns, subsequent reads and writes of any discovered tag

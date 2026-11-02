@@ -21,7 +21,7 @@ use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path_parse::{parse_epath, PathSegment};
 
 use crate::tag_registry::{TagEntry, TagRegistry};
-use crate::types::CipType;
+use crate::types::{CipType, SHORT_STRING_STORAGE_SIZE};
 use crate::walker::{walk, WalkResult};
 
 /// Configuration for [`start`].
@@ -607,6 +607,33 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             )
         };
 
+    // pycomm3 writes SHORT_STRING as `[length_byte][chars]` and does NOT pad
+    // the fixed 81-byte slot — a write of "hello" is 6 payload bytes, not 81.
+    // Our atomic size for SHORT_STRING is 81, so the normal length check
+    // would reject the shorter payload with 0x13 (NOT_ENOUGH_DATA).
+    // Accept the short form here and pad with zeros so Read_Tag returns the
+    // same value back.  Studio 5000 uses this shape on Identity attribute 7
+    // (the only place real Logix exposes SHORT_STRING).
+    let padded_short_string: Option<Vec<u8>> = if type_code == CipType::ShortString as u16
+        && client_struct_handle.is_none()
+        && !value.is_empty()
+        && value.len() >= 1 + value[0] as usize
+    {
+        let elem = CipType::ShortString.atomic_size().unwrap_or(SHORT_STRING_STORAGE_SIZE);
+        let want = count.max(1) * elem;
+        if value.len() < want {
+            let mut v = Vec::with_capacity(want);
+            v.extend_from_slice(value);
+            v.resize(want, 0);
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let value: &[u8] = padded_short_string.as_deref().unwrap_or(value);
+
     let resolved = match resolve_tag_path(path, registry) {
         Some(r) => r,
         None => {
@@ -786,6 +813,31 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
                 &body[8..],
             )
         };
+
+    // pycomm3-compat: fragmented SHORT_STRING write at offset 0 arrives as
+    // `[length_byte][chars]` with no fixed-slot padding.  Pad to the full
+    // 81-byte slot (per count) so the slot ends up zero-tailed.  We only
+    // pad for offset 0 — a non-zero offset is an explicit partial write.
+    let padded_short_string: Option<Vec<u8>> = if type_code == CipType::ShortString as u16
+        && client_struct_handle.is_none()
+        && byte_offset_in_elements == 0
+        && !value.is_empty()
+        && value.len() >= 1 + value[0] as usize
+    {
+        let elem = CipType::ShortString.atomic_size().unwrap_or(SHORT_STRING_STORAGE_SIZE);
+        let want = (count as usize).max(1) * elem;
+        if value.len() < want {
+            let mut v = Vec::with_capacity(want);
+            v.extend_from_slice(value);
+            v.resize(want, 0);
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let value: &[u8] = padded_short_string.as_deref().unwrap_or(value);
 
     let resolved = match resolve_tag_path(path, registry) {
         Some(r) => r,

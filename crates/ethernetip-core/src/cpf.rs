@@ -136,6 +136,13 @@ pub struct Envelope {
     pub items: Vec<Item>,
 }
 
+/// Hard cap on CPF item count. The protocol allows a UINT (65535) but a
+/// well-formed envelope carries at most a handful of items (address + data,
+/// optional sockaddr pair). Pre-reserving `Vec::with_capacity(item_count)`
+/// against an attacker-chosen UINT lets a single ~8-byte header reserve
+/// ~2 MB per connection. Reject anything beyond this cap.
+pub const MAX_CPF_ITEMS: usize = 8;
+
 impl Envelope {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 8 {
@@ -148,6 +155,11 @@ impl Envelope {
         let interface_handle = c.get_u32_le();
         let timeout = c.get_u16_le();
         let item_count = c.get_u16_le() as usize;
+        if item_count > MAX_CPF_ITEMS {
+            return Err(EipError::Protocol(format!(
+                "CPF item_count {item_count} exceeds max {MAX_CPF_ITEMS}"
+            )));
+        }
         let mut items = Vec::with_capacity(item_count);
         for _ in 0..item_count {
             if c.remaining() < 4 {

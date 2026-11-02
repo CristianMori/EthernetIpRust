@@ -213,6 +213,121 @@ async fn main() -> Result<()> {
     registry.set_by_name("MotorA", &motor_buf)?;
     // Array of Motor UDT (MotorArr[3]) — exercises `MotorArr[1].Speed`.
     registry.add_struct_array_from_template("MotorArr", &motor_tpl, 3)?;
+
+    // TIMER { EN:BOOL, TT:BOOL, DN:BOOL, PRE:DINT, ACC:DINT } — Logix exposes
+    // TIMER / COUNTER / CONTROL as predefined structures, but on the wire
+    // they are plain UDTs: the server emits a template via Template Object
+    // (0x6C) and member access goes through the same TagName.FieldName
+    // plumbing as any user UDT. BOOLs are byte-encoded (like Motor.Fault)
+    // then padded to the next DINT boundary. Total structure_size = 12.
+    let timer_tpl_id = registry.add_template(ServerTemplate {
+        instance_id: 0,
+        name: "TIMER".into(),
+        structure_handle: 0,
+        structure_size: 12,
+        members: vec![
+            ServerTemplateMember {
+                name: "EN".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 0,
+                array_size: 0,
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "TT".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 1,
+                array_size: 0,
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "DN".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 2,
+                array_size: 0,
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "PRE".into(),
+                data_type: 0x00C4, // DINT
+                offset: 4,
+                array_size: 0,
+                element_size: 4,
+            },
+            ServerTemplateMember {
+                name: "ACC".into(),
+                data_type: 0x00C4, // DINT
+                offset: 8,
+                array_size: 0,
+                element_size: 4,
+            },
+        ],
+    })?;
+    let timer_tpl = registry
+        .get_template(timer_tpl_id)
+        .expect("TIMER template just registered");
+    registry.add_struct_from_template("MyTimer", &timer_tpl)?;
+    let mut timer_buf = vec![0u8; 12];
+    timer_buf[0] = 1; // EN = true
+    timer_buf[4..8].copy_from_slice(&1000i32.to_le_bytes()); // PRE
+    timer_buf[8..12].copy_from_slice(&250i32.to_le_bytes()); // ACC
+    registry.set_by_name("MyTimer", &timer_buf)?;
+
+    // MixerAOI { Enable:BOOL, Setpoint:REAL, Done:BOOL, Steps:DINT } — a
+    // stand-in for an AOI's backing tag. On the wire this is identical to a
+    // user UDT; registering it here proves pycomm3's `TagName.FieldName`
+    // access works for AOI-backing shapes too. Natural-alignment layout:
+    //   Enable  at  0 (BOOL, 1 byte)
+    //   Setpoint at 4 (REAL, 4 bytes, aligned to 4)
+    //   Done    at  8 (BOOL, 1 byte)
+    //   Steps   at 12 (DINT, 4 bytes, aligned to 4)
+    // structure_size = 16.
+    let aoi_tpl_id = registry.add_template(ServerTemplate {
+        instance_id: 0,
+        name: "MixerAOI".into(),
+        structure_handle: 0,
+        structure_size: 16,
+        members: vec![
+            ServerTemplateMember {
+                name: "Enable".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 0,
+                array_size: 0,
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "Setpoint".into(),
+                data_type: 0x00CA, // REAL
+                offset: 4,
+                array_size: 0,
+                element_size: 4,
+            },
+            ServerTemplateMember {
+                name: "Done".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 8,
+                array_size: 0,
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "Steps".into(),
+                data_type: 0x00C4, // DINT
+                offset: 12,
+                array_size: 0,
+                element_size: 4,
+            },
+        ],
+    })?;
+    let aoi_tpl = registry
+        .get_template(aoi_tpl_id)
+        .expect("MixerAOI template just registered");
+    registry.add_struct_from_template("MyAOI", &aoi_tpl)?;
+    let mut aoi_buf = vec![0u8; 16];
+    aoi_buf[0] = 1; // Enable = true
+    aoi_buf[4..8].copy_from_slice(&42.5f32.to_le_bytes()); // Setpoint
+    aoi_buf[8] = 0; // Done = false
+    aoi_buf[12..16].copy_from_slice(&7i32.to_le_bytes()); // Steps
+    registry.set_by_name("MyAOI", &aoi_buf)?;
     // ----------------------------------------------------------------------
 
     let identity = IdentityInfo {

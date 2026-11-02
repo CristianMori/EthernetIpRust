@@ -1030,7 +1030,13 @@ fn build_walker_read_reply(
     // [0x02A0][structure_handle]; atomic members keep the 2-byte [type_code].
     // Older code emitted [member.data_type][template_id] which is neither
     // shape libplctag or pycomm3 accept — tracked against C# issue #2.
-    let is_struct_member = w.type_code & 0x8000 != 0;
+    //
+    // The walker leaves 0x02A0 on type_code for a struct-ARRAY-element
+    // landing (Element segment on a root struct array) because the Element
+    // branch never rewrites type_code; a nested struct member lands with
+    // 0x8000 | nested_template_id. Honor both as struct so the client gets
+    // the [type][handle] shape in either case.
+    let is_struct_member = w.type_code & 0x8000 != 0 || w.type_code == 0x02A0;
     if is_struct_member {
         // Look the handle up from the walker's recorded template id; falling
         // back to CipType::Struct keeps us Lucifer-safe if the template was
@@ -1221,7 +1227,14 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
     let lookup_handle = |tid: u16| registry.get_template(tid).map(|t| t.structure_handle);
     let type_check_failed = match &resolved {
         ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
-            let member_is_struct = (w.type_code & 0x8000) != 0;
+            // A member-level walker result sets 0x8000 on the member's
+            // data_type when the member is itself a struct, but a struct
+            // ARRAY-element landing hits 0x02A0 (the walker's root marker)
+            // because the Element segment doesn't rewrite type_code. Treat
+            // either shape as "struct" so Write_Tag on `GreetingArr[1]`
+            // doesn't trip the atomic-against-struct arm.
+            let member_is_struct =
+                (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
             match (client_struct_handle, member_is_struct) {
                 (None, false)  => type_code != w.type_code,
                 (Some(h), true) => {
@@ -1403,13 +1416,22 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
         None => return build_mr_reply(reply_svc, status::PATH_DESTINATION_UNKNOWN, &[]),
     };
 
-    // Type validation — same four-way check as `handle_write_tag`.
+    // Type validation — same four-way check as `handle_write_tag` (and the
+    // same 0x02A0-is-struct carve-out for a struct-array element landing).
+    let lookup_handle = |tid: u16| registry.get_template(tid).map(|t| t.structure_handle);
     let type_check_failed = match &resolved {
         ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
-            let member_is_struct = (w.type_code & 0x8000) != 0;
+            let member_is_struct =
+                (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
             match (client_struct_handle, member_is_struct) {
                 (None, false) => type_code != w.type_code,
-                (Some(h), true) => h != (w.type_code & 0x0FFF),
+                (Some(h), true) => {
+                    let expected = w
+                        .template
+                        .and_then(lookup_handle)
+                        .unwrap_or(w.type_code & 0x0FFF);
+                    h != expected
+                }
                 _ => true,
             }
         }

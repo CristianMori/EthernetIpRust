@@ -10,7 +10,10 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use ethernetip_logix::{start_tag_server, CipType, IdentityInfo, TagRegistry, TagServerConfig};
+use ethernetip_logix::{
+    start_tag_server, CipType, IdentityInfo, ServerTemplate, ServerTemplateMember, TagRegistry,
+    TagServerConfig,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -94,6 +97,123 @@ async fn main() -> Result<()> {
     // empty so the pycomm3 write of "hello" shows up as "hello\0..." in a
     // Read_Tag reply.
     registry.add_atomic("TestShortString", CipType::ShortString)?;
+
+    // ---- Yellow-row coverage ---------------------------------------------
+    // Keeps names and seed values aligned with the sibling Python port's
+    // test_pycomm3_roundtrip.py (commit 620fce4) so one pytest file can
+    // target either host.
+
+    // 1-D array of atomics: DintArr[10] seeded 100..109.
+    registry.add_array("DintArr", CipType::Dint, 10)?;
+    let mut dint_buf = Vec::with_capacity(40);
+    for i in 0..10i32 {
+        dint_buf.extend_from_slice(&(100i32 + i).to_le_bytes());
+    }
+    registry.set_by_name("DintArr", &dint_buf)?;
+
+    // Bit of atomic (DINT): FlagsDint seeded with alternating bits.
+    registry.add_atomic("FlagsDint", CipType::Dint)?;
+    registry.set_by_name("FlagsDint", &0b1010_1010_1010_1010u32.to_le_bytes())?;
+
+    // BOOL array (DWORD-packed): Flags32[32].
+    registry.add_array("Flags32", CipType::Bool, 32)?;
+
+    // Multi-dim array: Matrix[2,3] row-major, element value = 10*r + c.
+    registry.add_multi_dim("Matrix", CipType::Dint, &[2, 3])?;
+    let mut mat_buf = Vec::with_capacity(24);
+    for r in 0..2i32 {
+        for c in 0..3i32 {
+            mat_buf.extend_from_slice(&(10 * r + c).to_le_bytes());
+        }
+    }
+    registry.set_by_name("Matrix", &mat_buf)?;
+
+    // Logix STRING UDT: LEN:DINT + DATA:SINT[82], 88 bytes total (padded to
+    // a 4-byte boundary). pycomm3 recognises this specific shape as a Logix
+    // STRING and returns it as a Python str.
+    let string_tpl_id = registry.add_template(ServerTemplate {
+        instance_id: 0,
+        name: "STRING".into(),
+        structure_handle: 0, // auto = instance_id
+        structure_size: 88,
+        members: vec![
+            ServerTemplateMember {
+                name: "LEN".into(),
+                data_type: 0x00C4, // DINT
+                offset: 0,
+                array_size: 0,
+                element_size: 4,
+            },
+            ServerTemplateMember {
+                name: "DATA".into(),
+                data_type: 0x00C2, // SINT
+                offset: 4,
+                array_size: 82, // array member
+                element_size: 1,
+            },
+        ],
+    })?;
+    let string_tpl = registry
+        .get_template(string_tpl_id)
+        .expect("STRING template just registered");
+    registry.add_struct_from_template("Greeting", &string_tpl)?;
+    let hello = b"Hello pycomm3";
+    let mut gbuf = vec![0u8; 88];
+    gbuf[..4].copy_from_slice(&(hello.len() as u32).to_le_bytes());
+    gbuf[4..4 + hello.len()].copy_from_slice(hello);
+    registry.set_by_name("Greeting", &gbuf)?;
+    // Array of STRING UDT (GreetingArr[3]).
+    registry.add_struct_array_from_template("GreetingArr", &string_tpl, 3)?;
+
+    // User UDT: Motor { Speed:REAL, Fault:BOOL, RunCount:DINT } — 12 bytes.
+    //   REAL  at 0 (align 4),
+    //   BOOL  at 4 (align 1, one byte),
+    //   DINT  at 8 (align 4).  Trailing padding brings total to 12.
+    // Fault's bit position lives in the template-member's array_size field
+    // (pycomm3 reads it as the bit index inside the byte at offset 4). We
+    // store the BOOL as a plain byte (0x01 / 0x00) at offset 4 so a
+    // whole-byte Read_Tag / Write_Tag on MotorA.Fault reads bit 0 cleanly.
+    let motor_tpl_id = registry.add_template(ServerTemplate {
+        instance_id: 0,
+        name: "Motor".into(),
+        structure_handle: 0,
+        structure_size: 12,
+        members: vec![
+            ServerTemplateMember {
+                name: "Speed".into(),
+                data_type: 0x00CA, // REAL
+                offset: 0,
+                array_size: 0,
+                element_size: 4,
+            },
+            ServerTemplateMember {
+                name: "Fault".into(),
+                data_type: 0x00C1, // BOOL
+                offset: 4,
+                array_size: 0, // bit position for pycomm3
+                element_size: 1,
+            },
+            ServerTemplateMember {
+                name: "RunCount".into(),
+                data_type: 0x00C4, // DINT
+                offset: 8,
+                array_size: 0,
+                element_size: 4,
+            },
+        ],
+    })?;
+    let motor_tpl = registry
+        .get_template(motor_tpl_id)
+        .expect("Motor template just registered");
+    registry.add_struct_from_template("MotorA", &motor_tpl)?;
+    let mut motor_buf = vec![0u8; 12];
+    motor_buf[..4].copy_from_slice(&3.14f32.to_le_bytes());
+    motor_buf[4] = 1; // Fault = true (byte-encoded BOOL)
+    motor_buf[8..12].copy_from_slice(&42i32.to_le_bytes());
+    registry.set_by_name("MotorA", &motor_buf)?;
+    // Array of Motor UDT (MotorArr[3]) — exercises `MotorArr[1].Speed`.
+    registry.add_struct_array_from_template("MotorArr", &motor_tpl, 3)?;
+    // ----------------------------------------------------------------------
 
     let identity = IdentityInfo {
         vendor_id: 1,

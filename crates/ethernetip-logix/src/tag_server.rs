@@ -17,10 +17,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use ethernetip_core::cip::{class_codes as class, service_codes as service, status};
@@ -82,6 +83,18 @@ fn default_identity() -> IdentityInfo {
     }
 }
 
+/// Maximum concurrent TCP sessions. Idle sessions on `read_exact` park
+/// indefinitely, so without a cap a peer can exhaust tokio tasks (and file
+/// descriptors) by opening thousands of connections and never writing.
+pub const MAX_CONCURRENT_SESSIONS: usize = 64;
+
+/// Per-request idle timeout. If a peer opens a TCP session and goes quiet
+/// mid-frame the session is dropped so its slot in the semaphore above is
+/// returned to the pool. 60 s is long enough for any legitimate client's
+/// keep-alive gap and short enough that a parked idle session can't hold a
+/// slot forever.
+pub const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Handle to a running tag server.
 pub struct TagServerHandle {
     pub tcp_addr: SocketAddr,
@@ -103,6 +116,7 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let registry = cfg.registry;
     let identity = Arc::new(cfg.identity);
+    let session_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         loop {
@@ -113,6 +127,22 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
                 accept = tcp.accept() => {
                     match accept {
                         Ok((stream, peer)) => {
+                            // Try to grab a session slot. If we're already at
+                            // MAX_CONCURRENT_SESSIONS, drop the connection
+                            // rather than queueing — a slow peer must not
+                            // delay accept for everyone else.
+                            let permit = match session_limit.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "session limit reached ({}), rejecting {}",
+                                        MAX_CONCURRENT_SESSIONS,
+                                        peer
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let registry = registry.clone();
                             let identity = identity.clone();
                             let local = tcp_addr;
@@ -120,6 +150,7 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
                                 if let Err(err) = handle_session(stream, peer, local, registry, identity).await {
                                     tracing::debug!("session ended: {err}");
                                 }
+                                drop(permit);
                             });
                         }
                         Err(err) => tracing::warn!("accept error: {err}"),
@@ -164,7 +195,17 @@ async fn handle_session(
     let mut header_buf = [0u8; HEADER_LEN];
     let mut conn: Option<SessionConn> = None;
     loop {
-        stream.read_exact(&mut header_buf).await?;
+        // Idle timeout on the next-request boundary: a peer that opens a
+        // TCP session and goes silent must not keep its slot in the global
+        // session semaphore forever. Mid-frame reads below are not timed
+        // out — once a header is in, the payload is already bounded.
+        match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut header_buf)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                tracing::debug!("session {} idle timeout", peer);
+                return Ok(());
+            }
+        };
         let header = Header::parse(&header_buf)?;
         let mut payload = vec![0u8; header.length as usize];
         if header.length > 0 {

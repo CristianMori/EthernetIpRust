@@ -237,6 +237,9 @@ fn dispatch_mr(mr: &[u8], registry: &TagRegistry) -> Vec<u8> {
             handle_read_tag_fragmented(&path, &body, registry)
         }
         s if s == service::WRITE_TAG => handle_write_tag(&path, &body, registry),
+        s if s == service::WRITE_TAG_FRAGMENTED => {
+            handle_write_tag_fragmented(&path, &body, registry)
+        }
         s if s == service::GET_INSTANCE_ATTRIBUTE_LIST => {
             handle_get_instance_attribute_list(&path, &body, registry)
         }
@@ -698,6 +701,120 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
         }
     }
+}
+
+/// Write_Tag_Fragmented service (0x53).
+///
+/// Mirrors the C# port's `TagServices.HandleWriteTagFragmented` byte-for-byte
+/// so cross-port tests see identical status codes.  Request body:
+///
+///   atomic: `[type:UINT][count:UINT][offset:UDINT][payload...]`      (8+N bytes)
+///   struct: `[0x02A0][handle:UINT][count:UINT][offset:UDINT][payload]` (10+N bytes)
+///
+/// The absolute write offset is `walker.offset + offset_in_elements`.  For a
+/// walker-aware path (symbolic + Element, or the Class 0x6B + Instance +
+/// Element shortcut) `walker.offset` already includes the element-segment
+/// contribution — the same shape the fragmented read path uses after the
+/// earlier element-segment fix.  Fragmented writes to BOOL members are
+/// rejected with 0x08 (service not supported), matching the C# port.
+fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> {
+    let reply_svc = service::WRITE_TAG_FRAGMENTED | service::REPLY_FLAG;
+    if body.len() < 8 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let type_code = u16::from_le_bytes([body[0], body[1]]);
+    const CIP_TYPE_STRUCT_MARKER: u16 = 0x02A0;
+
+    let (client_struct_handle, count, byte_offset_in_elements, value): (Option<u16>, u16, u32, &[u8]) =
+        if type_code == CIP_TYPE_STRUCT_MARKER {
+            if body.len() < 10 {
+                return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+            }
+            (
+                Some(u16::from_le_bytes([body[2], body[3]])),
+                u16::from_le_bytes([body[4], body[5]]),
+                u32::from_le_bytes([body[6], body[7], body[8], body[9]]),
+                &body[10..],
+            )
+        } else {
+            (
+                None,
+                u16::from_le_bytes([body[2], body[3]]),
+                u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+                &body[8..],
+            )
+        };
+
+    let resolved = match resolve_tag_path(path, registry) {
+        Some(r) => r,
+        None => return build_mr_reply(reply_svc, status::PATH_DESTINATION_UNKNOWN, &[]),
+    };
+
+    // Type validation — same four-way check as `handle_write_tag`.
+    let type_check_failed = match &resolved {
+        ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
+            let member_is_struct = (w.type_code & 0x8000) != 0;
+            match (client_struct_handle, member_is_struct) {
+                (None, false) => type_code != w.type_code,
+                (Some(h), true) => h != (w.type_code & 0x0FFF),
+                _ => true,
+            }
+        }
+        ResolvedPath::Controller(e, None) | ResolvedPath::Program(_, e, None) => {
+            let tag_is_struct = e.cip_type == CipType::Struct;
+            match (client_struct_handle, tag_is_struct) {
+                (None, false) => type_code != e.cip_type as u16,
+                (Some(h), true) => h != (e.sym_type & 0x0FFF),
+                _ => true,
+            }
+        }
+    };
+    if type_check_failed {
+        return build_mr_reply_ext(reply_svc, 0xFF, 0x2107, &[]);
+    }
+
+    // Resolve base offset and element size for the window check.
+    let (base, element_size) = match &resolved {
+        ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
+            if w.bit_pos.is_some() {
+                // Bit writes don't support fragmented transfers (parity with C#).
+                return build_mr_reply(reply_svc, status::SERVICE_NOT_SUPPORTED, &[]);
+            }
+            (w.offset, w.element_size)
+        }
+        ResolvedPath::Controller(e, None) | ResolvedPath::Program(_, e, None) => {
+            (0usize, e.atomic_size().unwrap_or(e.data.len()))
+        }
+    };
+
+    // 0x2104: payload exceeds the declared element-count window.
+    let total_bytes = (count as usize).saturating_mul(element_size);
+    let write_len = value.len();
+    if (byte_offset_in_elements as usize).saturating_add(write_len) > total_bytes {
+        return build_mr_reply_ext(reply_svc, 0xFF, 0x2104, &[]);
+    }
+
+    let abs = base.saturating_add(byte_offset_in_elements as usize);
+
+    // 0x2105: absolute offset + payload runs past the tag buffer.
+    let buffer_len = match &resolved {
+        ResolvedPath::Controller(e, _) | ResolvedPath::Program(_, e, _) => e.data.len(),
+    };
+    if abs.saturating_add(write_len) > buffer_len {
+        return build_mr_reply_ext(reply_svc, 0xFF, 0x2105, &[]);
+    }
+
+    // Perform the write.
+    let write_result = match &resolved {
+        ResolvedPath::Controller(entry, _) => registry.set_bytes_at(entry.instance, abs, value),
+        ResolvedPath::Program(program, entry, _) => {
+            registry.set_program_tag_bytes(program, &entry.name, abs, value)
+        }
+    };
+    if write_result.is_err() {
+        return build_mr_reply(reply_svc, status::INVALID_ATTRIBUTE_VALUE, &[]);
+    }
+    build_mr_reply(reply_svc, status::SUCCESS, &[])
 }
 
 fn write_whole_tag(entry: &TagEntry, value: &[u8], count: usize, registry: &TagRegistry) -> Vec<u8> {

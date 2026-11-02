@@ -30,6 +30,7 @@ use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEAD
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path_parse::{parse_epath, PathSegment};
 
+use crate::server_template::ServerTemplate;
 use crate::tag_registry::{TagEntry, TagRegistry};
 use crate::types::{CipType, SHORT_STRING_STORAGE_SIZE};
 use crate::walker::{walk, WalkResult};
@@ -459,7 +460,16 @@ fn dispatch_mr(
         Some(x) => x,
         None => return build_mr_reply(0x00 | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, &[]),
     };
+    // CIP service codes 0x4C, 0x4E, 0x52 are shared between the Logix tag
+    // service family (addressed via Class 0x6B or a symbolic tag path) and
+    // other CIP service codes that happen to use the same byte (Template_Read
+    // on class 0x6C, Forward_Close on class 0x06, Unconnected_Send on class
+    // 0x06). Peek at the leading class segment to disambiguate before routing.
+    let path_class = read_class_id(&path);
     match service_code {
+        s if s == service::READ_TAG && path_class == Some(class::TEMPLATE_OBJECT) => {
+            handle_template_read(&path, &body, registry)
+        }
         s if s == service::READ_TAG => handle_read_tag(&path, &body, registry),
         s if s == service::READ_TAG_FRAGMENTED => {
             handle_read_tag_fragmented(&path, &body, registry)
@@ -477,15 +487,26 @@ fn dispatch_mr(
         s if s == service::LARGE_FORWARD_OPEN => {
             handle_forward_open(&path, &body, conn, session_handle, true)
         }
-        s if s == service::FORWARD_CLOSE => handle_forward_close(&path, &body, conn),
+        s if s == service::FORWARD_CLOSE
+            && path_class == Some(class::CONNECTION_MANAGER) =>
+        {
+            handle_forward_close(&path, &body, conn)
+        }
+        s if s == READ_MODIFY_WRITE => handle_read_modify_write(&path, &body, registry),
         s if s == GET_ATTRIBUTES_ALL => handle_get_attributes_all(&path, identity),
         s if s == GET_ATTRIBUTE_SINGLE => handle_get_attribute_single(&path, identity),
+        s if s == GET_ATTRIBUTE_LIST && path_class == Some(class::TEMPLATE_OBJECT) => {
+            handle_template_get_attribute_list(&path, &body, registry)
+        }
         s if s == MULTIPLE_SERVICE_PACKET => {
             handle_multiple_service_packet(&path, &body, registry, identity, conn, session_handle)
         }
         other => build_mr_reply(other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, &[]),
     }
 }
+
+const GET_ATTRIBUTE_LIST: u8 = 0x03;
+const READ_MODIFY_WRITE: u8 = 0x4E;
 
 const GET_ATTRIBUTES_ALL: u8 = 0x01;
 const GET_ATTRIBUTE_SINGLE: u8 = 0x0E;
@@ -1591,3 +1612,212 @@ fn append_attribute_field(out: &mut Vec<u8>, attr_id: u16, name: &str, sym_type:
 const _KEEP_ARC: fn() = || {
     let _ = std::marker::PhantomData::<Arc<()>>;
 };
+
+/// Read the instance id out of the path, if a 0x24 / 0x25 instance segment
+/// is present. The instance always follows the leading class segment in a
+/// Template Object request.
+fn read_instance_id(path: &[u8]) -> Option<u32> {
+    let mut i = 0;
+    while i < path.len() {
+        match path[i] {
+            0x20 => i += 2,
+            0x21 => i += 4,
+            0x24 if i + 1 < path.len() => return Some(path[i + 1] as u32),
+            0x25 if i + 3 < path.len() => {
+                return Some(u16::from_le_bytes([path[i + 2], path[i + 3]]) as u32)
+            }
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Template Object Get_Attribute_List (service 0x03). pycomm3 reads
+/// attributes {4, 5, 2, 1} in that order to populate its structure makeup
+/// cache before calling Template_Read.
+///
+/// Reply shape (per attribute, in request order):
+///   `[attr_id:UINT][status:UINT=0][value]`
+/// where value is UDINT for attr 4/5 and UINT for attr 1/2. The attribute
+/// list is prefixed with a count (echo of the request count), matching
+/// pycomm3's `StructTemplateAttributes` layout.
+fn handle_template_get_attribute_list(
+    path: &[u8],
+    body: &[u8],
+    registry: &TagRegistry,
+) -> Vec<u8> {
+    let reply_svc = GET_ATTRIBUTE_LIST | service::REPLY_FLAG;
+    if body.len() < 2 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let Some(instance) = read_instance_id(path) else {
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
+    };
+    let Some(tpl) = registry.get_template(instance as u16) else {
+        return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
+    };
+    let count = u16::from_le_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + 2 * count {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&(count as u16).to_le_bytes());
+    let member_data_len = build_template_member_data(&tpl).len() as u32;
+    let def_size_dwords = (21 + member_data_len + 3) / 4;
+    for i in 0..count {
+        let off = 2 + 2 * i;
+        let attr = u16::from_le_bytes([body[off], body[off + 1]]);
+        out.extend_from_slice(&attr.to_le_bytes());
+        match attr {
+            // Attr 4: object_definition_size in 32-bit words. Must match the
+            // boilerplate pycomm3 subtracts when it computes the Template_Read
+            // body size (`(def_size*4) - 21`), so the first call reaches the
+            // end of our member payload and comes back with SUCCESS instead
+            // of looping on PARTIAL_TRANSFER forever.
+            4 => {
+                out.extend_from_slice(&0u16.to_le_bytes()); // status
+                out.extend_from_slice(&def_size_dwords.to_le_bytes());
+            }
+            // Attr 5: structure_size in bytes.
+            5 => {
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&tpl.structure_size.to_le_bytes());
+            }
+            // Attr 2: template_member_count.
+            2 => {
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&(tpl.members.len() as u16).to_le_bytes());
+            }
+            // Attr 1: structure_handle.
+            1 => {
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&tpl.structure_handle.to_le_bytes());
+            }
+            // Unknown attribute: mark 0x14 (ATTRIBUTE_NOT_SUPPORTED) and
+            // emit a 4-byte zero slot so the stream stays aligned.
+            _ => {
+                out.extend_from_slice(&0x14u16.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    build_mr_reply(reply_svc, status::SUCCESS, &out)
+}
+
+/// Template_Read (service 0x4C on class 0x6C). pycomm3 Vol 1 §C-5.11 shape:
+///   `[Byte_Offset:UDINT][Size:UINT]`
+///
+/// We mirror the Python port's fix (commit 489b236): read the offset FIRST,
+/// then the size; emit the Logix template name as `<Name>;0` so pycomm3's
+/// splitter can carve the template name out of the member-name list.
+fn handle_template_read(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> {
+    let reply_svc = service::READ_TAG | service::REPLY_FLAG;
+    if body.len() < 6 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let Some(instance) = read_instance_id(path) else {
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
+    };
+    let Some(tpl) = registry.get_template(instance as u16) else {
+        return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
+    };
+    let byte_offset = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let requested = u16::from_le_bytes([body[4], body[5]]) as usize;
+    let member_data = build_template_member_data(&tpl);
+    if byte_offset >= member_data.len() {
+        return build_mr_reply(reply_svc, status::PATH_DESTINATION_UNKNOWN, &[]);
+    }
+    let remaining = member_data.len() - byte_offset;
+    // Pycomm3 occasionally asks for more than remains; cap each reply at the
+    // CIP transport-safe 480 bytes so a large UDT is naturally paged.
+    const CHUNK_CAP: usize = 480;
+    let chunk = remaining.min(requested).min(CHUNK_CAP);
+    let more = byte_offset + chunk < member_data.len();
+    let payload = &member_data[byte_offset..byte_offset + chunk];
+    let st = if more {
+        status::PARTIAL_TRANSFER
+    } else {
+        status::SUCCESS
+    };
+    build_mr_reply(reply_svc, st, payload)
+}
+
+/// Build the Template_Read payload for one template.
+///
+/// Wire layout per member (8 bytes, little-endian):
+///   `[info:UINT][data_type:UINT][byte_offset:UDINT]`
+///
+/// Then the ASCII template name (null terminated, with the `;0` suffix
+/// pycomm3's `name.split(";", 1)` needs to carve the template name out of
+/// the member list), followed by each member name null-terminated. The
+/// whole buffer is padded to a 4-byte boundary.
+///
+/// `info` carries the array size for an array member (and 0 for a scalar).
+/// Scalar BOOL members use `info` as the bit position inside the parent
+/// byte — pycomm3 keys off that to build its `_bit_members` dict.
+fn build_template_member_data(tpl: &ServerTemplate) -> Vec<u8> {
+    let mut out = Vec::new();
+    for m in &tpl.members {
+        let info = (m.array_size as u16) & 0xFFFF;
+        out.extend_from_slice(&info.to_le_bytes());
+        out.extend_from_slice(&m.data_type.to_le_bytes());
+        out.extend_from_slice(&(m.offset as u32).to_le_bytes());
+    }
+    out.extend_from_slice(tpl.name.as_bytes());
+    out.extend_from_slice(b";0");
+    out.push(0);
+    for m in &tpl.members {
+        out.extend_from_slice(m.name.as_bytes());
+        out.push(0);
+    }
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// Read_Modify_Write (service 0x4E on tag paths). pycomm3 sends this for a
+/// numeric-trailing symbol like `FlagsDint.1 = true`, with a path that
+/// resolves to the parent atomic.
+///
+/// Body: `[mask_size:UINT][or_mask:bytes][and_mask:bytes]`
+///
+/// Semantics: `new = (current & and_mask) | or_mask`, with `mask_size`
+/// bytes of each mask (pycomm3 encodes the and_mask with a known
+/// slice-by-length bug: its tail bytes may contain the ULINT high half).
+/// Honoring only the first `mask_size` bytes keeps us robust to that.
+fn handle_read_modify_write(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> {
+    let reply_svc = READ_MODIFY_WRITE | service::REPLY_FLAG;
+    if body.len() < 2 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let mask_size = u16::from_le_bytes([body[0], body[1]]) as usize;
+    if !matches!(mask_size, 1 | 2 | 4 | 8 | 12) {
+        return build_mr_reply(reply_svc, status::INVALID_PARAMETER, &[]);
+    }
+    if body.len() < 2 + 2 * mask_size {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let or_mask = &body[2..2 + mask_size];
+    let and_mask = &body[2 + mask_size..2 + 2 * mask_size];
+    let resolved = match resolve_tag_path(path, registry) {
+        Some(r) => r,
+        None => return build_mr_reply(reply_svc, status::PATH_DESTINATION_UNKNOWN, &[]),
+    };
+    let (entry, walked) = match resolved {
+        ResolvedPath::Controller(e, w) | ResolvedPath::Program(_, e, w) => (e, w),
+    };
+    let base = walked.as_ref().map(|w| w.offset).unwrap_or(0);
+    if base + mask_size > entry.data.len() {
+        return build_mr_reply(reply_svc, status::PATH_DESTINATION_UNKNOWN, &[]);
+    }
+    let current = entry.data[base..base + mask_size].to_vec();
+    let mut new = Vec::with_capacity(mask_size);
+    for i in 0..mask_size {
+        new.push((current[i] & and_mask[i]) | or_mask[i]);
+    }
+    if registry.set_bytes_at(entry.instance, base, &new).is_err() {
+        return build_mr_reply(reply_svc, status::INVALID_ATTRIBUTE_VALUE, &[]);
+    }
+    build_mr_reply(reply_svc, status::SUCCESS, &[])
+}

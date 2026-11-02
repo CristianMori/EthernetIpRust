@@ -332,7 +332,7 @@ async fn handle_send_rr_data(
         .ok_or_else(|| EipError::Protocol("SendRRData missing UnconnectedData item".into()))?;
     // Unwrap Unconnected_Send if present (service 0x52 to Connection Manager).
     let inner = maybe_unwrap_unconnected_send(&mr_item.data).unwrap_or_else(|| mr_item.data.clone());
-    let mr_reply = dispatch_mr(&inner, registry, identity, conn, header.session_handle);
+    let mr_reply = dispatch_mr(&inner, registry, identity, conn, header.session_handle, 0);
 
     let items = [
         Item::null_address(),
@@ -382,7 +382,7 @@ async fn handle_send_unit_data(
     // We still accept the whole dispatch_mr surface so Multiple_Service_Packet
     // and other inline services keep working.
     let mut local_conn: Option<SessionConn> = None;
-    let mr_reply = dispatch_mr(mr, registry, identity, &mut local_conn, header.session_handle);
+    let mr_reply = dispatch_mr(mr, registry, identity, &mut local_conn, header.session_handle, 0);
 
     let reply_cid = conn.as_ref().map(|c| c.to_id).unwrap_or(0);
     let mut data = Vec::with_capacity(2 + mr_reply.len());
@@ -447,19 +447,37 @@ fn maybe_unwrap_unconnected_send(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(bytes[msg_start..msg_end].to_vec())
 }
 
+/// Maximum nesting depth for `Multiple_Service_Packet`. Real originators
+/// never nest MSP; a malicious frame can otherwise recurse ~thousands of
+/// levels deep in a single 65535-byte request and overflow the worker-thread
+/// stack, which aborts the whole process (not just the task).
+const MAX_MR_DEPTH: u8 = 3;
+
 /// Dispatch a fully-unwrapped MR request against the registry and return the
 /// serialized MR reply bytes.
+///
+/// `depth` counts how many `Multiple_Service_Packet` frames we are nested
+/// inside. Beyond `MAX_MR_DEPTH` the dispatcher refuses with
+/// `SERVICE_NOT_SUPPORTED` instead of recursing further.
 fn dispatch_mr(
     mr: &[u8],
     registry: &TagRegistry,
     identity: &IdentityInfo,
     conn: &mut Option<SessionConn>,
     session_handle: u32,
+    depth: u8,
 ) -> Vec<u8> {
     let (service_code, path, body) = match split_mr(mr) {
         Some(x) => x,
         None => return build_mr_reply(0x00 | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, &[]),
     };
+    if depth > MAX_MR_DEPTH {
+        return build_mr_reply(
+            service_code | service::REPLY_FLAG,
+            status::SERVICE_NOT_SUPPORTED,
+            &[],
+        );
+    }
     // CIP service codes 0x4C, 0x4E, 0x52 are shared between the Logix tag
     // service family (addressed via Class 0x6B or a symbolic tag path) and
     // other CIP service codes that happen to use the same byte (Template_Read
@@ -498,9 +516,15 @@ fn dispatch_mr(
         s if s == GET_ATTRIBUTE_LIST && path_class == Some(class::TEMPLATE_OBJECT) => {
             handle_template_get_attribute_list(&path, &body, registry)
         }
-        s if s == MULTIPLE_SERVICE_PACKET => {
-            handle_multiple_service_packet(&path, &body, registry, identity, conn, session_handle)
-        }
+        s if s == MULTIPLE_SERVICE_PACKET => handle_multiple_service_packet(
+            &path,
+            &body,
+            registry,
+            identity,
+            conn,
+            session_handle,
+            depth,
+        ),
         other => build_mr_reply(other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, &[]),
     }
 }
@@ -665,6 +689,7 @@ fn handle_multiple_service_packet(
     identity: &IdentityInfo,
     conn: &mut Option<SessionConn>,
     session_handle: u32,
+    depth: u8,
 ) -> Vec<u8> {
     let reply_svc = MULTIPLE_SERVICE_PACKET | service::REPLY_FLAG;
     // Must address Message Router (class 2 instance 1). Any other target is
@@ -693,7 +718,7 @@ fn handle_multiple_service_packet(
             return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
         }
         let sub = &body[start..end];
-        let r = dispatch_mr(sub, registry, identity, conn, session_handle);
+        let r = dispatch_mr(sub, registry, identity, conn, session_handle, depth + 1);
         sub_replies.push(r);
     }
     // Encode: [n:UINT][offset_i*n:UINT][sub_replies concatenated]. Offsets

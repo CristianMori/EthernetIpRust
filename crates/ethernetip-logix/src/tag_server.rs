@@ -1,10 +1,19 @@
 //! Server side of the Logix tag protocol.
 //!
 //! Binds a TCP port, accepts encapsulated request/reply, and answers
-//! `Read_Tag`, `Write_Tag`, `Read_Tag_Fragmented`, and
-//! `Get_Instance_Attribute_List` against a shared [`TagRegistry`]. Requests
+//! `Read_Tag`, `Write_Tag`, `Read_Tag_Fragmented`,
+//! `Get_Instance_Attribute_List`, `Forward_Open` / `Large_Forward_Open`,
+//! `Forward_Close`, `ListIdentity`, `ListServices`, and connected explicit
+//! messaging (`SendUnitData`) against a shared [`TagRegistry`]. Requests
 //! wrapped in `Unconnected_Send` are unwrapped so scanners that always
 //! prepend a routing envelope still work.
+//!
+//! The encap-level `ListIdentity` (0x0063) handler is what unblocks
+//! pycomm3's `LogixDriver.__enter__`: pycomm3 sends it immediately after
+//! `RegisterSession` to classify the target as Micro800 vs. ControlLogix,
+//! and refuses to proceed without a reply. `Forward_Open` + `SendUnitData`
+//! are what let pycomm3 route tag reads over an explicit Class 3 CIP
+//! connection the way it does against a real Logix controller.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use ethernetip_core::cip::{class_codes as class, service_codes as service, status};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
+use ethernetip_core::device::IdentityInfo;
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path_parse::{parse_epath, PathSegment};
@@ -29,6 +39,10 @@ use crate::walker::{walk, WalkResult};
 pub struct TagServerConfig {
     pub tcp_bind: SocketAddr,
     pub registry: TagRegistry,
+    /// Identity returned on `ListIdentity` (encap 0x63) and on
+    /// `Get_Attributes_All` to the Identity object. pycomm3 inspects the
+    /// product name to pick its Logix vs. Micro800 code path.
+    pub identity: IdentityInfo,
 }
 
 impl TagServerConfig {
@@ -36,12 +50,34 @@ impl TagServerConfig {
         Self {
             tcp_bind: SocketAddr::from(([0, 0, 0, 0], 44818)),
             registry,
+            identity: default_identity(),
         }
     }
 
     pub fn tcp_bind(mut self, addr: SocketAddr) -> Self {
         self.tcp_bind = addr;
         self
+    }
+
+    pub fn identity(mut self, identity: IdentityInfo) -> Self {
+        self.identity = identity;
+        self
+    }
+}
+
+/// Default identity used when the host didn't set one. Serial / product
+/// name match no real device on purpose — keeps the server identifiable
+/// in wireshark but doesn't impersonate a specific Rockwell SKU.
+fn default_identity() -> IdentityInfo {
+    IdentityInfo {
+        vendor_id: 0x0001,
+        device_type: 0x000E, // Programmable Logic Controller
+        product_code: 65,
+        major_revision: 20,
+        minor_revision: 11,
+        status: 0x0030,
+        serial_number: 0x1234_5678,
+        product_name: "EthernetIPRust-TagServer".into(),
     }
 }
 
@@ -65,6 +101,7 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
     let tcp_addr = tcp.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let registry = cfg.registry;
+    let identity = Arc::new(cfg.identity);
     let task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         loop {
@@ -76,8 +113,10 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
                     match accept {
                         Ok((stream, peer)) => {
                             let registry = registry.clone();
+                            let identity = identity.clone();
+                            let local = tcp_addr;
                             tokio::spawn(async move {
-                                if let Err(err) = handle_session(stream, peer, registry).await {
+                                if let Err(err) = handle_session(stream, peer, local, registry, identity).await {
                                     tracing::debug!("session ended: {err}");
                                 }
                             });
@@ -95,13 +134,34 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
     })
 }
 
+/// Per-TCP-session state. One Class 3 explicit-messaging connection at a
+/// time is enough for pycomm3, libplctag, and our own client — if a second
+/// `Forward_Open` arrives we overwrite the slot (and emit a trace), which
+/// mirrors what the Python port does.
+#[derive(Debug, Default)]
+struct SessionConn {
+    /// Target-assigned Originator→Target connection ID. The originator uses
+    /// this value in the Connected Address CPF item on every subsequent
+    /// `SendUnitData` request. Kept for future validation (reject frames
+    /// whose address item doesn't match this id).
+    #[allow(dead_code)]
+    ot_id: u32,
+    /// Originator-assigned Target→Originator connection ID. We stamp this
+    /// into the Connected Address CPF item on every reply so the originator
+    /// can route it to the right handler.
+    to_id: u32,
+}
+
 async fn handle_session(
     mut stream: TcpStream,
     peer: SocketAddr,
+    local: SocketAddr,
     registry: TagRegistry,
+    identity: Arc<IdentityInfo>,
 ) -> Result<()> {
     let session_handle = derive_session_handle(peer);
     let mut header_buf = [0u8; HEADER_LEN];
+    let mut conn: Option<SessionConn> = None;
     loop {
         stream.read_exact(&mut header_buf).await?;
         let header = Header::parse(&header_buf)?;
@@ -110,6 +170,20 @@ async fn handle_session(
             stream.read_exact(&mut payload).await?;
         }
         match header.command {
+            x if x == Command::ListIdentity.as_u16() => {
+                // ListIdentity (0x63) carries no request payload. Reply has
+                // session_handle=0 per CIP Vol. 2 Table 2-4.4. pycomm3's
+                // LogixDriver.__enter__ sends this on every TCP connect to
+                // decide between Logix and Micro800 code paths.
+                let body = build_list_identity_body(local, &identity);
+                let frame = encode_encap(Command::ListIdentity, 0, header.sender_context, &body);
+                stream.write_all(&frame).await?;
+            }
+            x if x == Command::ListServices.as_u16() => {
+                let body = build_list_services_body();
+                let frame = encode_encap(Command::ListServices, 0, header.sender_context, &body);
+                stream.write_all(&frame).await?;
+            }
             x if x == Command::RegisterSession.as_u16() => {
                 let reply = [0x01, 0x00, 0x00, 0x00];
                 write_reply(
@@ -123,7 +197,26 @@ async fn handle_session(
             }
             x if x == Command::UnRegisterSession.as_u16() => return Ok(()),
             x if x == Command::SendRRData.as_u16() => {
-                handle_send_rr_data(&mut stream, &header, &payload, &registry).await?;
+                handle_send_rr_data(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &registry,
+                    &identity,
+                    &mut conn,
+                )
+                .await?;
+            }
+            x if x == Command::SendUnitData.as_u16() => {
+                handle_send_unit_data(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &registry,
+                    &identity,
+                    &conn,
+                )
+                .await?;
             }
             other => {
                 tracing::debug!("unhandled command 0x{:04X}", other);
@@ -131,6 +224,75 @@ async fn handle_session(
             }
         }
     }
+}
+
+/// Build the CPF-wrapped ListIdentity (0x63) reply body.
+///
+/// Wire shape per CIP Vol. 2 §2-4.3:
+///   `[item_count=1][type=0x000C][len:UINT][payload]`
+///
+/// Payload:
+///   `encap_protocol_version:UINT`
+/// + `sin_family:INT_BE` + `sin_port:UINT_BE` + `sin_addr:4 BE` + `sin_zero:8`
+/// + `vendor:UINT` + `device_type:UINT` + `product_code:UINT`
+/// + `major_rev:USINT` + `minor_rev:USINT`
+/// + `status:WORD` + `serial:UDINT`
+/// + `product_name:SHORT_STRING`
+/// + `state:USINT` (0xFF = "unknown but running" — matches the sibling ports)
+fn build_list_identity_body(local: SocketAddr, identity: &IdentityInfo) -> Vec<u8> {
+    let mut item = Vec::with_capacity(64);
+    // Encapsulation protocol version
+    item.extend_from_slice(&1u16.to_le_bytes());
+    // Socket address (big-endian: sin_family + sin_port + sin_addr + 8-byte zero)
+    item.extend_from_slice(&2i16.to_be_bytes());
+    item.extend_from_slice(&local.port().to_be_bytes());
+    let ip_bytes: [u8; 4] = match local {
+        SocketAddr::V4(v4) => v4.ip().octets(),
+        SocketAddr::V6(_) => [0; 4],
+    };
+    item.extend_from_slice(&ip_bytes);
+    item.extend_from_slice(&[0u8; 8]);
+    // Identity attributes
+    item.extend_from_slice(&identity.vendor_id.to_le_bytes());
+    item.extend_from_slice(&identity.device_type.to_le_bytes());
+    item.extend_from_slice(&identity.product_code.to_le_bytes());
+    item.push(identity.major_revision);
+    item.push(identity.minor_revision);
+    item.extend_from_slice(&identity.status.to_le_bytes());
+    item.extend_from_slice(&identity.serial_number.to_le_bytes());
+    let name_bytes = identity.product_name.as_bytes();
+    let name_len = name_bytes.len().min(0xFF) as u8;
+    item.push(name_len);
+    item.extend_from_slice(&name_bytes[..name_len as usize]);
+    item.push(0xFF); // state
+
+    let mut body = Vec::with_capacity(4 + item.len());
+    body.extend_from_slice(&1u16.to_le_bytes()); // item count
+    body.extend_from_slice(&0x000Cu16.to_le_bytes()); // CPF item type: CIP Identity
+    body.extend_from_slice(&(item.len() as u16).to_le_bytes());
+    body.extend_from_slice(&item);
+    body
+}
+
+/// Build the CPF-wrapped ListServices (0x04) reply body. One service entry
+/// advertising "Communications" with the Class 0+1 + Class 3 capability
+/// bits set (0x0120 == supports both CIP-over-UDP I/O and encapsulation
+/// over TCP), which is the shape every Rockwell device returns.
+fn build_list_services_body() -> Vec<u8> {
+    let mut item = Vec::with_capacity(20);
+    item.extend_from_slice(&1u16.to_le_bytes()); // version
+    item.extend_from_slice(&0x0120u16.to_le_bytes()); // capability bitfield
+    let mut name = [0u8; 16];
+    let src = b"Communications";
+    name[..src.len()].copy_from_slice(src);
+    item.extend_from_slice(&name);
+
+    let mut body = Vec::with_capacity(4 + item.len());
+    body.extend_from_slice(&1u16.to_le_bytes()); // item count
+    body.extend_from_slice(&0x0100u16.to_le_bytes()); // CPF item type: ListServices response
+    body.extend_from_slice(&(item.len() as u16).to_le_bytes());
+    body.extend_from_slice(&item);
+    body
 }
 
 fn derive_session_handle(peer: SocketAddr) -> u32 {
@@ -160,6 +322,8 @@ async fn handle_send_rr_data(
     header: &Header,
     payload: &[u8],
     registry: &TagRegistry,
+    identity: &IdentityInfo,
+    conn: &mut Option<SessionConn>,
 ) -> Result<()> {
     let envelope = Envelope::parse(payload)?;
     let mr_item = envelope
@@ -167,7 +331,7 @@ async fn handle_send_rr_data(
         .ok_or_else(|| EipError::Protocol("SendRRData missing UnconnectedData item".into()))?;
     // Unwrap Unconnected_Send if present (service 0x52 to Connection Manager).
     let inner = maybe_unwrap_unconnected_send(&mr_item.data).unwrap_or_else(|| mr_item.data.clone());
-    let mr_reply = dispatch_mr(&inner, registry);
+    let mr_reply = dispatch_mr(&inner, registry, identity, conn, header.session_handle);
 
     let items = [
         Item::null_address(),
@@ -177,6 +341,64 @@ async fn handle_send_rr_data(
     write_reply(
         stream,
         Command::SendRRData,
+        header.session_handle,
+        header.sender_context,
+        &body,
+    )
+    .await
+}
+
+/// `SendUnitData` (encap 0x70) — the Class 3 connected-explicit frame
+/// pycomm3 uses for every tag read/write after `Forward_Open` succeeds.
+///
+/// Wire shape: CPF with `Connected Address` item (type 0xA1, 4-byte O→T
+/// connection id) + `Connected Data` item (type 0xB1, 2-byte sequence +
+/// MR request). The reply replaces the connection id with the T→O id the
+/// originator chose in `Forward_Open` so it can route the response.
+///
+/// If no `Forward_Open` has been seen yet, drop the frame — the sibling
+/// ports reply with `INVALID_SESSION_HANDLE`, but pycomm3 only pulls this
+/// code path after a successful `Forward_Open` so it never trips.
+async fn handle_send_unit_data(
+    stream: &mut TcpStream,
+    header: &Header,
+    payload: &[u8],
+    registry: &TagRegistry,
+    identity: &IdentityInfo,
+    conn: &Option<SessionConn>,
+) -> Result<()> {
+    let envelope = Envelope::parse(payload)?;
+    let data_item = envelope
+        .find(item_type::CONNECTED_DATA)
+        .ok_or_else(|| EipError::Protocol("SendUnitData missing ConnectedData item".into()))?;
+    if data_item.data.len() < 2 {
+        return Err(EipError::Protocol("SendUnitData ConnectedData < 2 bytes".into()));
+    }
+    let seq = u16::from_le_bytes([data_item.data[0], data_item.data[1]]);
+    let mr = &data_item.data[2..];
+    // Connected MR dispatch — same path as unconnected except FwdOpen/Close
+    // are not valid here (pycomm3 never sends them on a connected channel).
+    // We still accept the whole dispatch_mr surface so Multiple_Service_Packet
+    // and other inline services keep working.
+    let mut local_conn: Option<SessionConn> = None;
+    let mr_reply = dispatch_mr(mr, registry, identity, &mut local_conn, header.session_handle);
+
+    let reply_cid = conn.as_ref().map(|c| c.to_id).unwrap_or(0);
+    let mut data = Vec::with_capacity(2 + mr_reply.len());
+    data.extend_from_slice(&seq.to_le_bytes());
+    data.extend_from_slice(&mr_reply);
+
+    let items = [
+        Item::new(
+            item_type::CONNECTED_ADDRESS,
+            reply_cid.to_le_bytes().to_vec(),
+        ),
+        Item::new(item_type::CONNECTED_DATA, data),
+    ];
+    let body = ethernetip_core::cpf::encode_envelope(0, envelope.timeout, &items);
+    write_reply(
+        stream,
+        Command::SendUnitData,
         header.session_handle,
         header.sender_context,
         &body,
@@ -226,7 +448,13 @@ fn maybe_unwrap_unconnected_send(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// Dispatch a fully-unwrapped MR request against the registry and return the
 /// serialized MR reply bytes.
-fn dispatch_mr(mr: &[u8], registry: &TagRegistry) -> Vec<u8> {
+fn dispatch_mr(
+    mr: &[u8],
+    registry: &TagRegistry,
+    identity: &IdentityInfo,
+    conn: &mut Option<SessionConn>,
+    session_handle: u32,
+) -> Vec<u8> {
     let (service_code, path, body) = match split_mr(mr) {
         Some(x) => x,
         None => return build_mr_reply(0x00 | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, &[]),
@@ -243,8 +471,332 @@ fn dispatch_mr(mr: &[u8], registry: &TagRegistry) -> Vec<u8> {
         s if s == service::GET_INSTANCE_ATTRIBUTE_LIST => {
             handle_get_instance_attribute_list(&path, &body, registry)
         }
+        s if s == service::FORWARD_OPEN => {
+            handle_forward_open(&path, &body, conn, session_handle, false)
+        }
+        s if s == service::LARGE_FORWARD_OPEN => {
+            handle_forward_open(&path, &body, conn, session_handle, true)
+        }
+        s if s == service::FORWARD_CLOSE => handle_forward_close(&path, &body, conn),
+        s if s == GET_ATTRIBUTES_ALL => handle_get_attributes_all(&path, identity),
+        s if s == GET_ATTRIBUTE_SINGLE => handle_get_attribute_single(&path, identity),
+        s if s == MULTIPLE_SERVICE_PACKET => {
+            handle_multiple_service_packet(&path, &body, registry, identity, conn, session_handle)
+        }
         other => build_mr_reply(other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, &[]),
     }
+}
+
+const GET_ATTRIBUTES_ALL: u8 = 0x01;
+const GET_ATTRIBUTE_SINGLE: u8 = 0x0E;
+
+/// `Get_Attributes_All` on class 0x01 Identity returns the standard
+/// `ModuleIdentityObject` block pycomm3 decodes in `get_plc_info`. On
+/// class 0x64 Program Name it returns a CIP STRING with the program name,
+/// which pycomm3 reads in `get_plc_name` whenever the target isn't a
+/// Micro800 (Rockwell KB 23341).
+fn handle_get_attributes_all(path: &[u8], identity: &IdentityInfo) -> Vec<u8> {
+    let reply_svc = GET_ATTRIBUTES_ALL | service::REPLY_FLAG;
+    let Some(class_id) = read_class_id(path) else {
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
+    };
+    match class_id {
+        class::IDENTITY => {
+            let body = identity_get_attrs_all_body(identity);
+            build_mr_reply(reply_svc, status::SUCCESS, &body)
+        }
+        0x64 => {
+            // Program Name: single attribute, CIP STRING (UINT length + ASCII).
+            let name = identity.product_name.as_bytes();
+            let mut body = Vec::with_capacity(2 + name.len());
+            body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            body.extend_from_slice(name);
+            build_mr_reply(reply_svc, status::SUCCESS, &body)
+        }
+        _ => build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]),
+    }
+}
+
+/// `Get_Attribute_Single` on class 0x01. Only the few attributes pycomm3
+/// reads directly are implemented; the rest fall through to
+/// `ATTRIBUTE_NOT_SUPPORTED` so a browser that probes the whole table
+/// doesn't take down the session.
+fn handle_get_attribute_single(path: &[u8], identity: &IdentityInfo) -> Vec<u8> {
+    let reply_svc = GET_ATTRIBUTE_SINGLE | service::REPLY_FLAG;
+    let Some(class_id) = read_class_id(path) else {
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
+    };
+    let attr_id = read_attribute_id(path);
+    match (class_id, attr_id) {
+        (class::IDENTITY, Some(1)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &identity.vendor_id.to_le_bytes(),
+        ),
+        (class::IDENTITY, Some(2)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &identity.device_type.to_le_bytes(),
+        ),
+        (class::IDENTITY, Some(3)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &identity.product_code.to_le_bytes(),
+        ),
+        (class::IDENTITY, Some(4)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &[identity.major_revision, identity.minor_revision],
+        ),
+        (class::IDENTITY, Some(5)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &identity.status.to_le_bytes(),
+        ),
+        (class::IDENTITY, Some(6)) => build_mr_reply(
+            reply_svc,
+            status::SUCCESS,
+            &identity.serial_number.to_le_bytes(),
+        ),
+        (class::IDENTITY, Some(7)) => {
+            let name = identity.product_name.as_bytes();
+            let mut body = Vec::with_capacity(1 + name.len());
+            body.push(name.len().min(0xFF) as u8);
+            body.extend_from_slice(&name[..name.len().min(0xFF)]);
+            build_mr_reply(reply_svc, status::SUCCESS, &body)
+        }
+        _ => build_mr_reply(reply_svc, status::ATTRIBUTE_NOT_SUPPORTED, &[]),
+    }
+}
+
+fn identity_get_attrs_all_body(identity: &IdentityInfo) -> Vec<u8> {
+    let name = identity.product_name.as_bytes();
+    let name_len = name.len().min(0xFF);
+    let mut out = Vec::with_capacity(15 + name_len);
+    out.extend_from_slice(&identity.vendor_id.to_le_bytes());
+    out.extend_from_slice(&identity.device_type.to_le_bytes());
+    out.extend_from_slice(&identity.product_code.to_le_bytes());
+    out.push(identity.major_revision);
+    out.push(identity.minor_revision);
+    out.extend_from_slice(&identity.status.to_le_bytes());
+    out.extend_from_slice(&identity.serial_number.to_le_bytes());
+    out.push(name_len as u8);
+    out.extend_from_slice(&name[..name_len]);
+    out
+}
+
+/// Read the class id from the leading 8-bit (0x20) or 16-bit (0x21) class
+/// segment. Attribute path probes come through with the exact same prefix
+/// so this is enough for both.
+fn read_class_id(path: &[u8]) -> Option<u16> {
+    if path.len() < 2 {
+        return None;
+    }
+    match path[0] {
+        0x20 => Some(path[1] as u16),
+        0x21 if path.len() >= 4 => Some(u16::from_le_bytes([path[2], path[3]])),
+        _ => None,
+    }
+}
+
+/// Read the attribute id from a path, if a `30 <id>` or `31 <0> <id:u16>`
+/// attribute segment is present. The attribute segment is always last on
+/// `Get_Attribute_Single` paths.
+fn read_attribute_id(path: &[u8]) -> Option<u16> {
+    // Find the final `30`/`31` segment.
+    let mut i = 0;
+    let mut last: Option<u16> = None;
+    while i < path.len() {
+        match path[i] {
+            0x20 | 0x24 | 0x28 | 0x2C | 0x30 => {
+                if i + 2 > path.len() {
+                    return last;
+                }
+                if path[i] == 0x30 {
+                    last = Some(path[i + 1] as u16);
+                }
+                i += 2;
+            }
+            0x21 | 0x25 | 0x29 | 0x2D | 0x31 => {
+                if i + 4 > path.len() {
+                    return last;
+                }
+                if path[i] == 0x31 {
+                    last = Some(u16::from_le_bytes([path[i + 2], path[i + 3]]));
+                }
+                i += 4;
+            }
+            _ => return last,
+        }
+    }
+    last
+}
+
+/// CIP Multiple_Service_Packet (0x0A). Each sub-service is dispatched
+/// through `dispatch_mr` recursively so Logix tag reads, FwdOpen replies,
+/// and the Symbol Object browse all compose naturally.
+const MULTIPLE_SERVICE_PACKET: u8 = 0x0A;
+
+fn handle_multiple_service_packet(
+    path: &[u8],
+    body: &[u8],
+    registry: &TagRegistry,
+    identity: &IdentityInfo,
+    conn: &mut Option<SessionConn>,
+    session_handle: u32,
+) -> Vec<u8> {
+    let reply_svc = MULTIPLE_SERVICE_PACKET | service::REPLY_FLAG;
+    // Must address Message Router (class 2 instance 1). Any other target is
+    // a client bug — Logix rejects with PATH_SEGMENT_ERROR.
+    if path.len() < 4 || path[0] != 0x20 || path[1] != class::MESSAGE_ROUTER as u8 {
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
+    }
+    if body.len() < 2 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let n = u16::from_le_bytes([body[0], body[1]]) as usize;
+    let needed = 2 + 2 * n;
+    if body.len() < needed {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let mut offsets = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = u16::from_le_bytes([body[2 + 2 * i], body[2 + 2 * i + 1]]) as usize;
+        offsets.push(off);
+    }
+    let mut sub_replies = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = offsets[i];
+        let end = if i + 1 < n { offsets[i + 1] } else { body.len() };
+        if start > body.len() || end > body.len() || start > end {
+            return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+        }
+        let sub = &body[start..end];
+        let r = dispatch_mr(sub, registry, identity, conn, session_handle);
+        sub_replies.push(r);
+    }
+    // Encode: [n:UINT][offset_i*n:UINT][sub_replies concatenated]. Offsets
+    // are relative to the start of this body.
+    let header_len = 2 + 2 * n;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    let mut running = header_len;
+    for r in &sub_replies {
+        out.extend_from_slice(&(running as u16).to_le_bytes());
+        running += r.len();
+    }
+    for r in &sub_replies {
+        out.extend_from_slice(r);
+    }
+    build_mr_reply(reply_svc, status::SUCCESS, &out)
+}
+
+/// Shared handler for `Forward_Open` (0x54) and `Large_Forward_Open` (0x5B).
+///
+/// Request bodies (connection path lives at the end, preceded by a size
+/// byte):
+///
+///   Standard: `[priority:USINT][tick:USINT][OT_id:UDINT][TO_id:UDINT]`
+///             `[conn_serial:UINT][orig_vendor:UINT][orig_serial:UDINT]`
+///             `[timeout_mult:USINT][reserved:3][OT_rpi:UDINT]`
+///             `[OT_params:UINT][TO_rpi:UDINT][TO_params:UINT]`
+///             `[xport_class:USINT][path_size:USINT][padded_epath]`
+///
+///   Large  : identical but `OT_params`/`TO_params` are UDINT.
+///
+/// Reply body: `[OT_id:UDINT][TO_id:UDINT][conn_serial:UINT]`
+///             `[orig_vendor:UINT][orig_serial:UDINT]`
+///             `[OT_api:UDINT][TO_api:UDINT][app_reply_size:USINT][0:USINT]`
+///
+/// The `OT_id` the target returns is the one pycomm3 pins into every
+/// subsequent `SendUnitData` request as the Connected Address.
+fn handle_forward_open(
+    _path: &[u8],
+    body: &[u8],
+    conn: &mut Option<SessionConn>,
+    session_handle: u32,
+    is_large: bool,
+) -> Vec<u8> {
+    let reply_svc = if is_large {
+        service::LARGE_FORWARD_OPEN | service::REPLY_FLAG
+    } else {
+        service::FORWARD_OPEN | service::REPLY_FLAG
+    };
+    // 36 bytes of fixed header before the connection path, 40 for large.
+    // The actual path bytes aren't needed — any reachable path is accepted
+    // for a Class 3 explicit connection; pycomm3 always sends `[20 02 24 01]`
+    // (Message Router), real Logix accepts more.
+    let min = if is_large { 40 } else { 36 };
+    if body.len() < min {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let _priority = body[0];
+    let _ticks = body[1];
+    let _ot_in = u32::from_le_bytes([body[2], body[3], body[4], body[5]]);
+    let to_id = u32::from_le_bytes([body[6], body[7], body[8], body[9]]);
+    let conn_serial = u16::from_le_bytes([body[10], body[11]]);
+    let orig_vendor = u16::from_le_bytes([body[12], body[13]]);
+    let orig_serial = u32::from_le_bytes([body[14], body[15], body[16], body[17]]);
+    let _timeout_mult = body[18];
+    // body[19..22] reserved
+    let ot_rpi = u32::from_le_bytes([body[22], body[23], body[24], body[25]]);
+    // Skip ot_params (2 or 4 bytes), then read to_rpi.
+    let to_rpi_off = if is_large { 30 } else { 28 };
+    let to_rpi = u32::from_le_bytes([
+        body[to_rpi_off],
+        body[to_rpi_off + 1],
+        body[to_rpi_off + 2],
+        body[to_rpi_off + 3],
+    ]);
+
+    // Target-assigned OT. Derive deterministically from the session handle
+    // so wireshark can match connections to sessions by inspection — but
+    // keep it distinct from the session so pycomm3's post-FwdOpen checks
+    // (which compare the CPF address id to _target_cid) actually test the
+    // field.
+    let ot_id = 0x8000_0000 | session_handle.wrapping_add(1);
+    *conn = Some(SessionConn { ot_id, to_id });
+
+    let mut out = Vec::with_capacity(26);
+    out.extend_from_slice(&ot_id.to_le_bytes());
+    out.extend_from_slice(&to_id.to_le_bytes());
+    out.extend_from_slice(&conn_serial.to_le_bytes());
+    out.extend_from_slice(&orig_vendor.to_le_bytes());
+    out.extend_from_slice(&orig_serial.to_le_bytes());
+    out.extend_from_slice(&ot_rpi.to_le_bytes());
+    out.extend_from_slice(&to_rpi.to_le_bytes());
+    out.push(0); // app_reply_size (16-bit words of trailing app data)
+    out.push(0); // reserved
+    build_mr_reply(reply_svc, status::SUCCESS, &out)
+}
+
+/// `Forward_Close` (0x4E). Body: `[priority:USINT][tick:USINT]`
+/// `[conn_serial:UINT][orig_vendor:UINT][orig_serial:UDINT][path_size]`
+/// `[reserved][padded_epath]`.
+///
+/// We tear down the session's connection slot unconditionally — the Rust
+/// server only tracks one Class 3 connection per TCP session anyway — and
+/// mirror the request's triad back so the originator can match the reply.
+fn handle_forward_close(
+    _path: &[u8],
+    body: &[u8],
+    conn: &mut Option<SessionConn>,
+) -> Vec<u8> {
+    let reply_svc = service::FORWARD_CLOSE | service::REPLY_FLAG;
+    if body.len() < 10 {
+        return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+    }
+    let conn_serial = u16::from_le_bytes([body[2], body[3]]);
+    let orig_vendor = u16::from_le_bytes([body[4], body[5]]);
+    let orig_serial = u32::from_le_bytes([body[6], body[7], body[8], body[9]]);
+    *conn = None;
+    let mut out = Vec::with_capacity(10);
+    out.extend_from_slice(&conn_serial.to_le_bytes());
+    out.extend_from_slice(&orig_vendor.to_le_bytes());
+    out.extend_from_slice(&orig_serial.to_le_bytes());
+    out.push(0); // app_reply_size
+    out.push(0); // reserved
+    build_mr_reply(reply_svc, status::SUCCESS, &out)
 }
 
 fn split_mr(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<u8>)> {
@@ -936,21 +1488,38 @@ fn write_whole_tag(entry: &TagEntry, value: &[u8], count: usize, registry: &TagR
 
 fn handle_get_instance_attribute_list(
     path: &[u8],
-    _body: &[u8],
+    body_in: &[u8],
     registry: &TagRegistry,
 ) -> Vec<u8> {
+    let reply_svc = service::GET_INSTANCE_ATTRIBUTE_LIST | service::REPLY_FLAG;
     // Path must at least contain the class segment.
     if path.len() < 4 || path[0] != 0x20 || path[1] != class::SYMBOL_OBJECT as u8 {
-        return build_mr_reply(
-            service::GET_INSTANCE_ATTRIBUTE_LIST | service::REPLY_FLAG,
-            status::PATH_SEGMENT_ERROR,
-            &[],
-        );
+        return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
     }
     let start_instance = match path[2] {
         0x24 => path[3] as u32,
         0x25 if path.len() >= 6 => u16::from_le_bytes([path[4], path[5]]) as u32,
         _ => 0,
+    };
+    // Parse the attribute-id list from the request body. Logix clients send
+    // `[count:UINT][attr_id:UINT * count]`. pycomm3's canonical set is
+    // {1, 2, 3, 5, 6, 8, 10}, our own TagClient sends {1, 2}. The response
+    // emits each entry's fields in the exact order the client asked for.
+    let attr_ids: Vec<u16> = if body_in.len() >= 2 {
+        let count = u16::from_le_bytes([body_in[0], body_in[1]]) as usize;
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 2 + 2 * i;
+            if off + 2 > body_in.len() {
+                break;
+            }
+            ids.push(u16::from_le_bytes([body_in[off], body_in[off + 1]]));
+        }
+        ids
+    } else {
+        // Fall back to the historical pair (name + sym_type) so legacy
+        // callers that omit the attribute list keep working.
+        vec![1, 2]
     };
 
     let entries = registry.browse_entries();
@@ -959,20 +1528,26 @@ fn handle_get_instance_attribute_list(
         .filter(|(inst, _, _)| *inst >= start_instance)
         .peekable();
 
-    // Pack as many entries as we can into a bounded response.
+    // Pack as many entries as we can into a bounded response. Each entry
+    // starts with the UDINT instance id, then one field per requested
+    // attribute. Unknown attribute ids are written as a 4-byte zero so a
+    // careless browser doesn't desync the stream.
     const RESPONSE_CAP: usize = 480;
     let mut body = Vec::new();
     let mut wrote_all = true;
     while let Some(&(inst, ref name, sym_type)) = cursor.peek() {
-        let entry_len = 4 + 2 + name.len() + 2;
+        let entry_len = 4 + attr_ids
+            .iter()
+            .map(|a| attribute_field_len(*a, name))
+            .sum::<usize>();
         if body.len() + entry_len > RESPONSE_CAP {
             wrote_all = false;
             break;
         }
         body.extend_from_slice(&inst.to_le_bytes());
-        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        body.extend_from_slice(name.as_bytes());
-        body.extend_from_slice(&sym_type.to_le_bytes());
+        for &a in &attr_ids {
+            append_attribute_field(&mut body, a, name, sym_type);
+        }
         cursor.next();
     }
     let st = if wrote_all {
@@ -980,11 +1555,50 @@ fn handle_get_instance_attribute_list(
     } else {
         status::PARTIAL_TRANSFER
     };
-    build_mr_reply(
-        service::GET_INSTANCE_ATTRIBUTE_LIST | service::REPLY_FLAG,
-        st,
-        &body,
-    )
+    build_mr_reply(reply_svc, st, &body)
+}
+
+/// Byte length of one attribute's value in a `Get_Instance_Attribute_List`
+/// response. All of pycomm3's canonical attributes are fixed-size except
+/// the Symbol Name (attribute 1), which carries a UINT length header.
+fn attribute_field_len(attr_id: u16, name: &str) -> usize {
+    match attr_id {
+        1 => 2 + name.len(), // STRING (UINT len + ASCII)
+        2 => 2,              // UINT symbol_type
+        3 => 4,              // UDINT symbol_address
+        4 => 4,              // UDINT (reserved)
+        5 => 4,              // UDINT symbol_object_address
+        6 => 4,              // UDINT software_control
+        7 => 4,              // UDINT (reserved)
+        8 => 12,             // [3]UDINT array dimensions
+        10 => 1,             // USINT external_access
+        _ => 4,              // unknown — reserve a slot so the stream stays aligned
+    }
+}
+
+fn append_attribute_field(out: &mut Vec<u8>, attr_id: u16, name: &str, sym_type: u16) {
+    match attr_id {
+        1 => {
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        2 => out.extend_from_slice(&sym_type.to_le_bytes()),
+        3 | 5 | 6 | 4 | 7 => out.extend_from_slice(&0u32.to_le_bytes()),
+        8 => {
+            // Dimensions. Atomic scalars report [0, 0, 0]; this is what a
+            // real controller returns for a non-array tag.
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        10 => {
+            // External Access: 1=ReadOnly, 2=None, 3=ReadWrite. pycomm3
+            // decodes this through its EXTERNAL_ACCESS map; "Read/Write" is
+            // the sane default for a simulator target.
+            out.push(0x03);
+        }
+        _ => out.extend_from_slice(&0u32.to_le_bytes()),
+    }
 }
 
 // Silence the unused Arc import if this file ever loses its last direct use.

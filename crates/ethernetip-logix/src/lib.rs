@@ -29,4 +29,5 @@ pub use template::{
 };
 pub use types::{CipType, TagValue};
 
+pub use ethernetip_core::device::IdentityInfo;
 pub use ethernetip_core::{EipError, Result};

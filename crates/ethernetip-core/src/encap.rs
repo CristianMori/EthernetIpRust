@@ -14,6 +14,14 @@ pub const HEADER_LEN: usize = 24;
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    /// `ListServices` (0x04) — discovery query asking the target to list its
+    /// encapsulation-level services. pycomm3 does not use it against Logix,
+    /// but other browsers hit it as a sanity probe before `RegisterSession`.
+    ListServices = 0x0004,
+    /// `ListIdentity` (0x63) — discovery query returning the Identity object
+    /// attributes. pycomm3's `LogixDriver` sends this on `__enter__` after
+    /// `RegisterSession` and refuses to proceed if the target does not reply.
+    ListIdentity = 0x0063,
     RegisterSession = 0x0065,
     UnRegisterSession = 0x0066,
     SendRRData = 0x006F,

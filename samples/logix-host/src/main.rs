@@ -330,6 +330,28 @@ async fn main() -> Result<()> {
     registry.set_by_name("MyAOI", &aoi_buf)?;
     // ----------------------------------------------------------------------
 
+    // ---- Program-scoped tags ---------------------------------------------
+    // pycomm3 enumerates these when LogixDriver is opened with
+    // init_program_tags=True.  Names and seed values match the sibling
+    // Python port's test_pycomm3_roundtrip.py so one pytest file can target
+    // either host.
+    //   Program:MainProgram.LocalDint   (DINT  = 42)
+    //   Program:MainProgram.LocalReal   (REAL  = 3.14)
+    //   Program:MainProgram.LocalMotor  (Motor UDT: Speed=2.5,
+    //                                    Fault=true, RunCount=99)
+    registry.register_program("MainProgram");
+    registry.add_program_atomic("MainProgram", "LocalDint", CipType::Dint)?;
+    registry.set_program_tag_bytes("MainProgram", "LocalDint", 0, &42i32.to_le_bytes())?;
+    registry.add_program_atomic("MainProgram", "LocalReal", CipType::Real)?;
+    registry.set_program_tag_bytes("MainProgram", "LocalReal", 0, &3.14f32.to_le_bytes())?;
+    registry.add_program_struct_from_template("MainProgram", "LocalMotor", &motor_tpl)?;
+    let mut local_motor_buf = vec![0u8; 12];
+    local_motor_buf[..4].copy_from_slice(&2.5f32.to_le_bytes());
+    local_motor_buf[4] = 1; // Fault = true
+    local_motor_buf[8..12].copy_from_slice(&99i32.to_le_bytes());
+    registry.set_program_tag_bytes("MainProgram", "LocalMotor", 0, &local_motor_buf)?;
+    // ----------------------------------------------------------------------
+
     let identity = IdentityInfo {
         vendor_id: 1,
         device_type: 0x000E,

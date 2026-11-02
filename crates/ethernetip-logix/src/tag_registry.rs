@@ -52,10 +52,18 @@ impl TagEntry {
         self.cip_type.atomic_size()
     }
 
-    /// Bytes per element as the walker sees them (defaults to the atomic size
-    /// when known; falls back to the whole buffer for opaque structs).
+    /// Bytes per element as the walker sees them. Atomics use their fixed
+    /// width; a struct tag divides the backing buffer by its element count
+    /// so a struct array indexes correctly (`MotorArr[1]` lands at offset
+    /// `structure_size`, not `data.len()`).
     pub fn element_size(&self) -> usize {
-        self.atomic_size().unwrap_or(self.data.len())
+        if let Some(sz) = self.atomic_size() {
+            return sz;
+        }
+        if self.cip_type == CipType::Struct && self.element_count > 0 {
+            return self.data.len() / self.element_count as usize;
+        }
+        self.data.len()
     }
 
     /// Resolve the backing template for this tag (None for atomics or when
@@ -221,14 +229,37 @@ impl TagRegistry {
         name: impl Into<String>,
         template: &ServerTemplate,
     ) -> Result<u32> {
-        let sym_type = 0x8000 | (template.instance_id & 0x0FFF);
-        let data = vec![0u8; template.structure_size as usize];
+        self.add_struct_array_from_template(name, template, 1)
+    }
+
+    /// Insert a 1-D struct array backed by a registered template.  Allocates
+    /// `template.structure_size * element_count` bytes.  The dimension bit
+    /// in `sym_type` is set so browse clients see it as an array of UDT.
+    pub fn add_struct_array_from_template(
+        &self,
+        name: impl Into<String>,
+        template: &ServerTemplate,
+        element_count: u32,
+    ) -> Result<u32> {
+        if element_count == 0 {
+            return Err(EipError::Protocol(
+                "struct array element_count must be >= 1".into(),
+            ));
+        }
+        let dims_bits: u16 = if element_count > 1 { 1 } else { 0 };
+        let sym_type = 0x8000 | (template.instance_id & 0x0FFF) | ((dims_bits & 0x03) << 13);
+        let data = vec![0u8; (template.structure_size as usize) * (element_count as usize)];
+        let dims = if element_count > 1 {
+            vec![element_count]
+        } else {
+            Vec::new()
+        };
         self.insert_entry(
             name.into(),
             sym_type,
             CipType::Struct,
-            1,
-            Vec::new(),
+            element_count,
+            dims,
             Some(template.instance_id),
             data,
         )
@@ -492,6 +523,14 @@ impl TagRegistry {
             if template.instance_id >= guard.next_template {
                 guard.next_template = template.instance_id.wrapping_add(1);
             }
+        }
+        // Default the structure handle to the template's own instance id so the
+        // CIP wire layer can round-trip a Write_Tag the client built from the
+        // Get_Attribute_List reply (which carries the handle). Callers that
+        // need a specific handle (CRC-16 off a Logix L5X capture) can set it
+        // on the ServerTemplate before registering.
+        if template.structure_handle == 0 {
+            template.structure_handle = template.instance_id;
         }
         let id = template.instance_id;
         guard.templates.insert(id, Arc::new(template));

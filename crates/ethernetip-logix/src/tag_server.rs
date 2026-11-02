@@ -855,10 +855,12 @@ enum ResolvedPath {
 
 fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath> {
     let (segments, _) = parse_epath(path).ok()?;
-    // Try instance-only shortcut when the path is Class(0x6B) + Instance(N),
-    // optionally followed by an Element segment for array element access
-    // (Symbol Object + Instance + Element — the shape TagClient emits after
-    // BrowseTagsAsync populates the instance cache).
+    // Try instance-form shortcut when the path leads with Class(0x6B) +
+    // Instance(N). Any trailing segments (Element + Symbolic chains for
+    // member drilling) are then handed to the walker so paths like
+    // `MotorArr[1].Speed` and `MotorA.Fault` resolve the same way they do
+    // off a symbolic root. pycomm3 always sends the instance form once
+    // init_tags populates its tag cache.
     if segments.len() >= 2 {
         if let (
             PathSegment::Logical { kind: k1, value: v1 },
@@ -871,29 +873,13 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
                 && matches!(k2, LogicalKind::InstanceId)
             {
                 let entry = registry.get_by_instance(*v2)?;
-                // Trailing Element segment: build a shallow walker result
-                // pointing at that element so Read_Tag / Write_Tag /
-                // Read_Tag_Fragmented all honor the element index.
-                if let Some(PathSegment::Element(idx)) = segments.get(2) {
-                    let element_size = entry
-                        .cip_type
-                        .atomic_size()
-                        .unwrap_or_else(|| entry.element_size());
-                    let type_code = if entry.cip_type == CipType::Struct {
-                        0x02A0
-                    } else {
-                        entry.cip_type as u16
-                    };
-                    let walked = WalkResult {
-                        offset: (*idx as usize) * element_size,
-                        type_code,
-                        element_size,
-                        bit_pos: None,
-                        template: entry.template_id,
-                    };
-                    return Some(ResolvedPath::Controller(entry, Some(walked)));
+                let post: Vec<PathSegment> =
+                    segments.iter().skip(2).cloned().collect();
+                if post.is_empty() {
+                    return Some(ResolvedPath::Controller(entry, None));
                 }
-                return Some(ResolvedPath::Controller(entry, None));
+                let w = walk(&entry, &post, registry).ok()?;
+                return Some(ResolvedPath::Controller(entry, Some(w)));
             }
         }
     }

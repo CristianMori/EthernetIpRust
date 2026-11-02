@@ -75,6 +75,9 @@ pub fn parse_epath(bytes: &[u8]) -> Result<(Vec<PathSegment>, usize)> {
         i += 1;
         let value = match format {
             0 => {
+                if i + 1 > bytes.len() {
+                    break;
+                }
                 let v = bytes[i] as u32;
                 i += 1;
                 v

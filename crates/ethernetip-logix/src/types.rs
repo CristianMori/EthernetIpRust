@@ -29,9 +29,23 @@ pub enum CipType {
     Word = 0x00D2,
     Dword = 0x00D3,
     Lword = 0x00D4,
+    /// CIP SHORT_STRING (Vol 1 §C-6.3): one USINT length byte followed by
+    /// ASCII characters. Distinct from the Logix predefined STRING UDT,
+    /// which is a structure with LEN:DINT + DATA:SINT[82]. Logix controllers
+    /// do not expose application tags as SHORT_STRING, but a Logix-shaped
+    /// symbol service can — Identity attribute 7 (Product Name) is the
+    /// typical place SHORT_STRING appears.
+    ShortString = 0x00DA,
     /// Structure marker; the two bytes following the marker are the CRC handle.
     Struct = 0x02A0,
 }
+
+/// Maximum character count for a SHORT_STRING tag in this server.
+pub const SHORT_STRING_MAX_LENGTH: usize = 80;
+
+/// SHORT_STRING storage size: one USINT length byte + `SHORT_STRING_MAX_LENGTH`
+/// character bytes.
+pub const SHORT_STRING_STORAGE_SIZE: usize = 1 + SHORT_STRING_MAX_LENGTH;
 
 impl CipType {
     pub fn from_u16(code: u16) -> Option<Self> {
@@ -51,6 +65,7 @@ impl CipType {
             0x00D2 => Self::Word,
             0x00D3 => Self::Dword,
             0x00D4 => Self::Lword,
+            0x00DA => Self::ShortString,
             0x02A0 => Self::Struct,
             _ => return None,
         })
@@ -63,6 +78,7 @@ impl CipType {
             Self::Int | Self::Uint | Self::Word => 2,
             Self::Dint | Self::Udint | Self::Real | Self::Dword => 4,
             Self::Lint | Self::Ulint | Self::Lreal | Self::Lword => 8,
+            Self::ShortString => SHORT_STRING_STORAGE_SIZE,
             Self::Struct => return None,
         })
     }
@@ -91,6 +107,8 @@ pub enum TagValue {
     Word(u16),
     Dword(u32),
     Lword(u64),
+    /// CIP SHORT_STRING: ASCII payload (not including the length byte).
+    ShortString(String),
     /// Undecoded structure: caller must know the UDT layout to interpret it.
     Struct { crc: u16, bytes: Vec<u8> },
 }
@@ -113,6 +131,7 @@ impl TagValue {
             Self::Word(_) => CipType::Word,
             Self::Dword(_) => CipType::Dword,
             Self::Lword(_) => CipType::Lword,
+            Self::ShortString(_) => CipType::ShortString,
             Self::Struct { .. } => CipType::Struct,
         }
     }
@@ -132,6 +151,14 @@ impl TagValue {
             Self::Ulint(v) | Self::Lword(v) => v.to_le_bytes().to_vec(),
             Self::Real(v) => v.to_le_bytes().to_vec(),
             Self::Lreal(v) => v.to_le_bytes().to_vec(),
+            Self::ShortString(s) => {
+                let mut out = vec![0u8; SHORT_STRING_STORAGE_SIZE];
+                let ascii = s.as_bytes();
+                let len = ascii.len().min(SHORT_STRING_MAX_LENGTH);
+                out[0] = len as u8;
+                out[1..1 + len].copy_from_slice(&ascii[..len]);
+                out
+            }
             Self::Struct { bytes, .. } => bytes.clone(),
         }
     }
@@ -164,6 +191,25 @@ pub fn decode_read_tag(bytes: &[u8]) -> Result<TagValue> {
             crc,
             bytes: payload[2..].to_vec(),
         });
+    }
+    if ty == CipType::ShortString {
+        if payload.is_empty() {
+            return Err(EipError::Short {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let len = payload[0] as usize;
+        if payload.len() < 1 + len {
+            return Err(EipError::Short {
+                expected: 1 + len,
+                actual: payload.len(),
+            });
+        }
+        let s = std::str::from_utf8(&payload[1..1 + len])
+            .map_err(|_| EipError::Protocol("SHORT_STRING contains non-UTF-8 bytes".into()))?
+            .to_string();
+        return Ok(TagValue::ShortString(s));
     }
     let needed = ty.atomic_size().unwrap();
     if payload.len() < needed {
@@ -208,6 +254,6 @@ pub fn decode_read_tag(bytes: &[u8]) -> Result<TagValue> {
             payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
             payload[7],
         ])),
-        CipType::Struct => unreachable!(),
+        CipType::ShortString | CipType::Struct => unreachable!(),
     })
 }

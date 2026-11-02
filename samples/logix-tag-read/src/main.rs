@@ -135,6 +135,7 @@ fn print_value(name: &str, v: &TagValue) {
         TagValue::Word(x) => println!("  {name} = 0x{x:04X} (WORD)"),
         TagValue::Dword(x) => println!("  {name} = 0x{x:08X} (DWORD)"),
         TagValue::Lword(x) => println!("  {name} = 0x{x:016X} (LWORD)"),
+        TagValue::ShortString(s) => println!("  {name} = {s:?} (SHORT_STRING)"),
         TagValue::Struct { crc, bytes } => {
             println!(
                 "  {name} = struct(crc=0x{crc:04X}, {} bytes)",

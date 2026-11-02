@@ -511,6 +511,17 @@ where
                     slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
                     slice[7],
                 ])),
+                CipType::ShortString => {
+                    // SHORT_STRING member inside a template: decoded as the raw
+                    // 81-byte element. UDT members holding SHORT_STRING are
+                    // uncommon in real Logix UDTs; callers that need the string
+                    // can use `TagEntry::read_sstring` on an atomic SHORT_STRING
+                    // tag instead.
+                    TypedValue::Raw {
+                        type_code: CipType::ShortString as u16,
+                        bytes: slice.to_vec(),
+                    }
+                }
                 CipType::Bool | CipType::Struct => unreachable!(),
             })
         }

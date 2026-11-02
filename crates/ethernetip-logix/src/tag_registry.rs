@@ -614,6 +614,48 @@ impl TagRegistry {
         Ok(inst)
     }
 
+    /// Add a structured (UDT) tag inside a program scope backed by a
+    /// previously-registered template.  Mirrors `add_struct_from_template`
+    /// but places the tag in the per-program table so it is addressable as
+    /// `Program:<prog>.<name>` through the walker path.  The sym_type gets
+    /// the struct bit (0x8000) OR'd with the template's instance id so a
+    /// browse reply flags the entry as a structure and pycomm3 fetches the
+    /// template via Template Object (class 0x6C) in the usual way.
+    pub fn add_program_struct_from_template(
+        &self,
+        program: &str,
+        name: impl Into<String>,
+        template: &ServerTemplate,
+    ) -> Result<u32> {
+        let name = name.into();
+        let sym_type = 0x8000 | (template.instance_id & 0x0FFF);
+        let data = vec![0u8; template.structure_size as usize];
+        let mut guard = self.inner.write().unwrap();
+        let program_entry = guard
+            .programs
+            .get_mut(program)
+            .ok_or_else(|| EipError::Protocol(format!("program `{program}` not registered")))?;
+        if program_entry.tags.contains_key(&name) {
+            return Err(EipError::Protocol(format!(
+                "tag `{name}` already registered in program `{program}`"
+            )));
+        }
+        let inst = program_entry.next_instance;
+        program_entry.next_instance = program_entry.next_instance.wrapping_add(1);
+        let entry = TagEntry {
+            instance: inst,
+            name: name.clone(),
+            sym_type,
+            cip_type: CipType::Struct,
+            element_count: 1,
+            dims: Vec::new(),
+            template_id: Some(template.instance_id),
+            data,
+        };
+        program_entry.tags.insert(name, entry);
+        Ok(inst)
+    }
+
     /// Look up a program-scoped tag by name.
     pub fn get_program_tag(&self, program: &str, name: &str) -> Option<TagEntry> {
         let guard = self.inner.read().unwrap();

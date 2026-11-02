@@ -4,3 +4,8 @@ Cargo.lock.bak
 *.pdb
 .vscode/
 .idea/
+
+# Python test byproducts
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1269,12 +1269,14 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         );
     }
 
-    // Walker path — write into a specific member/element offset (with BOOL bit
-    // handling).  Program-scoped writes also flow through here since both
-    // resolutions produce the same walker result.
+    // Walker path — write into a specific member/element offset (with BOOL
+    // bit handling).  Controller- and program-scoped tags take different
+    // backing-store calls: `set_bytes_at` keys on the global instance id,
+    // which a program-scoped TagEntry does not have (its `instance` is the
+    // program-local id), so program-scoped member writes have to route
+    // through `set_program_tag_bytes(program, name, offset, …)`.
     match resolved {
-        ResolvedPath::Controller(entry, Some(w))
-        | ResolvedPath::Program(_, entry, Some(w)) => {
+        ResolvedPath::Controller(entry, Some(w)) => {
             if let Some(bit) = w.bit_pos {
                 if value.is_empty() {
                     return build_mr_reply(
@@ -1306,6 +1308,71 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             }
             if registry
                 .set_bytes_at(entry.instance, w.offset, &value[..bytes_to_write])
+                .is_err()
+            {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::INVALID_ATTRIBUTE_VALUE,
+                    &[],
+                );
+            }
+            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+        }
+        ResolvedPath::Program(program, entry, Some(w)) => {
+            if let Some(bit) = w.bit_pos {
+                if value.is_empty() {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::NOT_ENOUGH_DATA,
+                        &[],
+                    );
+                }
+                // Read-modify-write the host byte at w.offset inside the
+                // program-scoped tag.  Program scope has no dedicated bit
+                // helper yet — do it inline against the current buffer.
+                let current = registry.get_program_tag(&program, &entry.name);
+                let Some(mut cur) = current else {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::PATH_DESTINATION_UNKNOWN,
+                        &[],
+                    );
+                };
+                if w.offset >= cur.data.len() {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::INVALID_ATTRIBUTE_VALUE,
+                        &[],
+                    );
+                }
+                let mask = 1u8 << bit;
+                if value[0] & 0x01 != 0 {
+                    cur.data[w.offset] |= mask;
+                } else {
+                    cur.data[w.offset] &= !mask;
+                }
+                if registry
+                    .set_program_tag_bytes(&program, &entry.name, w.offset, &cur.data[w.offset..w.offset + 1])
+                    .is_err()
+                {
+                    return build_mr_reply(
+                        service::WRITE_TAG | service::REPLY_FLAG,
+                        status::INVALID_ATTRIBUTE_VALUE,
+                        &[],
+                    );
+                }
+                return build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[]);
+            }
+            let bytes_to_write = count.max(1) * w.element_size;
+            if value.len() < bytes_to_write {
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::NOT_ENOUGH_DATA,
+                    &[],
+                );
+            }
+            if registry
+                .set_program_tag_bytes(&program, &entry.name, w.offset, &value[..bytes_to_write])
                 .is_err()
             {
                 return build_mr_reply(

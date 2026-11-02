@@ -821,6 +821,17 @@ fn atomic_to_typed(v: TagValue) -> TypedValue {
         TagValue::Word(x) => TypedValue::Word(x),
         TagValue::Dword(x) => TypedValue::Dword(x),
         TagValue::Lword(x) => TypedValue::Lword(x),
+        TagValue::ShortString(s) => {
+            let bytes = s.as_bytes();
+            let len = bytes.len().min(crate::types::SHORT_STRING_MAX_LENGTH);
+            let mut raw = vec![0u8; crate::types::SHORT_STRING_STORAGE_SIZE];
+            raw[0] = len as u8;
+            raw[1..1 + len].copy_from_slice(&bytes[..len]);
+            TypedValue::Raw {
+                type_code: CipType::ShortString as u16,
+                bytes: raw,
+            }
+        }
         TagValue::Struct { .. } => {
             unreachable!("atomic_to_typed called with a struct — caller bug")
         }

@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use ethernetip_core::error::{EipError, Result};
 
 use crate::server_template::ServerTemplate;
-use crate::types::CipType;
+use crate::types::{CipType, SHORT_STRING_MAX_LENGTH, SHORT_STRING_STORAGE_SIZE};
 
 /// Combined `sym_type` bits reported for a struct entry — the top bit set
 /// distinguishes structures from atomic types, and the low 12 bits are the
@@ -63,6 +63,39 @@ impl TagEntry {
     /// layer can compute member offsets without a second registry lookup.
     pub fn template(&self, registry: &TagRegistry) -> Option<Arc<ServerTemplate>> {
         self.template_id.and_then(|id| registry.get_template(id))
+    }
+
+    /// True when this tag's CIP type is `SHORT_STRING` (0xDA).
+    pub fn is_sstring(&self) -> bool {
+        self.cip_type == CipType::ShortString
+    }
+
+    /// Read one SHORT_STRING element as a `String`.  Each element occupies
+    /// `SHORT_STRING_STORAGE_SIZE` bytes laid out as `[len:USINT][ASCII..]`.
+    pub fn read_sstring(&self, element_index: usize) -> Result<String> {
+        if !self.is_sstring() {
+            return Err(EipError::Protocol(format!(
+                "tag `{}` is not SHORT_STRING",
+                self.name
+            )));
+        }
+        if element_index >= self.element_count as usize {
+            return Err(EipError::Protocol(format!(
+                "element index {element_index} out of range (count={})",
+                self.element_count
+            )));
+        }
+        let offset = element_index * SHORT_STRING_STORAGE_SIZE;
+        let len = self.data[offset] as usize;
+        if len > SHORT_STRING_MAX_LENGTH {
+            return Err(EipError::Protocol(format!(
+                "SHORT_STRING length byte {len} exceeds max {SHORT_STRING_MAX_LENGTH}"
+            )));
+        }
+        let bytes = &self.data[offset + 1..offset + 1 + len];
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| EipError::Protocol("SHORT_STRING contains non-UTF-8 bytes".into()))
     }
 }
 
@@ -316,6 +349,59 @@ impl TagRegistry {
             return None;
         }
         Some(entry.data[offset..offset + len].to_vec())
+    }
+
+    /// Write one SHORT_STRING element from a `&str`.  Validates ASCII, the
+    /// 80-char cap, element index, and zeros any trailing bytes inside the
+    /// element so a shorter write does not carry garbage from a prior one.
+    pub fn write_sstring(&self, name: &str, element_index: usize, value: &str) -> Result<()> {
+        if value.len() > SHORT_STRING_MAX_LENGTH {
+            return Err(EipError::Protocol(format!(
+                "SHORT_STRING length {} exceeds max {}",
+                value.len(),
+                SHORT_STRING_MAX_LENGTH
+            )));
+        }
+        for b in value.bytes() {
+            if b > 0x7F {
+                return Err(EipError::Protocol(
+                    "SHORT_STRING only accepts ASCII (0x00..0x7F)".into(),
+                ));
+            }
+        }
+
+        let mut guard = self.inner.write().unwrap();
+        let Some(&instance) = guard.by_name.get(name) else {
+            return Err(EipError::Protocol(format!("no such tag `{name}`")));
+        };
+        let entry = guard.by_instance.get_mut(&instance).unwrap();
+        if entry.cip_type != CipType::ShortString {
+            return Err(EipError::Protocol(format!(
+                "tag `{name}` is not SHORT_STRING"
+            )));
+        }
+        if element_index >= entry.element_count as usize {
+            return Err(EipError::Protocol(format!(
+                "element index {element_index} out of range (count={})",
+                entry.element_count
+            )));
+        }
+        let offset = element_index * SHORT_STRING_STORAGE_SIZE;
+        let bytes = value.as_bytes();
+        entry.data[offset] = bytes.len() as u8;
+        entry.data[offset + 1..offset + 1 + bytes.len()].copy_from_slice(bytes);
+        // Zero the trailing capacity so a shorter string does not leave a tail.
+        let tail = offset + 1 + bytes.len();
+        let end = offset + SHORT_STRING_STORAGE_SIZE;
+        if tail < end {
+            for slot in &mut entry.data[tail..end] {
+                *slot = 0;
+            }
+        }
+        if !guard.suppress_events && guard.dirty_tracking {
+            guard.dirty.insert(instance);
+        }
+        Ok(())
     }
 
     /// Atomic bit set/clear on a host byte inside a tag's buffer.  Used by

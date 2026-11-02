@@ -186,11 +186,27 @@ async fn handle_send_rr_data(
 
 /// If the outer MR is an `Unconnected_Send` addressed to the Connection
 /// Manager, return the embedded message; otherwise `None`.
+///
+/// Note: service code 0x52 is shared between `Unconnected_Send` and
+/// `Read_Tag_Fragmented`.  Disambiguation requires the Connection-Manager
+/// path check: a UCMM request always addresses `Class 0x06, Instance 1`,
+/// while `Read_Tag_Fragmented` addresses a Logix tag by symbolic name or
+/// Symbol Object instance (`Class 0x6B`). Without this check, a
+/// fragmented read with a well-formed path looked like a malformed UCMM
+/// and the heuristic unwrap returned a bogus "inner message", which the
+/// dispatcher then rejected with `PATH_SEGMENT_ERROR`.
 fn maybe_unwrap_unconnected_send(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() < 2 {
+    if bytes.len() < 4 {
         return None;
     }
     if bytes[0] != service::UNCONNECTED_SEND {
+        return None;
+    }
+    // The UCMM path addresses the Connection Manager: Class 0x06 Instance 1.
+    // Encoded as [0x20 0x06 0x24 0x01]. If the first logical class segment is
+    // anything else (e.g. Class 0x6B Symbol Object for Read_Tag_Fragmented),
+    // this is a different 0x52 service and must not be unwrapped.
+    if bytes[2] != 0x20 || bytes[3] != class::CONNECTION_MANAGER as u8 {
         return None;
     }
     let path_words = bytes[1] as usize;
@@ -284,7 +300,10 @@ enum ResolvedPath {
 
 fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath> {
     let (segments, _) = parse_epath(path).ok()?;
-    // Try instance-only shortcut when the path is Class(0x6B) + Instance(N).
+    // Try instance-only shortcut when the path is Class(0x6B) + Instance(N),
+    // optionally followed by an Element segment for array element access
+    // (Symbol Object + Instance + Element — the shape TagClient emits after
+    // BrowseTagsAsync populates the instance cache).
     if segments.len() >= 2 {
         if let (
             PathSegment::Logical { kind: k1, value: v1 },
@@ -297,8 +316,28 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
                 && matches!(k2, LogicalKind::InstanceId)
             {
                 let entry = registry.get_by_instance(*v2)?;
-                // No post-root symbolic drilling supported for instance-form paths
-                // (rare and typically used only for whole-tag reads).
+                // Trailing Element segment: build a shallow walker result
+                // pointing at that element so Read_Tag / Write_Tag /
+                // Read_Tag_Fragmented all honor the element index.
+                if let Some(PathSegment::Element(idx)) = segments.get(2) {
+                    let element_size = entry
+                        .cip_type
+                        .atomic_size()
+                        .unwrap_or_else(|| entry.element_size());
+                    let type_code = if entry.cip_type == CipType::Struct {
+                        0x02A0
+                    } else {
+                        entry.cip_type as u16
+                    };
+                    let walked = WalkResult {
+                        offset: (*idx as usize) * element_size,
+                        type_code,
+                        element_size,
+                        bit_pos: None,
+                        template: entry.template_id,
+                    };
+                    return Some(ResolvedPath::Controller(entry, Some(walked)));
+                }
                 return Some(ResolvedPath::Controller(entry, None));
             }
         }
@@ -429,7 +468,7 @@ fn handle_read_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) 
         );
     }
     let _count = u16::from_le_bytes([body[0], body[1]]) as usize;
-    let offset = u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize;
+    let fragment_offset = u32::from_le_bytes([body[2], body[3], body[4], body[5]]) as usize;
     let resolved = match resolve_tag_path(path, registry) {
         Some(r) => r,
         None => {
@@ -440,20 +479,52 @@ fn handle_read_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) 
             );
         }
     };
-    let entry = match resolved {
-        ResolvedPath::Controller(e, _) | ResolvedPath::Program(_, e, _) => e,
+
+    // The walker (symbolic + Element segments, or the instance-form shortcut
+    // for Class 0x6B + Instance + Element) carries the absolute byte offset
+    // of the target element. The fragment offset in the request body is
+    // relative to that; the atomic Read_Tag path already honors this. Before
+    // this fix, Read_Tag_Fragmented was ignoring the walker and reading from
+    // byte 0 of the tag.
+    let (entry, walked) = match resolved {
+        ResolvedPath::Controller(e, w) | ResolvedPath::Program(_, e, w) => (e, w),
     };
+    let (base, type_code, is_struct) = match &walked {
+        Some(w) => {
+            let is_struct = (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
+            (w.offset, w.type_code, is_struct)
+        }
+        None => (
+            0usize,
+            entry.cip_type as u16,
+            entry.cip_type == CipType::Struct,
+        ),
+    };
+
+    let start = base + fragment_offset;
+    if start >= entry.data.len() {
+        return build_mr_reply(
+            service::READ_TAG_FRAGMENTED | service::REPLY_FLAG,
+            status::PATH_DESTINATION_UNKNOWN,
+            &[],
+        );
+    }
     // Cap each chunk so a very large struct is naturally paged.
     const CHUNK: usize = 500;
-    let end = (offset + CHUNK).min(entry.data.len());
+    let end = (start + CHUNK).min(entry.data.len());
     let more = end < entry.data.len();
-    let mut out = Vec::with_capacity(4 + (end - offset));
-    out.extend_from_slice(&(entry.cip_type as u16).to_le_bytes());
-    if entry.cip_type == CipType::Struct {
-        let handle = entry.sym_type & 0x0FFF;
+    let mut out = Vec::with_capacity(4 + (end - start));
+    out.extend_from_slice(&type_code.to_le_bytes());
+    if is_struct {
+        // Prefer the walker's handle (nested struct member) over the tag's
+        // own sym_type when both are available.
+        let handle = match walked {
+            Some(w) => w.type_code & 0x0FFF,
+            None => entry.sym_type & 0x0FFF,
+        };
         out.extend_from_slice(&handle.to_le_bytes());
     }
-    out.extend_from_slice(&entry.data[offset..end]);
+    out.extend_from_slice(&entry.data[start..end]);
     let st = if more {
         status::PARTIAL_TRANSFER
     } else {

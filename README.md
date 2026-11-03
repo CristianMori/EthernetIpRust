@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
 - [CIP Safety details](#cip-safety-details)
 - [Interop matrix](#interop-matrix)
 - [Known limitations](#known-limitations)
+- [Security hardening](#security-hardening)
 - [Related projects](#related-projects)
 - [License](#license)
 
@@ -466,7 +467,7 @@ cargo test -p ethernetip-safety
 
 Requirements: Rust 1.75+ (2021 edition), tokio runtime. `ethernetip-core` defaults the `live-nic` feature on (optional `network-interface` crate; on Windows, `windows-sys` for `GetIfTable2` when that feature is enabled).
 
-The test suite covers CIP path encoding + parsing (round-trips, array indexers, multi-dim, program scope, cache paths), Forward_Open request/response codecs, EPIO frame round-trips (with and without run/idle, CIP sequence roundtrip), safety CRC check values against the reference implementations (S1=0x4C, S2=0xBF, S3=0x9516 for "123456789"; S4=0x340BC6D9), safety frame codec round-trips for every (format, size) combination, safety segment round-trips (target / router / extended), and Forward_Open + CPCRC patching.
+The test suite is 221 tests across the workspace (`cargo test --workspace`). It covers CIP path encoding + parsing (round-trips, array indexers, multi-dim, program scope, cache paths), Forward_Open request/response codecs, EPIO frame round-trips (with and without run/idle, CIP sequence roundtrip), safety CRC check values against the reference implementations (S1=0x4C, S2=0xBF, S3=0x9516 for "123456789"; S4=0x340BC6D9), safety frame codec round-trips for every (format, size) combination, safety segment round-trips (target / router / extended), and Forward_Open + CPCRC patching.
 
 ---
 
@@ -603,6 +604,25 @@ The Rust ↔ C# gap was where the last round of wire-format bugs was found — s
 - **Assembly contents don't survive restart.** Tag values do — use `persistence::save` / `load` for a compact cross-port binary snapshot.
 - **Client-direction safety soaks are not in the interop matrix.** The code path and the `safety-scanner --client` flag exist; the recorded C# soaks are the server direction.
 <!-- TODO: owner — if you have soaked `SafetyScannerConfig::client` against another port or a live safety device, add that row. -->
+
+---
+
+## Security hardening
+
+Six rounds of static security review across the workspace, 28 commits applied on top of the 0.2.0 release. `cargo test --workspace` reports **221 tests passing** after the pass.
+
+Industrial CIP has no authentication or transport encryption — this work doesn't make the library "secure", it closes the specific attack and correctness gaps the review rounds surfaced. Real deployments still need network segmentation (dedicated OT VLAN, no Internet exposure).
+
+Coverage spans both server-side (adapter / target) and client-side (scanner) paths:
+
+- **CIP decoding** — bounds-checked path parse for every EPATH segment format, CPF item count cap, Multiple_Service_Packet recursion depth cap, `Get_Instance_Attribute_List` capped at `MAX_ATTRIBUTE_COUNT` per request.
+- **Tag server** — connection semaphore + idle timeout on `tag_server`, `tag_registry` tolerates poisoned `RwLock` across all read / write / drain paths.
+- **CIP dispatcher** — poison tolerance on the dispatcher's internal mutexes, and service handlers are called outside the dispatcher's lock so a handler panic cannot wedge later requests.
+- **Forward_Open admission** — per-session and global Forward_Open caps in both `ethernetip-connections` and `ethernetip-safety`; T→O connection id seeds are randomized at adapter boot in both crates.
+- **Poison tolerance** — remaining `std::sync::Mutex` sites in the connection manager, Safety Supervisor, and Safety Validator recover from a poisoned guard rather than propagating the panic.
+- **CIP Safety** — TUNID / SCCRC / CPCRC are verified on every safety Forward_Open against the Supervisor's SCID; timestamp rollover is only committed after the CRC check passes (both producer and consumer); the safety segment enforces a format-specific minimum length; Forward_Close removes only a matching (CID, PID, serial) triplet; per-session safety Forward_Open ownership is tracked so a session cannot close another session's connections; Supervisor state transitions happen inside the shared-map lock scope; `SendUnitData` validates the Connected-Address item's connection id against the active session.
+
+No new `unsafe` blocks were added. The workspace still contains one pre-existing `unsafe` block: the Windows `GetIfTable2` call behind the `live-nic` feature in `ethernetip-core`.
 
 ---
 

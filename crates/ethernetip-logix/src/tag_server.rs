@@ -1688,8 +1688,16 @@ fn handle_get_instance_attribute_list(
     // `[count:UINT][attr_id:UINT * count]`. pycomm3's canonical set is
     // {1, 2, 3, 5, 6, 8, 10}, our own TagClient sends {1, 2}. The response
     // emits each entry's fields in the exact order the client asked for.
+    // The Symbol Object only defines a handful of attributes (1..=10), so
+    // any wire-supplied `count` beyond that is either malformed or hostile.
+    // Cap the per-request attribute list so a 16-bit `count` can't drive a
+    // ~128 KB pre-allocation per session.
+    const MAX_ATTRIBUTE_COUNT: usize = 32;
     let attr_ids: Vec<u16> = if body_in.len() >= 2 {
         let count = u16::from_le_bytes([body_in[0], body_in[1]]) as usize;
+        if count > MAX_ATTRIBUTE_COUNT {
+            return build_mr_reply(reply_svc, status::TOO_MUCH_DATA, &[]);
+        }
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
             let off = 2 + 2 * i;

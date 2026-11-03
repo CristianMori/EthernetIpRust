@@ -212,6 +212,28 @@ pub struct ConnectionTable {
 }
 
 impl ConnectionTable {
+    /// Insert `row` under `key`, replacing any prior row at that key.
+    ///
+    /// `next_conn_id.fetch_add` can eventually wrap onto an id that a
+    /// leaked (undropped) row still holds. Letting `HashMap::insert`
+    /// just drop the old row would send its `producer_shutdown` watch
+    /// sender into `Err`-territory WITHOUT ever flipping its value — the
+    /// orphan producer's `tokio::select!` on `shutdown_rx.changed()`
+    /// would then spin at 100% CPU because `*borrow()` still reads
+    /// `false`. Flip the old sender to `true` first so the orphan sees
+    /// a clean shutdown via `*shutdown_rx.borrow() == true` and its
+    /// select loop exits.
+    pub fn insert_replacing(&mut self, key: u32, row: ConnectionRow) {
+        if let Some(prev) = self.rows.remove(&key) {
+            let _ = prev.producer_shutdown.send(true);
+            // The JoinHandle is dropped here — detaching the task,
+            // which is correct: it will observe the shutdown signal
+            // and exit on its own without blocking the FO handler.
+            drop(prev.producer_task);
+        }
+        self.rows.insert(key, row);
+    }
+
     pub fn summaries(&self) -> Vec<ConnectionSummary> {
         self.rows
             .values()
@@ -785,7 +807,11 @@ fn do_process_forward_open_with_safety(
 
     {
         let mut table = lock_recover(connections);
-        table.rows.insert(
+        // Use `insert_replacing` instead of `rows.insert` so a conn-id
+        // collision (e.g. after a counter wrap onto a leaked row) flips
+        // the old producer's shutdown watch to `true` before the row is
+        // replaced, avoiding a 100% CPU spin in the orphan task.
+        table.insert_replacing(
             assigned_oto_t,
             ConnectionRow {
                 o_to_t_conn_id: assigned_oto_t,
@@ -917,6 +943,67 @@ mod tests {
     use super::*;
     use ethernetip_core::cip::{CipDispatcher, CipPath};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn insert_replacing_signals_shutdown_on_prior_row() {
+        // Simulate a conn-id collision: insert a row, then insert
+        // again with the same key. The prior row's producer_shutdown
+        // watch must flip to `true` BEFORE being dropped so the
+        // orphan task's `shutdown_rx.changed() + *borrow() == true`
+        // check exits the select loop instead of spinning at 100% CPU.
+        let mut table = ConnectionTable::default();
+        let peer: SocketAddr = "127.0.0.1:2222".parse().unwrap();
+
+        let (tx1, mut rx1) = watch::channel(false);
+        let task1 = tokio::spawn(async {});
+        let row1 = ConnectionRow {
+            o_to_t_conn_id: 0x8000_0000,
+            t_to_o_conn_id: 1,
+            input_assembly: 100,
+            output_assembly: 102,
+            config_assembly: 0,
+            config_data: Vec::new(),
+            peer_udp: Arc::new(std::sync::RwLock::new(peer)),
+            o_to_t_rpi_us: 10_000,
+            t_to_o_rpi_us: 10_000,
+            connection_serial: 1,
+            originator_vendor: 1,
+            originator_serial: 1,
+            producer_shutdown: tx1,
+            producer_task: task1,
+        };
+        table.insert_replacing(0x8000_0000, row1);
+        assert_eq!(*rx1.borrow(), false);
+
+        let (tx2, _rx2) = watch::channel(false);
+        let task2 = tokio::spawn(async {});
+        let row2 = ConnectionRow {
+            o_to_t_conn_id: 0x8000_0000,
+            t_to_o_conn_id: 2,
+            input_assembly: 100,
+            output_assembly: 102,
+            config_assembly: 0,
+            config_data: Vec::new(),
+            peer_udp: Arc::new(std::sync::RwLock::new(peer)),
+            o_to_t_rpi_us: 10_000,
+            t_to_o_rpi_us: 10_000,
+            connection_serial: 2,
+            originator_vendor: 1,
+            originator_serial: 1,
+            producer_shutdown: tx2,
+            producer_task: task2,
+        };
+        table.insert_replacing(0x8000_0000, row2);
+
+        // The old receiver must now observe the shutdown signal set
+        // to `true` — this is the behaviour that lets the orphan
+        // producer actually break out of its tokio::select! loop.
+        rx1.changed().await.expect("shutdown signal must be deliverable");
+        assert_eq!(*rx1.borrow(), true);
+        // Only one row remains in the table.
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[&0x8000_0000].t_to_o_conn_id, 2);
+    }
 
     #[test]
     fn open_requests_attribute_reads_zero_when_no_counters() {

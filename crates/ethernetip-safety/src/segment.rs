@@ -184,6 +184,26 @@ impl SafetyNetworkSegment {
                 actual: bytes.len(),
             });
         }
+        // The declared data_len is attacker-controlled: a crafted length that
+        // satisfies the generic `total <= bytes.len()` check above can still
+        // be too small for the format-specific parser below (which reaches
+        // deeper into the buffer with constant offsets). Enforce the
+        // minimum on-wire size for the declared format before slicing, or
+        // the fixed-offset reads below panic on a short buffer.
+        let format_min_total = match format {
+            0x00 => 56, // Target format
+            0x01 => 14, // Router format
+            0x02 => 62, // Extended target format
+            // Unknown formats carry only the leader + length + format byte
+            // worth of guaranteed layout — anything beyond is parser-defined.
+            _ => 3,
+        };
+        if total < format_min_total {
+            return Err(EipError::Protocol(format!(
+                "safety segment format 0x{:02X} declares {} bytes, needs at least {}",
+                format, total, format_min_total
+            )));
+        }
 
         let mut seg = SafetyNetworkSegment {
             format,
@@ -305,6 +325,32 @@ mod tests {
         let (back, consumed) = SafetyNetworkSegment::parse(&bytes).unwrap();
         assert_eq!(consumed, 62);
         assert_eq!(back, seg);
+    }
+
+    #[test]
+    fn parse_rejects_short_declared_length_for_extended_format() {
+        // Finding 6 regression: a crafted segment whose data_len_words
+        // satisfies `total <= bytes.len()` but is too small for the
+        // format's fixed layout used to panic inside parse via index
+        // slicing (`&bytes[8..14]` etc.). Build such a buffer — total=10
+        // bytes, format=0x02 (Extended, needs 62) — and confirm parse
+        // returns an Err rather than panicking.
+        let mut bytes = vec![0u8; 10];
+        bytes[0] = SEGMENT_TYPE;
+        bytes[1] = 4; // data_len_words = 4 → total = 10
+        bytes[2] = 0x02; // extended format, needs 62
+        let res = SafetyNetworkSegment::parse(&bytes);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_short_target_format() {
+        // Same panic shape but for format 0x00 which needs 56 bytes.
+        let mut bytes = vec![0u8; 10];
+        bytes[0] = SEGMENT_TYPE;
+        bytes[1] = 4;
+        bytes[2] = 0x00;
+        assert!(SafetyNetworkSegment::parse(&bytes).is_err());
     }
 
     #[test]

@@ -647,23 +647,17 @@ async fn handle_send_rr_data(
         }
         s if s == service::FORWARD_CLOSE => {
             // Parse the originator triplet from the FC body and remove
-            // ONLY the matching row — not every live row on the adapter.
-            // The pre-fix behavior cleared the entire shared HashMap on
-            // any FC, which meant any peer that could complete
-            // RegisterSession + one FC MR packet tore down every live
-            // safety connection on the adapter and transitioned the
-            // Supervisor Executing → Idle.
-            //
-            // TODO: full per-session owned-id tracking (equivalent of
-            // the connections crate's `active_conn_ids` list from
-            // `5dccf8d`) would additionally require the FC's triplet to
-            // belong to a connection THIS session opened. Without that,
-            // a peer who guesses or observes another originator's
-            // triplet can still close that one connection from an
-            // unrelated session. The minimum correctness fix below —
-            // triplet-match + remove-single-row — closes the "any FC
-            // clears everything" vector; the cross-session guess
-            // vector is a separate commit.
+            // ONLY the matching row — and only if that row is one THIS
+            // session Forward_Open'd. The pre-fix behavior cleared the
+            // entire shared HashMap on any FC; the round-4 fix scoped
+            // that to the matching triplet but still matched globally,
+            // so a peer who guessed or observed another originator's
+            // triplet could close that peer's connection from an
+            // unrelated session. CIP has no cross-session identity
+            // tying FC to the originator who opened the connection, so
+            // we enforce it via the per-session active_conn_ids list —
+            // same pattern the connections crate uses
+            // (adapter.rs:552-562).
             if body.len() < 10 {
                 tracing::warn!("safety Forward_Close body too short ({} bytes)", body.len());
                 (s | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, Vec::new())
@@ -683,7 +677,28 @@ async fn handle_send_rr_data(
                     })
                     .map(|row| row.o_to_t_conn_id);
 
-                if let Some(id) = matching_id {
+                // Only close a row the GLOBAL match resolved to that is
+                // also one THIS session owns. Any other hit means the
+                // caller is trying to reach into another session's
+                // connections — reject with 0x0113 ("no more connection
+                // resources") rather than touching that row.
+                let owned_id = matching_id.filter(|id| active_conn_ids.contains(id));
+                if matching_id.is_some() && owned_id.is_none() {
+                    tracing::warn!(
+                        peer=?peer,
+                        "safety Forward_Close rejected: triplet (conn_serial=0x{fc_conn_serial:04X}, \
+                         orig_vendor=0x{fc_orig_vendor:04X}, orig_serial=0x{fc_orig_serial:08X}) \
+                         resolves to connection id {:?} not owned by this session",
+                        matching_id,
+                    );
+                    drop(guard);
+                    reply_ext_status = vec![0x0113];
+                    (
+                        s | service::REPLY_FLAG,
+                        status::CONNECTION_FAILURE,
+                        Vec::new(),
+                    )
+                } else if let Some(id) = owned_id {
                     // Drop the matching Validator instance BEFORE pulling
                     // the row out so we read sv_inst from the row we're
                     // about to remove.
@@ -1743,6 +1758,142 @@ mod tests {
         assert_eq!(surviving.connection_serial, 0x2222);
         assert!(session_a_ids.is_empty());
         assert_eq!(session_b_ids, vec![id_b]);
+    }
+
+    /// Finding 2 regression (round-5 MEDIUM): a Forward_Close whose
+    /// triplet resolves to a connection NOT owned by the current TCP
+    /// session must be rejected with CIP 0x01 ext 0x0113 and must not
+    /// touch the other session's row. CIP has no cross-session identity
+    /// tying FC to the originator who opened the connection, so a peer
+    /// who guesses or observes another originator's triplet could
+    /// otherwise close that peer's connection through its own session.
+    #[tokio::test]
+    async fn safety_fc_rejects_triplet_not_owned_by_session() {
+        let fo_cfg = test_cfg();
+        let wire_a = build_safety_forward_open(
+            &fo_cfg,
+            0x1111,
+            0x0001,
+            0xC0FF_EE01,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let wire_b = build_safety_forward_open(
+            &fo_cfg,
+            0x2222,
+            0x0001,
+            0xC0FF_EE02,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
+        let shared = Mutex::new(std::collections::HashMap::new());
+        let open = AtomicBool::new(false);
+        let next_id = AtomicU32::new(0x8000_0000);
+
+        // Session A opens FO A; session B opens FO B. Each session has
+        // its own `active_conn_ids` list.
+        let mut session_a_ids: Vec<u32> = Vec::new();
+        let (id_a, _) = handle_safety_forward_open(
+            &wire_a.service_data,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect("FO A must verify");
+        session_a_ids.push(id_a);
+        let mut session_b_ids: Vec<u32> = Vec::new();
+        let (id_b, _) = handle_safety_forward_open(
+            &wire_b.service_data,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect("FO B must verify");
+        session_b_ids.push(id_b);
+        assert_eq!(shared.lock().await.len(), 2);
+
+        // Build a Forward_Close MR targeting SESSION B's triplet
+        // (0x2222, 0x0001, 0xC0FF_EE02) and route it through
+        // handle_send_rr_data with SESSION A's active_conn_ids. The
+        // fix must reject with 0x0113 and leave both rows untouched.
+        let mut fc_body = Vec::<u8>::new();
+        fc_body.push(0x05); // priority_tick
+        fc_body.push(0x9C); // timeout_ticks
+        fc_body.extend_from_slice(&0x2222u16.to_le_bytes()); // conn_serial
+        fc_body.extend_from_slice(&0x0001u16.to_le_bytes()); // orig_vendor
+        fc_body.extend_from_slice(&0xC0FF_EE02u32.to_le_bytes()); // orig_serial
+        fc_body.push(0x02); // path_size_words
+        fc_body.push(0x00); // reserved
+        fc_body.extend_from_slice(&[0x20, 0x06, 0x24, 0x01]);
+
+        let path = [0x20u8, 0x06, 0x24, 0x01];
+        let mut mr = Vec::<u8>::new();
+        mr.push(service::FORWARD_CLOSE);
+        mr.push((path.len() / 2) as u8);
+        mr.extend_from_slice(&path);
+        mr.extend_from_slice(&fc_body);
+
+        let envelope = ethernetip_core::cpf::encode_envelope(
+            0,
+            10,
+            &[
+                Item::null_address(),
+                Item::new(item_type::UNCONNECTED_DATA, mr),
+            ],
+        );
+
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let reply_body = handle_send_rr_data(
+            &envelope,
+            SocketAddr::from(([127, 0, 0, 1], 44818)),
+            &udp,
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+            &mut session_a_ids,
+        )
+        .await
+        .expect("handle_send_rr_data must build a reply envelope");
+
+        // Parse the reply envelope and extract the MR reply.
+        let reply_env = ethernetip_core::cpf::Envelope::parse(&reply_body).unwrap();
+        let mr_reply_item = reply_env
+            .find(item_type::UNCONNECTED_DATA)
+            .expect("reply must carry UnconnectedData");
+        let mr_reply = &mr_reply_item.data;
+        assert!(mr_reply.len() >= 6, "mr reply too short: {:?}", mr_reply);
+        let general_status = mr_reply[2];
+        let ext_status_count = mr_reply[3] as usize;
+        let mut ext_status = Vec::<u16>::new();
+        for i in 0..ext_status_count {
+            let lo = mr_reply[4 + i * 2];
+            let hi = mr_reply[4 + i * 2 + 1];
+            ext_status.push(u16::from_le_bytes([lo, hi]));
+        }
+        assert_eq!(general_status, 0x01, "general status must be CONNECTION_FAILURE");
+        assert_eq!(ext_status, vec![0x0113], "ext status must be 0x0113 (no resources / not owned)");
+
+        // Both rows must remain in the shared map.
+        assert_eq!(
+            shared.lock().await.len(),
+            2,
+            "cross-session FC must not touch rows",
+        );
+        // Session A's active_conn_ids must still hold id_a untouched.
+        assert_eq!(session_a_ids, vec![id_a]);
     }
 
     /// Finding 4 companion: tampered TUNID in the FO's safety segment

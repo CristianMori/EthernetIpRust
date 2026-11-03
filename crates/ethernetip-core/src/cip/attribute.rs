@@ -14,9 +14,25 @@
 //!    disjoint copies.
 
 use std::borrow::Cow;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::cip::data_type::CipDataType;
+
+/// `read()` on a `std::sync::RwLock`, recovering transparently from
+/// poisoning. A shared-backed attribute's lock protects a single
+/// `Vec<u8>` whose entire replacement is a single `set_data` call;
+/// there is no half-committed invariant a panicked section could
+/// leave behind. Recovering the inner guard keeps the attribute (and
+/// every CIP service that reads it) usable instead of translating one
+/// panic into a permanent attribute-wide outage.
+fn read_recover<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `write()` variant of [`read_recover`].
+fn write_recover<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Which standard services are allowed against this attribute. A plain
 /// bit-set on a `u8` — no `bitflags` crate dependency for a three-flag enum.
@@ -127,7 +143,7 @@ impl CipAttribute {
     pub fn data(&self) -> Cow<'_, [u8]> {
         match &self.backing {
             Backing::Owned(v) => Cow::Borrowed(v.as_slice()),
-            Backing::Shared(arc) => Cow::Owned(arc.read().unwrap().clone()),
+            Backing::Shared(arc) => Cow::Owned(read_recover(arc).clone()),
         }
     }
 
@@ -135,7 +151,7 @@ impl CipAttribute {
     pub fn len(&self) -> usize {
         match &self.backing {
             Backing::Owned(v) => v.len(),
-            Backing::Shared(arc) => arc.read().unwrap().len(),
+            Backing::Shared(arc) => read_recover(arc).len(),
         }
     }
 
@@ -159,7 +175,7 @@ impl CipAttribute {
                 }
             }
             Backing::Shared(arc) => {
-                let mut g = arc.write().unwrap();
+                let mut g = write_recover(arc);
                 if value.len() != g.len() {
                     *g = value.to_vec();
                 } else {

@@ -19,10 +19,29 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
+
+/// Acquire a `std::sync::Mutex` guard, recovering transparently from
+/// mutex poisoning. The adapter's locks (connection table, peer_udp
+/// slot) have no half-committed invariants that a panicked section
+/// could leave behind, so recovering the inner guard keeps the adapter
+/// responsive instead of translating one panic into a permanent outage.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `read()` variant of [`lock_recover`] for `std::sync::RwLock`.
+fn read_recover<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `write()` variant of [`lock_recover`] for `std::sync::RwLock`.
+fn write_recover<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 use ethernetip_core::cip::{service_codes as service, status, CipDispatcher, CipPath};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
@@ -684,7 +703,7 @@ impl ProducerState {
                         data,
                     };
                     let bytes = epio::encode_frame(&frame);
-                    let peer = *self.peer_udp.read().unwrap();
+                    let peer = *read_recover(&self.peer_udp);
                     if let Err(err) = self.udp.send_to(&bytes, peer).await {
                         tracing::warn!("producer send failed: {err}");
                     }
@@ -725,7 +744,7 @@ impl ConsumerState {
                         }
                     };
                     let target = {
-                        let table = self.connections.lock().unwrap();
+                        let table = lock_recover(&self.connections);
                         table.rows
                             .values()
                             .find(|row| row.o_to_t_conn_id == frame.connection_id)
@@ -736,9 +755,9 @@ impl ConsumerState {
                         // typically ephemeral, not the well-known 2222. The
                         // producer reads this on every tick so T→O lands where
                         // the scanner is actually listening.
-                        let cur = *peer_udp_shared.read().unwrap();
+                        let cur = *read_recover(&peer_udp_shared);
                         if cur != sender {
-                            *peer_udp_shared.write().unwrap() = sender;
+                            *write_recover(&peer_udp_shared) = sender;
                         }
                         // Truncate/pad the incoming data to the assembly size, in
                         // case the scanner sends a larger payload than we host.

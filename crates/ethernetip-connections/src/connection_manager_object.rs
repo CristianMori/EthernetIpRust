@@ -244,7 +244,7 @@ impl ConnectionTable {
                 t_to_o_rpi_us: r.t_to_o_rpi_us,
                 input_assembly: r.input_assembly,
                 output_assembly: r.output_assembly,
-                peer_udp: *r.peer_udp.read().unwrap(),
+                peer_udp: *r.peer_udp.read().unwrap_or_else(|e| e.into_inner()),
             })
             .collect()
     }

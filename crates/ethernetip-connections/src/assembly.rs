@@ -6,9 +6,25 @@
 //! movement.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ethernetip_core::error::{EipError, Result};
+
+/// `read()` on a `std::sync::RwLock`, recovering transparently from
+/// poisoning. The assembly registry's state is append/replace-only
+/// (`HashMap<u16, Assembly>` + per-assembly fixed-size `Vec<u8>`), so
+/// there is no half-committed invariant a panicked section could leave
+/// behind. Recovering the inner guard keeps the registry (and every
+/// Class 1 I/O loop that depends on it) usable instead of translating
+/// one panic into a permanent assembly-wide outage.
+fn read_recover<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `write()` variant of [`read_recover`].
+fn write_recover<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// What role an assembly plays inside a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +92,7 @@ impl AssemblyRegistry {
     /// assemblies with the same instance would silently collide, so we make
     /// the second registration fail loudly.
     pub fn insert(&self, asm: Assembly) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = write_recover(&self.inner);
         if guard.contains_key(&asm.instance) {
             return Err(EipError::Protocol(format!(
                 "assembly instance {} already registered",
@@ -89,14 +105,14 @@ impl AssemblyRegistry {
 
     /// Look up an assembly by instance id and clone the current snapshot.
     pub fn snapshot(&self, instance: u16) -> Option<Assembly> {
-        self.inner.read().unwrap().get(&instance).cloned()
+        read_recover(&self.inner).get(&instance).cloned()
     }
 
     /// Replace the data buffer of an existing assembly. Returns
     /// `EipError::Protocol` if the instance is not registered or the buffer
     /// length doesn't match.
     pub fn update(&self, instance: u16, data: &[u8]) -> Result<()> {
-        let guard = self.inner.read().unwrap();
+        let guard = read_recover(&self.inner);
         let Some(asm) = guard.get(&instance) else {
             return Err(EipError::Protocol(format!(
                 "assembly instance {} not registered",
@@ -111,35 +127,31 @@ impl AssemblyRegistry {
                 data.len()
             )));
         }
-        asm.data.write().unwrap().copy_from_slice(data);
+        write_recover(&asm.data).copy_from_slice(data);
         Ok(())
     }
 
     /// Read out the current data of an assembly.
     pub fn read(&self, instance: u16) -> Option<Vec<u8>> {
-        self.inner
-            .read()
-            .unwrap()
+        read_recover(&self.inner)
             .get(&instance)
-            .map(|a| a.data.read().unwrap().clone())
+            .map(|a| read_recover(&a.data).clone())
     }
 
     /// Return the shared byte handle for an assembly so a caller (typically
     /// a `CipAttribute::new_shared`) can point at the same bytes.
     pub fn shared_buffer(&self, instance: u16) -> Option<Arc<RwLock<Vec<u8>>>> {
-        self.inner
-            .read()
-            .unwrap()
+        read_recover(&self.inner)
             .get(&instance)
             .map(|a| a.shared_buffer())
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        read_recover(&self.inner).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        read_recover(&self.inner).is_empty()
     }
 }
 

@@ -65,7 +65,11 @@ pub fn add_instance_shared(
     instance_id: u32,
     shared: Arc<RwLock<Vec<u8>>>,
 ) {
-    let data_size = shared.read().unwrap().len();
+    // Recover from a poisoned shared buffer the same way the attribute
+    // layer's accessors do — the buffer holds only the raw assembly
+    // bytes and has no half-committed invariant for a panicked writer
+    // to have left behind, so a poisoned lock here is harmless.
+    let data_size = shared.read().unwrap_or_else(|e| e.into_inner()).len();
     let inst = cls.create_instance(instance_id);
     inst.add_attribute(CipAttribute::from_u16(
         1,

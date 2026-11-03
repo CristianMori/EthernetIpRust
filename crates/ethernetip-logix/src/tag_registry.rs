@@ -301,10 +301,14 @@ impl TagRegistry {
             )));
         }
         let instance = guard.next_instance;
-        guard.next_instance = guard.next_instance.wrapping_add(1);
-        // Order matters: publish to by_instance BEFORE by_name so a concurrent
-        // reader that resolves the tag by name always sees a fully-published
-        // instance-id entry (mirrors the C# gap-7 fix).
+        // Build the entry first, then publish to both maps, then bump the
+        // allocator. HashMap::insert is infallible, so once we start the two
+        // inserts there is no reachable panic between them — a panic earlier
+        // (building `entry`) leaves `next_instance` untouched, so we can't
+        // orphan a by_instance row with a bumped counter. Order between the
+        // two inserts still matters: publish to by_instance BEFORE by_name so
+        // a concurrent reader that resolves the tag by name always sees a
+        // fully-published instance-id entry (mirrors the C# gap-7 fix).
         let entry = TagEntry {
             instance,
             name: name.clone(),
@@ -317,6 +321,7 @@ impl TagRegistry {
         };
         guard.by_instance.insert(instance, entry);
         guard.by_name.insert(name, instance);
+        guard.next_instance = instance.wrapping_add(1);
         Ok(instance)
     }
 

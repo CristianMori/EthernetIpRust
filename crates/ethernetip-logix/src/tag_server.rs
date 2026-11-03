@@ -172,11 +172,12 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
 /// mirrors what the Python port does.
 #[derive(Debug, Default)]
 struct SessionConn {
-    /// Target-assigned Originator→Target connection ID. The originator uses
-    /// this value in the Connected Address CPF item on every subsequent
-    /// `SendUnitData` request. Kept for future validation (reject frames
-    /// whose address item doesn't match this id).
-    #[allow(dead_code)]
+    /// Target-assigned Originator→Target connection ID. The originator must
+    /// place this value in the Connected Address CPF item of every
+    /// subsequent `SendUnitData` request; `handle_send_unit_data` checks
+    /// the incoming id against this field and drops the frame on mismatch
+    /// so a peer sharing the TCP session cannot route explicit messages
+    /// through someone else's Forward_Open.
     ot_id: u32,
     /// Originator-assigned Target→Originator connection ID. We stamp this
     /// into the Connected Address CPF item on every reply so the originator
@@ -410,6 +411,40 @@ async fn handle_send_unit_data(
     conn: &Option<SessionConn>,
 ) -> Result<()> {
     let envelope = Envelope::parse(payload)?;
+    // Validate that the Connected Address CPF item names the connection
+    // that was established by Forward_Open on THIS session. A peer sharing
+    // the TCP session (or a hostile re-use of session_handle) could
+    // otherwise stuff an arbitrary conn id in the address item and the
+    // server would process the request as if it belonged to the real
+    // connection. Drop the frame on mismatch — pycomm3 never sends a
+    // SendUnitData with the wrong address item, so this is purely a
+    // defensive gate against a misbehaving / malicious peer.
+    if let Some(conn) = conn.as_ref() {
+        let addr_item = envelope
+            .find(item_type::CONNECTED_ADDRESS)
+            .ok_or_else(|| EipError::Protocol(
+                "SendUnitData missing ConnectedAddress item".into(),
+            ))?;
+        if addr_item.data.len() < 4 {
+            return Err(EipError::Protocol(
+                "SendUnitData ConnectedAddress < 4 bytes".into(),
+            ));
+        }
+        let incoming_ot_id = u32::from_le_bytes([
+            addr_item.data[0],
+            addr_item.data[1],
+            addr_item.data[2],
+            addr_item.data[3],
+        ]);
+        if incoming_ot_id != conn.ot_id {
+            tracing::warn!(
+                "SendUnitData dropped: Connected Address id 0x{:08X} does not match session ot_id 0x{:08X}",
+                incoming_ot_id,
+                conn.ot_id,
+            );
+            return Ok(());
+        }
+    }
     let data_item = envelope
         .find(item_type::CONNECTED_DATA)
         .ok_or_else(|| EipError::Protocol("SendUnitData missing ConnectedData item".into()))?;

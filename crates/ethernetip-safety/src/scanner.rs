@@ -789,20 +789,24 @@ impl ConsumerState {
 
         // Peek at the timestamp BEFORE the CRC-S5 seed depends on the
         // rollover count — a wrap detected here has to bump the counter
-        // before verification.
+        // before verification. Compute a CANDIDATE rollover; only commit
+        // it to `client.rollover` after the decoder reports Ok. A spoofed
+        // UDP packet with a crafted timestamp lacks the PID seed → the
+        // decoder fails, and the committed state stays intact. Without
+        // this gate, one spoofed packet with a crafted timestamp bumps
+        // the rollover count permanently and every subsequent legitimate
+        // frame then fails CRC with the wrong seed.
         let ts = frame_codec::extract_timestamp(payload, data_len, client.format);
-        let rollover_now = {
-            let mut rs = client.rollover.lock().await;
+        let candidate_rollover = {
+            let rs = client.rollover.lock().await;
+            let mut candidate = rs.rollover_count;
             if rs.initialized {
                 let delta = ts as i32 - rs.last_ts as i32;
                 if delta < -0x4000 {
-                    rs.rollover_count = rs.rollover_count.wrapping_add(1);
+                    candidate = candidate.wrapping_add(1);
                 }
-            } else {
-                rs.initialized = true;
             }
-            rs.last_ts = ts;
-            rs.rollover_count
+            candidate
         };
 
         let result = frame_codec::decode(
@@ -812,8 +816,18 @@ impl ConsumerState {
             client.target_pid_s1,
             client.target_pid_s3,
             client.target_pid_s5,
-            rollover_now,
+            candidate_rollover,
         );
+
+        // Commit rollover + ts only on a successful decode. On an error
+        // (crafted frame, CRC fail) leave the per-connection rollover
+        // state unchanged so the legitimate stream stays in sync.
+        if result.is_ok() {
+            let mut rs = client.rollover.lock().await;
+            rs.rollover_count = candidate_rollover;
+            rs.last_ts = ts;
+            rs.initialized = true;
+        }
 
         // Mode byte lives right after the data bytes.
         let mode_byte = payload.get(data_len).copied().unwrap_or(0);

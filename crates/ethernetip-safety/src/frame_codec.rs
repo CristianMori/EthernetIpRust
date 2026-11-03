@@ -58,6 +58,13 @@ pub fn wire_size(data_length: usize, _format: SafetyFormat) -> usize {
 /// rollover count folds into the seed), so the safety validator peels the
 /// timestamp off up front, decides whether the target's counter rolled, and
 /// then verifies with the right seeds.
+///
+/// Short-buffer fallback returns 0 — the subsequent [`decode`] call sees the
+/// same undersized buffer and reports [`SafetyDecodeError::TooShort`]. Callers
+/// MUST commit any derived rollover / last-timestamp state ONLY after a
+/// successful decode: a crafted short frame that reaches this function
+/// otherwise feeds a spurious 0 into their delta math and desynchronizes
+/// the per-connection rollover tracker.
 pub fn extract_timestamp(input: &[u8], data_len: usize, _format: SafetyFormat) -> u16 {
     let is_short = data_len <= 2;
     // Layout: data + mode + a_crc(2) + [comp(data_len) if long] + [s5_lo(2) if ext long] +
@@ -681,6 +688,84 @@ mod tests {
                 | SafetyDecodeError::ActualDataCrc
                 | SafetyDecodeError::ComplementDataCrc
         ));
+    }
+
+    /// Finding 2 regression: a crafted frame carrying a timestamp that
+    /// would trigger a rollover-count increment MUST NOT desync the
+    /// per-connection rollover tracker when the CRC fails to verify. The
+    /// adapter / scanner use a candidate-rollover + commit-on-Ok pattern
+    /// to enforce this; this test verifies the primitive it relies on —
+    /// that a CRC fail is detectable BEFORE the committed state would
+    /// have to change, so callers can gate their state update on the
+    /// decode result.
+    #[test]
+    fn crafted_frame_crc_fail_does_not_require_state_mutation() {
+        let data = [10u8, 20, 30, 40, 50, 60, 70, 80];
+        let ts_legit: u16 = 0xFFF0;
+        let mut buf = vec![0u8; wire_size(data.len(), SafetyFormat::Extended)];
+        encode(
+            &mut buf,
+            &data,
+            SafetyFormat::Extended,
+            ModeByte::build(true, 0),
+            ts_legit,
+            PID_S1,
+            PID_S3,
+            PID_S5,
+            0,
+        );
+
+        // Simulated connection state before the attack: rollover_count=0,
+        // last_ts near the top of the 16-bit window — the target's wrap
+        // is imminent, so a legitimate wrap would push ts to a small value.
+        let committed_rollover: u16 = 0;
+        let committed_last_ts: u16 = 0xFFF0;
+
+        // Craft a packet: real-looking shape, but ts = 0x0010 (looks like
+        // a legitimate wrap vs the committed 0xFFF0) so a naive "advance
+        // rollover before verify" pipeline would bump rollover_count to 1
+        // and overwrite last_ts. Everything else is garbage — the attacker
+        // doesn't have PID_S5, so S5 won't match.
+        let mut crafted = buf.clone();
+        let ts_bytes = 0x0010u16.to_le_bytes();
+        // ts at offset 2*data_len+5 for extended-long per extract_timestamp
+        let ts_off = 2 * data.len() + 5;
+        crafted[ts_off] = ts_bytes[0];
+        crafted[ts_off + 1] = ts_bytes[1];
+        // zero the s5_hi byte so the S5 almost-certainly fails.
+        let s5_hi_off = ts_off + 2;
+        crafted[s5_hi_off] = 0x00;
+
+        // Extract the "candidate" rollover the caller WOULD use before CRC.
+        let ts_peek = extract_timestamp(&crafted, data.len(), SafetyFormat::Extended);
+        let mut candidate = committed_rollover;
+        if (ts_peek as i32 - committed_last_ts as i32) < -0x4000 {
+            candidate = candidate.wrapping_add(1);
+        }
+        // The attack's candidate SHOULD trip the wrap heuristic.
+        assert_eq!(candidate, 1, "candidate should propose rollover++");
+
+        // Decode with the candidate rollover: must fail (attacker lacks PID_S5).
+        let dec = decode(
+            &crafted,
+            data.len(),
+            SafetyFormat::Extended,
+            PID_S1,
+            PID_S3,
+            PID_S5,
+            candidate,
+        );
+        assert!(dec.is_err(), "crafted frame must fail CRC verification");
+
+        // Caller policy: commit ONLY on Ok. Verify the committed state is
+        // still the legitimate one — the attacker couldn't move it.
+        let (final_rollover, final_ts) = if dec.is_ok() {
+            (candidate, ts_peek)
+        } else {
+            (committed_rollover, committed_last_ts)
+        };
+        assert_eq!(final_rollover, 0, "rollover must NOT desync on CRC fail");
+        assert_eq!(final_ts, 0xFFF0, "last_ts must NOT desync on CRC fail");
     }
 
     #[test]

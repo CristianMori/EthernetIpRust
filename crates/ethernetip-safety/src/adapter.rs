@@ -953,23 +953,34 @@ impl ConsumerLoop {
 
         // Peek at the timestamp before verifying the CRC so the rollover
         // counter can be advanced first if the target wrapped.
+        //
+        // State-update rule: compute `candidate_rollover` / `candidate_ts`
+        // locally and run the decoder with the candidate rollover. ONLY
+        // commit `conn.rollover_count` / `conn.last_ts` after the decoder
+        // reports Ok. A spoofed UDP packet with a crafted timestamp lacks
+        // the PID seed → the decoder fails, and we leave the rollover
+        // state intact. Without this gate, one spoofed packet with a
+        // crafted timestamp bumps `rollover_count` and overwrites
+        // `last_ts` before CRC verification, permanently desynchronizing
+        // the legitimate stream (every subsequent legitimate frame then
+        // fails CRC with the wrong seed).
         let this_ts = frame_codec::extract_timestamp(&frame.data, data_len, conn_format);
 
-        let rollover_now = {
-            let mut guard = self.shared.lock().await;
-            let Some(conn) = guard.get_mut(&frame.connection_id) else { return };
+        let (candidate_rollover, prev_last_ts, prev_initialized) = {
+            let guard = self.shared.lock().await;
+            let Some(conn) = guard.get(&frame.connection_id) else { return };
+            let mut candidate = conn.rollover_count;
             if conn.rollover_initialized {
                 let delta = this_ts as i32 - conn.last_ts as i32;
                 if delta < -0x4000 {
-                    conn.rollover_count = conn.rollover_count.wrapping_add(1);
+                    candidate = candidate.wrapping_add(1);
                 }
-            } else {
-                conn.rollover_initialized = true;
             }
-            conn.last_ts = this_ts;
-            conn.rollover_count
+            (candidate, conn.last_ts, conn.rollover_initialized)
         };
+        let _ = prev_last_ts;
 
+        let mut used_rollover = candidate_rollover;
         let mut result = frame_codec::decode(
             &frame.data,
             data_len,
@@ -977,17 +988,17 @@ impl ConsumerLoop {
             seeds.0,
             seeds.1,
             seeds.2,
-            rollover_now,
+            candidate_rollover,
         );
 
         // Idle-frame fallback: the C# scanner emits a few idle frames with
         // rollover_count=0 (its struct default) before its consumer flips to
         // run and adopts initial_rollover_value. Retry with 0 when the first
         // attempt failed AND the mode byte says idle AND we're not already at 0.
-        if result.is_err() && rollover_now != 0 && wire_len > data_len {
+        if result.is_err() && candidate_rollover != 0 && wire_len > data_len {
             let mode_byte = frame.data[data_len];
             if mode_byte & 0x80 == 0 {
-                result = frame_codec::decode(
+                let retry = frame_codec::decode(
                     &frame.data,
                     data_len,
                     conn_format,
@@ -996,8 +1007,31 @@ impl ConsumerLoop {
                     seeds.2,
                     0,
                 );
+                if retry.is_ok() {
+                    used_rollover = 0;
+                    result = retry;
+                }
             }
         }
+
+        // Commit rollover + ts only on a successful decode. On an error
+        // (crafted frame, CRC fail) leave the per-connection rollover
+        // state unchanged so the legitimate stream stays in sync.
+        if result.is_ok() {
+            let mut guard = self.shared.lock().await;
+            if let Some(conn) = guard.get_mut(&frame.connection_id) {
+                conn.rollover_count = used_rollover;
+                conn.last_ts = this_ts;
+                conn.rollover_initialized = true;
+            }
+        } else {
+            // Keep the "prev_initialized" value — nothing changes.
+            let _ = prev_initialized;
+        }
+
+        // `rollover_now` is kept around to preserve downstream logging
+        // behavior that previously read the committed rollover.
+        let rollover_now = used_rollover;
 
         match result {
             Ok(DecodedFrame { actual_data, mode, timestamp, .. }) => {

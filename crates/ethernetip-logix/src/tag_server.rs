@@ -1861,6 +1861,13 @@ fn handle_template_get_attribute_list(
     let Some(instance) = read_instance_id(path) else {
         return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
     };
+    // The wire EPATH can carry a 32-bit instance id but Logix template ids
+    // are 16 bits. Reject anything above u16::MAX explicitly instead of
+    // letting `as u16` silently truncate — otherwise `0x0001_0001` would
+    // alias to template `0x0001` on a lookup that should have failed.
+    if instance > u32::from(u16::MAX) {
+        return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
+    }
     let Some(tpl) = registry.get_template(instance as u16) else {
         return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
     };
@@ -1926,6 +1933,11 @@ fn handle_template_read(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec
     let Some(instance) = read_instance_id(path) else {
         return build_mr_reply(reply_svc, status::PATH_SEGMENT_ERROR, &[]);
     };
+    // Same guard as handle_template_get_attribute_list: a 32-bit wire id
+    // above u16::MAX must not silently truncate to a valid 16-bit template.
+    if instance > u32::from(u16::MAX) {
+        return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
+    }
     let Some(tpl) = registry.get_template(instance as u16) else {
         return build_mr_reply(reply_svc, status::OBJECT_DOES_NOT_EXIST, &[]);
     };

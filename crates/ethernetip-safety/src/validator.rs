@@ -94,11 +94,24 @@ impl SafetyValidatorInstanceState {
 /// runtime state tracker is held separately on the validator object so
 /// callers can update rollover / counters without going through the CIP
 /// attribute layer.
+/// Upper bound on the Safety Validator instance id the allocator will
+/// ever hand out. The on-wire path narrows the instance id back down to
+/// a `u16` (`target_connection_serial` in the SafetyAppReply and the
+/// `sv_inst` field on the active-connection record), so letting a u32
+/// id ever exceed 0xFFFF would silently alias a different instance's
+/// id on remove — `remove_instance_via_dispatcher(sv_inst)` would
+/// target the wrong id and leak the real instance. Rust-port policy is
+/// "fail loud at the wire boundary" — refuse the allocation here so
+/// the FO path can reject the Forward_Open with a CIP resource error
+/// instead of accepting it and later misrouting the close.
+pub const MAX_SAFETY_VALIDATOR_ID: u32 = u16::MAX as u32;
+
 #[derive(Debug)]
 pub struct SafetyValidatorObject {
     cip_class: Option<CipClass>,
     /// Monotonic instance-id allocator. Starts at 0 so the first allocated
-    /// instance is 1 (matches C#).
+    /// instance is 1 (matches C#). Capped at [`MAX_SAFETY_VALIDATOR_ID`]
+    /// so an id can always round-trip through the wire's u16 fields.
     next_instance_id: Arc<Mutex<u32>>,
     /// Runtime state for every allocated instance, keyed by instance id.
     /// Not visible via CIP today; kept here so a follow-up integration
@@ -132,8 +145,11 @@ impl SafetyValidatorObject {
     /// Returns the assigned instance id.
     pub fn create_instance_local(&mut self, init: SafetyValidatorInstanceState) -> Option<u32> {
         // Allocate the id before the &mut CipClass borrow so both borrows
-        // don't overlap.
-        let id = self.alloc_instance_id();
+        // don't overlap. `alloc_instance_id` returns `None` once the
+        // counter has used up the u16 half of the id space (see
+        // [`MAX_SAFETY_VALIDATOR_ID`]), which is the only correct answer
+        // once a later `sv_inst as u16` would alias a different id.
+        let id = self.alloc_instance_id()?;
         let cls = self.cip_class.as_mut()?;
         let inst = cls.create_instance(id);
         inst.add_attribute(CipAttribute::from_u8(
@@ -160,7 +176,12 @@ impl SafetyValidatorObject {
         dispatcher: &CipDispatcher,
         init: SafetyValidatorInstanceState,
     ) -> Option<u32> {
-        let id = self.alloc_instance_id();
+        // See `create_instance_local` — the allocator refuses to go past
+        // [`MAX_SAFETY_VALIDATOR_ID`], which forces the FO handler to
+        // reject the Forward_Open with a CIP resource error instead of
+        // silently aliasing an existing id through the wire's u16
+        // `target_connection_serial`.
+        let id = self.alloc_instance_id()?;
         let ok = dispatcher.with_class_mut(class_codes::SAFETY_VALIDATOR, |cls| {
             let inst = cls.create_instance(id);
             inst.add_attribute(CipAttribute::from_u8(
@@ -219,10 +240,19 @@ impl SafetyValidatorObject {
         }
     }
 
-    fn alloc_instance_id(&self) -> u32 {
+    fn alloc_instance_id(&self) -> Option<u32> {
         let mut g = lock_recover(&self.next_instance_id);
+        // Refuse the allocation when the next id would exceed what the
+        // on-wire `target_connection_serial: u16` can carry — see
+        // [`MAX_SAFETY_VALIDATOR_ID`]. The counter is left at its cap
+        // so every subsequent call also fails, which is the correct
+        // bounded-total behaviour for a safety device that can't
+        // forget old instances until a FC removes them.
+        if *g >= MAX_SAFETY_VALIDATOR_ID {
+            return None;
+        }
         *g += 1;
-        *g
+        Some(*g)
     }
 }
 
@@ -291,6 +321,49 @@ mod tests {
         let r = dispatcher.dispatch(0x0E, path, Vec::new());
         assert_eq!(r.general_status, status::SUCCESS);
         assert_eq!(r.data, vec![0]);
+    }
+
+    #[test]
+    fn alloc_instance_id_refuses_past_u16_max() {
+        // The on-wire path narrows the instance id to a u16 twice
+        // (SafetyAppReply.target_connection_serial, ActiveConnection.sv_inst),
+        // so letting a u32 id climb past u16::MAX would silently alias a
+        // different instance's id on remove. The allocator must therefore
+        // return None once it reaches MAX_SAFETY_VALIDATOR_ID, and every
+        // subsequent call must also return None — the counter is parked
+        // at its cap, not reset.
+        let val = SafetyValidatorObject::new();
+        {
+            let mut g = lock_recover(&val.next_instance_id);
+            *g = MAX_SAFETY_VALIDATOR_ID - 1;
+        }
+        // Last legal id.
+        assert_eq!(val.alloc_instance_id(), Some(MAX_SAFETY_VALIDATOR_ID));
+        // Past the cap: every subsequent allocation refused.
+        assert_eq!(val.alloc_instance_id(), None);
+        assert_eq!(val.alloc_instance_id(), None);
+        // Counter is still parked at the cap.
+        assert_eq!(*lock_recover(&val.next_instance_id), MAX_SAFETY_VALIDATOR_ID);
+    }
+
+    #[test]
+    fn create_instance_via_dispatcher_rejects_past_u16_max() {
+        // End-to-end on the public API: a validator whose counter has
+        // already reached the cap refuses to hand out a new instance,
+        // and the CIP class picks up no row (so the FO handler can turn
+        // the None into a CIP resource error).
+        let mut val = SafetyValidatorObject::new();
+        let dispatcher = Arc::new(CipDispatcher::new());
+        {
+            let mut g = lock_recover(&val.next_instance_id);
+            *g = MAX_SAFETY_VALIDATOR_ID;
+        }
+        dispatcher.register_class(val.into_cip_class());
+        let id = val.create_instance_via_dispatcher(
+            &dispatcher,
+            SafetyValidatorInstanceState::default(),
+        );
+        assert_eq!(id, None);
     }
 
     #[test]

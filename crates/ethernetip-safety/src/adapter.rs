@@ -972,18 +972,33 @@ async fn handle_safety_forward_open(
     // FO and use its id; otherwise fall back to a hard-coded 1 (older
     // Rust adapter behavior — kept so callers without a validator still
     // interop against clients that always talk to instance 1).
+    //
+    // The validator's allocator caps itself at `MAX_SAFETY_VALIDATOR_ID`
+    // (= u16::MAX) because the wire's `target_connection_serial` field
+    // and `ActiveConnection.sv_inst` round-trip the id through 16 bits.
+    // A `None` here therefore means "no more connection resources":
+    // reject the Forward_Open with CIP 0x01 ext 0x0100 instead of
+    // silently reusing a stale id.
     let target_connection_serial: u16 = match (cfg.validator.as_ref(), cfg.dispatcher.as_ref())
     {
-        (Some(v), Some(d)) => v
-            .create_instance_via_dispatcher(
-                d,
-                SafetyValidatorInstanceState {
-                    state: SafetyValidatorState::Executing,
-                    ..Default::default()
-                },
-            )
-            .map(|id| id as u16)
-            .unwrap_or(1),
+        (Some(v), Some(d)) => match v.create_instance_via_dispatcher(
+            d,
+            SafetyValidatorInstanceState {
+                state: SafetyValidatorState::Executing,
+                ..Default::default()
+            },
+        ) {
+            Some(id) => id as u16,
+            None => {
+                tracing::warn!(
+                    "safety Forward_Open rejected: safety validator instance pool exhausted",
+                );
+                return Err(EipError::Cip {
+                    status: 0x01,
+                    ext: vec![0x0100],
+                });
+            }
+        },
         _ => 1,
     };
 

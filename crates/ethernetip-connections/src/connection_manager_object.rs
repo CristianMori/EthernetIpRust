@@ -67,6 +67,15 @@ use crate::forward_open::{
     ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
 };
 
+/// Hard cap on the total number of simultaneous Class 1 connections the
+/// Connection Manager will keep in its table. A single misbehaving (or
+/// hostile) scanner that opens Forward_Opens without ever closing them
+/// would otherwise balloon the row map and the pool of spawned producer
+/// tasks without bound until the process runs out of memory or UDP sockets.
+/// `0x0113` ("No more connection resources") is the CIP-standard reject
+/// extended status for exactly this condition.
+pub const MAX_TOTAL_CONNECTIONS: usize = 256;
+
 // -------------------- counters --------------------
 
 /// Live counter block backing the Connection Manager's instance-1 attrs.
@@ -469,6 +478,46 @@ impl ConnectionManagerObject {
         lock_recover(&self.connections).summaries()
     }
 
+    /// Find the T→O connection id of a row whose originator triplet
+    /// matches the given `(connection_serial, originator_vendor,
+    /// originator_serial)`. Returns `None` when no row matches. Used by
+    /// the adapter's Forward_Close path to identify which of the
+    /// session's active connections the FC refers to when a session owns
+    /// several.
+    pub fn find_by_triplet(
+        &self,
+        connection_serial: u16,
+        originator_vendor: u16,
+        originator_serial: u32,
+    ) -> Option<u32> {
+        let table = lock_recover(&self.connections);
+        table
+            .rows
+            .values()
+            .find(|row| {
+                row.connection_serial == connection_serial
+                    && row.originator_vendor == originator_vendor
+                    && row.originator_serial == originator_serial
+            })
+            .map(|row| row.o_to_t_conn_id)
+    }
+
+    /// Signal shutdown + remove the row for `o_to_t_conn_id`. Returns
+    /// `true` when the id was present. Used by the adapter's session
+    /// teardown path to drop every connection a session still owns when
+    /// the TCP socket closes without an explicit Forward_Close — without
+    /// this each unmatched Forward_Open would leak its row and its
+    /// spawned producer task.
+    pub fn remove_connection(&self, o_to_t_conn_id: u32) -> bool {
+        let mut table = lock_recover(&self.connections);
+        if let Some(row) = table.rows.remove(&o_to_t_conn_id) {
+            let _ = row.producer_shutdown.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Process a Forward_Open request. Parses the body, validates the
     /// assembly path against the registry, allocates a T→O connection id,
     /// spawns the producer task via the registered spawner, and inserts
@@ -622,6 +671,8 @@ fn do_process_forward_open_with_safety(
 
     // Duplicate-triad check — a second FO with the same
     // (connSerial, origVendor, origSerial) is a "Connection In Use" (0x0100).
+    // Combined with the global per-table cap so a hostile peer can't
+    // exhaust the row map or the pool of spawned producer tasks.
     {
         let table = lock_recover(connections);
         for row in table.rows.values() {
@@ -635,6 +686,13 @@ fn do_process_forward_open_with_safety(
                     ext: vec![0x0100], // Connection In Use / Duplicate Forward Open
                 });
             }
+        }
+        if table.rows.len() >= MAX_TOTAL_CONNECTIONS {
+            counters.record_open_resource_reject();
+            return Err(EipError::Cip {
+                status: 0x01,      // CONNECTION_FAILURE
+                ext: vec![0x0113], // No more connection resources available
+            });
         }
     }
 
@@ -669,9 +727,7 @@ fn do_process_forward_open_with_safety(
     // listening on (typically ephemeral, not 2222).
     let peer_udp = Arc::new(std::sync::RwLock::new(ctx.peer_udp));
 
-    let spawner = producer_spawner
-        .lock()
-        .unwrap()
+    let spawner = lock_recover(producer_spawner)
         .as_ref()
         .cloned()
         .ok_or_else(|| {
@@ -1101,5 +1157,91 @@ mod tests {
         assert_eq!(r.general_status, status::SUCCESS);
         assert_eq!(connections_handle.lock().unwrap().rows.len(), 1);
         assert_eq!(counters_handle.open_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn fo_rejected_when_table_at_global_cap() {
+        // Simulate a connection table that's already at
+        // MAX_TOTAL_CONNECTIONS by pre-populating it with dummy rows.
+        // A fresh FO should come back with CIP 0x01 / ext 0x0113 instead
+        // of being inserted — otherwise a hostile peer could balloon the
+        // table and the pool of spawned producer tasks indefinitely.
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+
+        // Fill the table to the cap with placeholder rows. They use a
+        // disjoint originator triplet range so the real FO's duplicate
+        // check doesn't false-positive.
+        let connections = cm.connections();
+        {
+            let mut table = connections.lock().unwrap();
+            for i in 0..MAX_TOTAL_CONNECTIONS {
+                let (shutdown_tx, _rx) = watch::channel(false);
+                let id = 0x7000_0000 + i as u32;
+                table.rows.insert(
+                    id,
+                    ConnectionRow {
+                        o_to_t_conn_id: id,
+                        t_to_o_conn_id: id,
+                        input_assembly: 100,
+                        output_assembly: 102,
+                        config_assembly: 0,
+                        config_data: Vec::new(),
+                        peer_udp: Arc::new(std::sync::RwLock::new(
+                            "127.0.0.1:0".parse().unwrap(),
+                        )),
+                        o_to_t_rpi_us: 10_000,
+                        t_to_o_rpi_us: 10_000,
+                        connection_serial: i as u16,
+                        originator_vendor: 0xBEEF,
+                        originator_serial: i as u32,
+                        producer_shutdown: shutdown_tx,
+                        producer_task: tokio::spawn(async {}),
+                    },
+                );
+            }
+        }
+
+        let err = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap_err();
+        match err {
+            EipError::Cip { status: s, ext } => {
+                assert_eq!(s, 0x01);
+                assert_eq!(ext, vec![0x0113]);
+            }
+            other => panic!("expected Cip{{0x01, [0x0113]}}, got {other:?}"),
+        }
+        // Table unchanged — the rejected FO must not have inserted or
+        // spawned anything.
+        assert_eq!(cm.connection_count(), MAX_TOTAL_CONNECTIONS);
+    }
+
+    #[tokio::test]
+    async fn find_by_triplet_and_remove_connection() {
+        let cm = ConnectionManagerObject::new();
+        install_noop_spawner(&cm);
+        let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let ctx = ForwardOpenContext {
+            peer_udp: "127.0.0.1:44818".parse().unwrap(),
+            assemblies: make_asm_registry(),
+            udp,
+            run_idle: true,
+        };
+        let resp = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap();
+        // build_test_fo_body uses conn serial 0x1111 / vendor 0x0001 /
+        // serial 0xC0FFEE01.
+        let found = cm.find_by_triplet(0x1111, 0x0001, 0xC0FFEE01);
+        assert_eq!(found, Some(resp.o_to_t_connection_id));
+        let not_found = cm.find_by_triplet(0x2222, 0x0001, 0xC0FFEE01);
+        assert_eq!(not_found, None);
+        assert!(cm.remove_connection(resp.o_to_t_connection_id));
+        assert_eq!(cm.connection_count(), 0);
+        assert!(!cm.remove_connection(resp.o_to_t_connection_id));
     }
 }

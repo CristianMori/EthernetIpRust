@@ -35,7 +35,7 @@ use crate::connection_manager_object::{
     ProducerSpawnArgs,
 };
 use crate::epio::{self, Frame};
-use crate::forward_open::{ForwardCloseResponse, ForwardOpenResponse};
+use crate::forward_open::{ForwardCloseRequest, ForwardCloseResponse, ForwardOpenResponse};
 
 /// Default cyclic I/O UDP port (well-known EtherNet/IP value).
 pub const IO_UDP_PORT: u16 = 2222;
@@ -51,6 +51,16 @@ pub const MAX_CONCURRENT_SESSIONS: usize = 64;
 /// keep-alive gap and short enough that a parked idle session can't hold a
 /// slot forever.
 pub const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard cap on the number of simultaneous Class 1 connections a single
+/// TCP session is allowed to Forward_Open. Without a per-session cap a
+/// single misbehaving (or hostile) scanner could burn through 100 000
+/// Forward_Opens on one socket and leak that many `ConnectionRow`s and
+/// spawned producer tasks before the global
+/// [`ConnectionManagerObject::MAX_TOTAL_CONNECTIONS`] cap kicks in. 16
+/// matches the practical fan-out of real scanners and is deliberately
+/// well below the global cap so one session can never starve the rest.
+pub const MAX_FORWARD_OPENS_PER_SESSION: usize = 16;
 
 /// Configuration for an [`Adapter`].
 #[derive(Debug, Clone)]
@@ -294,7 +304,7 @@ impl AcceptState {
                         peer_udp_port: self.peer_udp_port,
                         dispatcher: self.dispatcher.clone(),
                         session_handle: 0,
-                        active_conn_id: None,
+                        active_conn_ids: Vec::new(),
                     };
                     tokio::spawn(async move {
                         session.run().await;
@@ -316,7 +326,12 @@ struct SessionState {
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
     session_handle: u32,
-    active_conn_id: Option<u32>,
+    /// Every T→O connection id this session has successfully opened and
+    /// not yet closed. A session can hold up to
+    /// [`MAX_FORWARD_OPENS_PER_SESSION`] of these; on session teardown
+    /// each one is removed from the CM so the matching producer task
+    /// shuts down and the connection row leaves the global table.
+    active_conn_ids: Vec<u32>,
 }
 
 impl SessionState {
@@ -359,17 +374,14 @@ impl SessionState {
             }
         }
         // TCP session ended without an explicit Forward_Close (peer
-        // dropped the socket, or the loop broke on error). Remove the
-        // dangling connection through the CM so its producer task shuts
-        // down and the row leaves the table.
-        if let Some(id) = self.active_conn_id.take() {
-            let table = self.cm.connections();
-            let mut table = table.lock().unwrap();
-            if let Some(row) = table.rows.remove(&id) {
-                let _ = row.producer_shutdown.send(true);
-                // Task shuts down on its own tick — we drop the
-                // JoinHandle rather than blocking on it.
-            }
+        // dropped the socket, or the loop broke on error). Remove every
+        // connection this session still owned through the CM so their
+        // producer tasks shut down and the rows leave the table —
+        // otherwise a session that FO'd several connections and dropped
+        // without closing any of them would leak that many rows and
+        // tasks until process exit.
+        for id in self.active_conn_ids.drain(..) {
+            let _ = self.cm.remove_connection(id);
         }
     }
 
@@ -421,49 +433,99 @@ impl SessionState {
         let mut reply_ext_status: Vec<u16> = Vec::new();
         let (reply_service, reply_status, reply_body) = match service_code {
             s if s == service::FORWARD_OPEN => {
-                // Scanner may have advertised its UDP endpoint in a Sockaddr
-                // Info T→O CPF item — use it (with 0.0.0.0 falling back to
-                // the TCP peer IP) instead of the hard default peer:2222.
-                let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
-                    &envelope,
-                    item_type::SOCKADDR_INFO_T_TO_O,
-                    self.peer.ip(),
-                    self.peer_udp_port,
-                );
-                let ctx = ForwardOpenContext {
-                    peer_udp,
-                    assemblies: self.assemblies.clone(),
-                    udp: self.udp.clone(),
-                    run_idle: self.run_idle,
-                };
-                match self.cm.process_forward_open(&body, &ctx) {
-                    Ok(resp) => {
-                        include_sockaddr_reply = true;
-                        self.active_conn_id = Some(resp.o_to_t_connection_id);
-                        (
-                            service::FORWARD_OPEN | service::REPLY_FLAG,
-                            status::SUCCESS,
-                            resp.encode(),
-                        )
-                    }
-                    Err(err) => {
-                        tracing::warn!("Forward_Open rejected: {err}");
-                        (
-                            service::FORWARD_OPEN | service::REPLY_FLAG,
-                            status::CONNECTION_FAILURE,
-                            Vec::new(),
-                        )
+                // Per-session cap: a single TCP session must not be able
+                // to burn through unbounded Forward_Opens and leak that
+                // many rows + spawned producer tasks. Reject before even
+                // calling into the CM so the global table and the task
+                // pool stay bounded on hostile input.
+                if self.active_conn_ids.len() >= MAX_FORWARD_OPENS_PER_SESSION {
+                    tracing::warn!(
+                        peer=?self.peer,
+                        "Forward_Open rejected: session already holds {} connections (cap {})",
+                        self.active_conn_ids.len(),
+                        MAX_FORWARD_OPENS_PER_SESSION,
+                    );
+                    // 0x0113 = "No more connection resources" — the CIP
+                    // standard reject code for this exact condition.
+                    reply_ext_status = vec![0x0113];
+                    (
+                        service::FORWARD_OPEN | service::REPLY_FLAG,
+                        status::CONNECTION_FAILURE,
+                        Vec::new(),
+                    )
+                } else {
+                    // Scanner may have advertised its UDP endpoint in a
+                    // Sockaddr Info T→O CPF item — use it (with 0.0.0.0
+                    // falling back to the TCP peer IP) instead of the
+                    // hard default peer:2222.
+                    let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
+                        &envelope,
+                        item_type::SOCKADDR_INFO_T_TO_O,
+                        self.peer.ip(),
+                        self.peer_udp_port,
+                    );
+                    let ctx = ForwardOpenContext {
+                        peer_udp,
+                        assemblies: self.assemblies.clone(),
+                        udp: self.udp.clone(),
+                        run_idle: self.run_idle,
+                    };
+                    match self.cm.process_forward_open(&body, &ctx) {
+                        Ok(resp) => {
+                            include_sockaddr_reply = true;
+                            self.active_conn_ids.push(resp.o_to_t_connection_id);
+                            (
+                                service::FORWARD_OPEN | service::REPLY_FLAG,
+                                status::SUCCESS,
+                                resp.encode(),
+                            )
+                        }
+                        Err(EipError::Cip { status: s, ext }) => {
+                            tracing::warn!("Forward_Open rejected: CIP 0x{s:02X} ext={ext:?}");
+                            reply_ext_status = ext;
+                            (
+                                service::FORWARD_OPEN | service::REPLY_FLAG,
+                                s,
+                                Vec::new(),
+                            )
+                        }
+                        Err(err) => {
+                            tracing::warn!("Forward_Open rejected: {err}");
+                            (
+                                service::FORWARD_OPEN | service::REPLY_FLAG,
+                                status::CONNECTION_FAILURE,
+                                Vec::new(),
+                            )
+                        }
                     }
                 }
             }
             s if s == service::FORWARD_CLOSE => {
-                let active = self.active_conn_id.take();
-                match self.cm.process_forward_close(&body, active) {
-                    Ok(resp) => (
-                        service::FORWARD_CLOSE | service::REPLY_FLAG,
-                        status::SUCCESS,
-                        resp.encode(),
+                // The FC body carries the originator triplet
+                // (connection_serial, originator_vendor, originator_serial).
+                // Resolve which of this session's active connections it
+                // refers to by querying the CM for a matching row; fall
+                // back to the first id when the parse fails so the
+                // single-connection common case still works.
+                let active = match ForwardCloseRequest::decode(&body) {
+                    Ok(req) => self.cm.find_by_triplet(
+                        req.connection_serial,
+                        req.originator_vendor,
+                        req.originator_serial,
                     ),
+                    Err(_) => self.active_conn_ids.first().copied(),
+                };
+                match self.cm.process_forward_close(&body, active) {
+                    Ok(resp) => {
+                        if let Some(id) = active {
+                            self.active_conn_ids.retain(|x| *x != id);
+                        }
+                        (
+                            service::FORWARD_CLOSE | service::REPLY_FLAG,
+                            status::SUCCESS,
+                            resp.encode(),
+                        )
+                    }
                     Err(_) => (
                         service::FORWARD_CLOSE | service::REPLY_FLAG,
                         status::CONNECTION_FAILURE,

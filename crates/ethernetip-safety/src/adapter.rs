@@ -506,15 +506,20 @@ async fn handle_session(
             }
         }
     }
+    // Transition the Supervisor back to Idle inside the same lock
+    // scope as the drain so a concurrent FO on another session can't
+    // insert between `is_empty()` and the transition.
     let now_empty = guard.is_empty();
+    if now_empty {
+        if let (Some(sup), Some(disp)) = (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref()) {
+            sup.transition_idle_via(disp);
+        }
+    }
     drop(guard);
     // `connection_open` reflects whether ANY session holds a live
     // connection, so flip it only when the last row disappeared.
     if now_empty {
         connection_open.store(false, Ordering::Relaxed);
-        if let (Some(sup), Some(disp)) = (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref()) {
-            sup.transition_idle_via(disp);
-        }
     }
     Ok(())
 }
@@ -624,18 +629,12 @@ async fn handle_send_rr_data(
                             sockaddr_reply_bytes = Some(sa);
                         }
                     }
-                    // Supervisor state transition: Idle → Executing on
-                    // the FIRST accepted safety connection. Subsequent
-                    // FOs don't re-transition (state stays Executing
-                    // as long as any connection is live).
-                    if let (Some(sup), Some(disp)) =
-                        (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref())
-                    {
-                        let is_first = shared.lock().await.len() == 1;
-                        if is_first {
-                            sup.transition_executing_via(disp);
-                        }
-                    }
+                    // Supervisor Idle → Executing is performed INSIDE
+                    // handle_safety_forward_open, in the same lock
+                    // scope as the shared-map insert, so concurrent FOs
+                    // on different sessions can't race past the
+                    // transition. No work here beyond the state
+                    // bookkeeping already done above.
                     (s | service::REPLY_FLAG, status::SUCCESS, reply)
                 }
                 Err(err) => {
@@ -714,16 +713,23 @@ async fn handle_send_rr_data(
                     // Supervisor back to Idle when the LAST row is gone.
                     // A session that holds several safety connections
                     // and closes one of them must keep the others live.
+                    // The Executing → Idle transition runs INSIDE the
+                    // same lock scope as the remove so a racing FO on
+                    // another session can't insert between `is_empty()`
+                    // and the transition and leave the Supervisor stuck
+                    // in Idle while a live connection exists.
                     let is_empty_now = guard.is_empty();
-                    drop(guard);
-                    active_conn_ids.retain(|x| *x != id);
                     if is_empty_now {
-                        connection_open.store(false, Ordering::Relaxed);
                         if let (Some(sup), Some(disp)) =
                             (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref())
                         {
                             sup.transition_idle_via(disp);
                         }
+                    }
+                    drop(guard);
+                    active_conn_ids.retain(|x| *x != id);
+                    if is_empty_now {
+                        connection_open.store(false, Ordering::Relaxed);
                     }
                     let mut r = Vec::with_capacity(10);
                     r.extend_from_slice(&body[2..10]);
@@ -1096,27 +1102,46 @@ async fn handle_safety_forward_open(
 
     // Register the active connection so consumer / TCOO tasks pick it up.
     // peer_udp came from the caller (Sockaddr Info T→O or fallback default).
-    shared.lock().await.insert(assigned_oto_t, ActiveConnection {
-        o_to_t_conn_id: assigned_oto_t,
-        t_to_o_conn_id,
-        peer_udp,
-        format,
-        pid_seed_s1,
-        pid_seed_s3,
-        pid_seed_s5,
-        cid_seed_s3,
-        cid_seed_s5,
-        input_data_len: cfg.input_data_size,
-        sv_inst: target_connection_serial as u32,
-        connection_serial,
-        orig_vendor,
-        orig_serial,
-        production_start: Instant::now(),
-        rollover_count: initial_rollover,
-        last_ts: 0,
-        rollover_initialized: false,
-        last_ping: 0xFF,
-    });
+    //
+    // The Supervisor Idle → Executing transition runs INSIDE the same
+    // lock scope as the insert so two concurrent Forward_Opens on
+    // different sessions can't both observe `len() > 1` after inserting
+    // and leave the Supervisor stuck in Idle. The previous code acquired
+    // the lock twice — once here to insert, once in the caller to read
+    // `len()` for the transition — which race-condition'd for exactly
+    // that reason.
+    let mut guard = shared.lock().await;
+    guard.insert(
+        assigned_oto_t,
+        ActiveConnection {
+            o_to_t_conn_id: assigned_oto_t,
+            t_to_o_conn_id,
+            peer_udp,
+            format,
+            pid_seed_s1,
+            pid_seed_s3,
+            pid_seed_s5,
+            cid_seed_s3,
+            cid_seed_s5,
+            input_data_len: cfg.input_data_size,
+            sv_inst: target_connection_serial as u32,
+            connection_serial,
+            orig_vendor,
+            orig_serial,
+            production_start: Instant::now(),
+            rollover_count: initial_rollover,
+            last_ts: 0,
+            rollover_initialized: false,
+            last_ping: 0xFF,
+        },
+    );
+    let is_first = guard.len() == 1;
+    if is_first {
+        if let (Some(sup), Some(disp)) = (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref()) {
+            sup.transition_executing_via(disp);
+        }
+    }
+    drop(guard);
     connection_open.store(true, Ordering::Relaxed);
     Ok((assigned_oto_t, reply))
 }
@@ -1894,6 +1919,102 @@ mod tests {
         );
         // Session A's active_conn_ids must still hold id_a untouched.
         assert_eq!(session_a_ids, vec![id_a]);
+    }
+
+    /// Finding 3 regression (round-5 MEDIUM): the Supervisor Idle →
+    /// Executing transition and the shared-map insert must run under
+    /// one lock acquire. Before the fix, the insert in
+    /// `handle_safety_forward_open` released the lock before the
+    /// caller reacquired it to check `len() == 1`. Two concurrent
+    /// Forward_Opens on different sessions could both insert first,
+    /// then both see len == 2 on the second lock, and neither would
+    /// transition — Supervisor stuck in Idle while live connections
+    /// exist.
+    ///
+    /// Launch several FOs on independent tokio tasks that each hit a
+    /// barrier before entering the handler. The exact interleaving is
+    /// racy, but with the fix the invariant "Supervisor is Executing
+    /// after any accepted FO" holds regardless of which task wins the
+    /// lock. Before the fix this flakes toward Idle on multi-core
+    /// hardware.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn safety_concurrent_fos_leave_supervisor_executing() {
+        use crate::supervisor::{SafetySupervisorObject, SafetySupervisorState};
+        use crate::types::SafetyNetworkNumber;
+        use std::sync::Arc;
+
+        let fo_cfg = test_cfg();
+
+        // Build four distinct FO wires with different connection
+        // serials so each FO allocates its own row.
+        let mut wires = Vec::new();
+        for i in 0..4u16 {
+            let w = build_safety_forward_open(
+                &fo_cfg,
+                0x1000 + i,
+                0x0001,
+                0xC0FF_EE00 + i as u32,
+                0xA0,
+                &[],
+                &[],
+            )
+            .unwrap();
+            wires.push(w);
+        }
+
+        // Fresh supervisor + dispatcher so the test owns the state.
+        let mut sup = SafetySupervisorObject::new(
+            SafetyNetworkNumber([0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]),
+            0xC0A8_0154,
+        );
+        let dispatcher = Arc::new(ethernetip_core::cip::CipDispatcher::new());
+        dispatcher.register_class(sup.into_cip_class());
+        let sup = Arc::new(sup);
+
+        let mut cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
+        cfg.dispatcher = Some(dispatcher.clone());
+        cfg.supervisor = Some(sup.clone());
+
+        let shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let open = Arc::new(AtomicBool::new(false));
+        let next_id = Arc::new(AtomicU32::new(0x8000_0000));
+
+        // All four tasks pass through a barrier before entering the FO
+        // handler so their inserts race on the shared mutex.
+        let barrier = Arc::new(tokio::sync::Barrier::new(wires.len()));
+
+        let mut joins = Vec::new();
+        for wire in wires.into_iter() {
+            let cfg = cfg.clone();
+            let shared = shared.clone();
+            let open = open.clone();
+            let next_id = next_id.clone();
+            let barrier = barrier.clone();
+            joins.push(tokio::spawn(async move {
+                barrier.wait().await;
+                handle_safety_forward_open(
+                    &wire.service_data,
+                    SocketAddr::from(([127, 0, 0, 1], 2222)),
+                    &cfg,
+                    &shared,
+                    &open,
+                    &next_id,
+                )
+                .await
+                .expect("concurrent FO must verify")
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+
+        assert_eq!(shared.lock().await.len(), 4);
+        assert_eq!(
+            sup.state(),
+            SafetySupervisorState::Executing,
+            "supervisor must be Executing after any accepted FO",
+        );
     }
 
     /// Finding 4 companion: tampered TUNID in the FO's safety segment

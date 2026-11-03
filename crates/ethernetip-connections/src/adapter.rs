@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -39,6 +39,18 @@ use crate::forward_open::{ForwardCloseResponse, ForwardOpenResponse};
 
 /// Default cyclic I/O UDP port (well-known EtherNet/IP value).
 pub const IO_UDP_PORT: u16 = 2222;
+
+/// Maximum concurrent TCP sessions. Idle sessions on `read_exact` park
+/// indefinitely, so without a cap a peer can exhaust tokio tasks (and file
+/// descriptors) by opening thousands of connections and never writing.
+pub const MAX_CONCURRENT_SESSIONS: usize = 64;
+
+/// Per-request idle timeout. If a peer opens a TCP session and goes quiet
+/// mid-frame the session is dropped so its slot in the semaphore above is
+/// returned to the pool. 60 s is long enough for any legitimate scanner's
+/// keep-alive gap and short enough that a parked idle session can't hold a
+/// slot forever.
+pub const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Configuration for an [`Adapter`].
 #[derive(Debug, Clone)]
@@ -206,6 +218,7 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
     };
     let consumer_task = tokio::spawn(consumer_state.run(shutdown_rx.clone()));
 
+    let session_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let accept_state = AcceptState {
         cm: cm.clone(),
         assemblies: assemblies.clone(),
@@ -213,6 +226,7 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
         run_idle,
         peer_udp_port: cfg.peer_udp_port,
         dispatcher: cfg.dispatcher.clone(),
+        session_limit,
     };
     let accept_task = tokio::spawn(accept_state.run(tcp, shutdown_rx));
 
@@ -236,6 +250,7 @@ struct AcceptState {
     run_idle: bool,
     peer_udp_port: u16,
     dispatcher: Option<Arc<CipDispatcher>>,
+    session_limit: Arc<Semaphore>,
 }
 
 impl AcceptState {
@@ -253,6 +268,22 @@ impl AcceptState {
                             continue;
                         }
                     };
+                    // Try to grab a session slot. If we're already at
+                    // MAX_CONCURRENT_SESSIONS, drop the connection rather
+                    // than queueing — a slow peer must not delay accept
+                    // for everyone else.
+                    let permit = match self.session_limit.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!(
+                                "session limit reached ({}), rejecting {}",
+                                MAX_CONCURRENT_SESSIONS,
+                                peer
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let session = SessionState {
                         stream,
                         peer,
@@ -265,7 +296,10 @@ impl AcceptState {
                         session_handle: 0,
                         active_conn_id: None,
                     };
-                    tokio::spawn(session.run());
+                    tokio::spawn(async move {
+                        session.run().await;
+                        drop(permit);
+                    });
                 }
             }
         }
@@ -289,9 +323,21 @@ impl SessionState {
     async fn run(mut self) {
         loop {
             let mut header_buf = [0u8; HEADER_LEN];
-            if let Err(err) = self.stream.read_exact(&mut header_buf).await {
-                tracing::debug!(peer=?self.peer, "session read ended: {err}");
-                break;
+            // Idle timeout on the next-request boundary: a peer that opens
+            // a TCP session and goes silent must not keep its slot in the
+            // global session semaphore forever. Mid-frame reads below are
+            // not timed out — once a header is in, the payload is already
+            // bounded.
+            match tokio::time::timeout(SESSION_READ_TIMEOUT, self.stream.read_exact(&mut header_buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(peer=?self.peer, "session read ended: {err}");
+                    break;
+                }
+                Err(_) => {
+                    tracing::debug!(peer=?self.peer, "session idle timeout");
+                    break;
+                }
             }
             let header = match Header::parse(&header_buf) {
                 Ok(h) => h,

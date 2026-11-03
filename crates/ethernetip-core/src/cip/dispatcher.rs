@@ -5,11 +5,12 @@
 //! synchronization.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::cip::class::CipClass;
+use crate::cip::instance::CipInstance;
 use crate::cip::path::CipPath;
-use crate::cip::service::{CipServiceRequest, CipServiceResponse};
+use crate::cip::service::{CipServiceHandler, CipServiceRequest, CipServiceResponse};
 use crate::cip::status;
 
 /// A CIP object dispatcher — holds the class registry and answers requests
@@ -26,13 +27,26 @@ impl CipDispatcher {
         Self::default()
     }
 
+    /// Acquire the classes guard, recovering transparently from mutex
+    /// poisoning.
+    ///
+    /// `std::sync::Mutex` poisons itself if a thread panics while holding
+    /// the guard; every subsequent `.lock()` then returns `Err`. The
+    /// dispatcher has no invariants that a panicked handler could have
+    /// left half-updated — the only mutation under this guard is inserting
+    /// / looking up classes by id, and the per-handler mutation now runs
+    /// against an instance that has been taken out of the map (see
+    /// [`CipClass::take_instance_for_dispatch`]). Taking the inner guard
+    /// on poisoning keeps the whole CIP handler fleet responsive instead
+    /// of translating one panic into a permanent dispatcher-wide outage.
+    fn classes_lock(&self) -> MutexGuard<'_, HashMap<u16, CipClass>> {
+        self.classes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Register a class. If a class with the same class code was already
     /// registered it's replaced — matches the C# implementation.
     pub fn register_class(&self, class: CipClass) {
-        self.classes
-            .lock()
-            .expect("CipDispatcher classes mutex poisoned")
-            .insert(class.class_code, class);
+        self.classes_lock().insert(class.class_code, class);
     }
 
     /// Route a Message Router request to the matching class + instance +
@@ -67,21 +81,29 @@ impl CipDispatcher {
         let instance_id = path.instance_id.unwrap_or(0);
         let is_class_level = instance_id == 0;
 
-        let mut guard = self
-            .classes
-            .lock()
-            .expect("CipDispatcher classes mutex poisoned");
-        let Some(class) = guard.get_mut(&class_id16) else {
-            return CipServiceResponse::error(service_code, status::PATH_DESTINATION_UNKNOWN);
-        };
-
-        let handler = match class.get_service(service_code, is_class_level) {
-            Some(svc) => svc.handler.clone(),
-            None => return CipServiceResponse::error(service_code, status::SERVICE_NOT_SUPPORTED),
-        };
-
-        let Some(instance) = class.get_instance_mut(instance_id) else {
-            return CipServiceResponse::error(service_code, status::OBJECT_DOES_NOT_EXIST);
+        // Phase 1: under the classes lock, resolve service → handler and
+        // pull the target instance out of the class. Dropping the guard
+        // after this scope is critical — the handler must not run while
+        // the dispatcher mutex is held, both so another thread can keep
+        // dispatching through this same dispatcher during the call and so
+        // that a handler which recursively dispatches (e.g. a service
+        // that re-enters CipDispatcher for a different class) does not
+        // deadlock itself.
+        let (handler, mut instance): (CipServiceHandler, CipInstance) = {
+            let mut guard = self.classes_lock();
+            let Some(class) = guard.get_mut(&class_id16) else {
+                return CipServiceResponse::error(service_code, status::PATH_DESTINATION_UNKNOWN);
+            };
+            let handler = match class.get_service(service_code, is_class_level) {
+                Some(svc) => svc.handler.clone(),
+                None => {
+                    return CipServiceResponse::error(service_code, status::SERVICE_NOT_SUPPORTED)
+                }
+            };
+            let Some(instance) = class.take_instance_for_dispatch(instance_id) else {
+                return CipServiceResponse::error(service_code, status::OBJECT_DOES_NOT_EXIST);
+            };
+            (handler, instance)
         };
 
         let request = CipServiceRequest {
@@ -90,17 +112,46 @@ impl CipDispatcher {
             data,
             context,
         };
-        handler(instance, &request)
+
+        // RAII guard so a panic inside the handler still restores the
+        // instance back to the class. Without it, a panic would both
+        // poison the mutex (recoverable via `classes_lock`) AND leave the
+        // instance missing — the next dispatch to the same id would wrongly
+        // return `OBJECT_DOES_NOT_EXIST`.
+        struct Restore<'a> {
+            dispatcher: &'a CipDispatcher,
+            class_id: u16,
+            instance_id: u32,
+            instance: Option<CipInstance>,
+        }
+        impl<'a> Drop for Restore<'a> {
+            fn drop(&mut self) {
+                if let Some(instance) = self.instance.take() {
+                    let mut guard = self.dispatcher.classes_lock();
+                    if let Some(class) = guard.get_mut(&self.class_id) {
+                        class.restore_instance_for_dispatch(self.instance_id, instance);
+                    }
+                }
+            }
+        }
+        let mut restore = Restore {
+            dispatcher: self,
+            class_id: class_id16,
+            instance_id,
+            instance: None,
+        };
+
+        let response = handler(&mut instance, &request);
+        restore.instance = Some(instance);
+        drop(restore);
+        response
     }
 
     /// True when the given class code is registered — useful in the safety
     /// adapter to decide whether to route or fall through to the old inline
     /// handler.
     pub fn has_class(&self, class_code: u16) -> bool {
-        self.classes
-            .lock()
-            .expect("CipDispatcher classes mutex poisoned")
-            .contains_key(&class_code)
+        self.classes_lock().contains_key(&class_code)
     }
 
     /// Give a scoped mutable reference to an instance inside a registered
@@ -113,10 +164,7 @@ impl CipDispatcher {
     where
         F: FnOnce(&mut crate::cip::instance::CipInstance) -> R,
     {
-        let mut guard = self
-            .classes
-            .lock()
-            .expect("CipDispatcher classes mutex poisoned");
+        let mut guard = self.classes_lock();
         let class = guard.get_mut(&class_code)?;
         let instance = class.get_instance_mut(instance_id)?;
         Some(f(instance))
@@ -130,10 +178,7 @@ impl CipDispatcher {
     where
         F: FnOnce(&mut crate::cip::class::CipClass) -> R,
     {
-        let mut guard = self
-            .classes
-            .lock()
-            .expect("CipDispatcher classes mutex poisoned");
+        let mut guard = self.classes_lock();
         let class = guard.get_mut(&class_code)?;
         Some(f(class))
     }

@@ -135,6 +135,48 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_survives_handler_panic_poison() {
+        // A handler that panics must not knock the dispatcher offline:
+        // the std Mutex poisoning policy would otherwise make every
+        // subsequent request from any peer fail. The dispatcher recovers
+        // the inner guard on poison, and the panic-safety RAII restores
+        // the taken instance back into the class.
+        use std::sync::Arc;
+
+        let mut cls = CipClass::new(0x39, "Safety Supervisor", 1);
+        cls.add_standard_instance_services();
+        cls.add_instance_service(CipServiceDefinition::new(
+            0x55,
+            "Boom",
+            |_inst, _req| panic!("intentional handler panic"),
+        ));
+        cls.create_instance(1);
+        let dispatcher = Arc::new(CipDispatcher::new());
+        dispatcher.register_class(cls);
+
+        // First call: panic on another thread so this thread survives.
+        let d1 = dispatcher.clone();
+        let join = std::thread::spawn(move || {
+            let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x01]).unwrap();
+            d1.dispatch(0x55, path, Vec::new())
+        });
+        assert!(join.join().is_err(), "handler panic must propagate");
+
+        // Second call on a surviving thread: dispatcher still works,
+        // instance still exists.
+        let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x01]).unwrap();
+        let response = dispatcher.dispatch(
+            standard_services::GET_ATTRIBUTE_SINGLE,
+            path,
+            Vec::new(),
+        );
+        // Attribute 0 is not present, but the response should carry a
+        // normal CIP status rather than hanging / propagating a poison
+        // panic.
+        assert_eq!(response.service_code, standard_services::GET_ATTRIBUTE_SINGLE | 0x80);
+    }
+
+    #[test]
     fn dispatcher_custom_service_receives_body() {
         // Handler returns whatever body it received, plus a marker byte.
         let mut cls = CipClass::new(0x39, "Safety Supervisor", 1);

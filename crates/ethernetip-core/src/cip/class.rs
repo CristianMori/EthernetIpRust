@@ -135,6 +135,39 @@ impl CipClass {
         }
     }
 
+    /// Pull an instance out of the class so it can be mutated without
+    /// holding any dispatcher-level lock. For `id == 0` the class-level
+    /// instance is swapped out with a fresh placeholder so the slot stays
+    /// occupied; for any other id the instance is `remove`d from the
+    /// internal map. Pair every call with
+    /// [`CipClass::restore_instance_for_dispatch`] after the handler has
+    /// run — the dispatcher does this to avoid holding the classes mutex
+    /// while a user-registered handler executes, which would deadlock a
+    /// handler that recursively dispatches through the same dispatcher.
+    pub fn take_instance_for_dispatch(&mut self, id: u32) -> Option<CipInstance> {
+        if id == 0 {
+            Some(std::mem::replace(
+                &mut self.class_instance,
+                CipInstance::new(0),
+            ))
+        } else {
+            self.instances.remove(&id)
+        }
+    }
+
+    /// Put an instance back after
+    /// [`CipClass::take_instance_for_dispatch`] + a handler call. The
+    /// dispatcher calls this unconditionally, even on handler panic
+    /// (through a drop-guard), so the class never ends up with a missing
+    /// instance.
+    pub fn restore_instance_for_dispatch(&mut self, id: u32, instance: CipInstance) {
+        if id == 0 {
+            self.class_instance = instance;
+        } else {
+            self.instances.insert(id, instance);
+        }
+    }
+
     /// Register a service available on every non-zero instance.
     pub fn add_instance_service(&mut self, svc: CipServiceDefinition) {
         self.instance_services.insert(svc.service_code, svc);

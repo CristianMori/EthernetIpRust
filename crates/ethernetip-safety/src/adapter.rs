@@ -37,6 +37,32 @@ use ethernetip_core::error::{EipError, Result};
 use crate::cpcrc;
 use crate::crc;
 use crate::forward_open::SafetyAppReply;
+
+/// Produce an unpredictable starting value for the safety adapter's T→O
+/// id allocator. Mirrors the helper in
+/// `ethernetip_connections::connection_manager_object::random_conn_id_seed`:
+/// a passive observer who sees (or makes) one safety Forward_Open could
+/// otherwise predict the exact ids issued to subsequent peers, because
+/// every process booted at 0x8000_0000 and incremented by one.
+/// SplitMix64-mix wall-clock nanoseconds with the process id, then force
+/// the top bit set so the seed stays in the originator-chosen half of
+/// the 32-bit connection-id space. Not cryptographic — adequate only to
+/// defeat a passive network guesser, which is all this needs to do.
+fn random_conn_id_seed() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mut z = nanos ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // 0x8000_0000..=0xBFFF_FFFF — still ~1 billion ids of headroom before
+    // fetch_add rolls out of the originator-chosen half of the id space.
+    ((z as u32) & 0x3FFF_FFFF) | 0x8000_0000
+}
 use crate::frame_codec::{self, DecodedFrame, SafetyDecodeError};
 use crate::scanner::IO_UDP_PORT;
 use crate::segment::{SafetyNetworkSegment, SEGMENT_TYPE};
@@ -252,7 +278,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
     let rx_crc_fail = Arc::new(AtomicU64::new(0));
     let tx_tcoo = Arc::new(AtomicU64::new(0));
     let connection_open = Arc::new(AtomicBool::new(false));
-    let next_conn_id = Arc::new(AtomicU32::new(0x8000_0000));
+    let next_conn_id = Arc::new(AtomicU32::new(random_conn_id_seed()));
     let shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
 
@@ -1386,6 +1412,37 @@ mod tests {
             validator: None,
             supervisor: None,
         }
+    }
+
+    /// The randomised T→O id seed from `random_conn_id_seed` must land
+    /// in the originator-chosen half of the id space, and two calls
+    /// must almost always disagree. We tolerate a one-in-a-billion
+    /// coincidence by trying up to 32 samples before failing; the
+    /// SplitMix64 mix of nanoseconds + pid should move on nearly every
+    /// invocation on any real machine.
+    #[test]
+    fn random_conn_id_seed_differs_across_calls_and_stays_in_upper_half() {
+        let first = random_conn_id_seed();
+        assert!(
+            first >= 0x8000_0000 && first <= 0xBFFF_FFFF,
+            "seed {first:#010X} outside originator-chosen half 0x8000_0000..=0xBFFF_FFFF",
+        );
+        let mut saw_different = false;
+        for _ in 0..32 {
+            let next = random_conn_id_seed();
+            assert!(
+                next >= 0x8000_0000 && next <= 0xBFFF_FFFF,
+                "seed {next:#010X} outside originator-chosen half",
+            );
+            if next != first {
+                saw_different = true;
+                break;
+            }
+        }
+        assert!(
+            saw_different,
+            "random_conn_id_seed produced the same value 32 times in a row",
+        );
     }
 
     /// Finding 4 regression: a Forward_Open body whose CPCRC field has been

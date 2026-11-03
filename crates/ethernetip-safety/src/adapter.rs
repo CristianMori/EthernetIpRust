@@ -47,6 +47,22 @@ use crate::validator::{SafetyValidatorInstanceState, SafetyValidatorObject, Safe
 /// descriptors) by opening thousands of connections and never writing.
 pub const MAX_CONCURRENT_SESSIONS: usize = 64;
 
+/// Hard cap on the number of simultaneous safety Forward_Opens a single TCP
+/// session is allowed to hold. Safety connections are heavier than ordinary
+/// Class 1 ones (each allocates a Validator instance, a producer-side
+/// rollover state slot, and a seat in the shared connection map), so the
+/// per-session cap is deliberately lower than
+/// [`ethernetip_connections::adapter::MAX_FORWARD_OPENS_PER_SESSION`].
+pub const MAX_SAFETY_FORWARD_OPENS_PER_SESSION: usize = 8;
+
+/// Hard cap on the total number of simultaneous safety connections across
+/// all sessions. Also bounds the `next_instance_id` growth on the installed
+/// Safety Validator and the size of the shared connection map, so a swarm
+/// of sessions each near the per-session cap can't balloon memory or push
+/// the validator's u32 id space toward wrap. 0x0113 ("No more connection
+/// resources") is the CIP-standard reject extended status.
+pub const MAX_SAFETY_TOTAL_CONNECTIONS: usize = 64;
+
 /// Per-request idle timeout. If a peer opens a TCP session and goes quiet
 /// mid-frame the session is dropped so its slot in the semaphore above is
 /// returned to the pool. 60 s is long enough for any legitimate scanner's
@@ -345,6 +361,11 @@ async fn handle_session(
 ) -> Result<()> {
     let session_handle = 0x0100_0000 ^ (peer.port() as u32).wrapping_mul(0x9E37_79B9);
     let mut header_buf = [0u8; HEADER_LEN];
+    // Per-session FO count — bounds how many safety connections one TCP
+    // session can allocate. Incremented on each accepted FO, decremented
+    // on each FC and on session teardown. The global HashMap size caps
+    // the aggregate.
+    let mut session_fo_count: usize = 0;
     loop {
         // Idle timeout on the next-request boundary: a peer that opens a
         // TCP session and goes silent must not keep its slot in the
@@ -381,6 +402,7 @@ async fn handle_session(
                     &shared,
                     &connection_open,
                     &next_conn_id,
+                    &mut session_fo_count,
                 )
                 .await?;
                 let frame = encode_encap(
@@ -428,6 +450,7 @@ async fn handle_send_rr_data(
     shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
     connection_open: &AtomicBool,
     next_conn_id: &AtomicU32,
+    session_fo_count: &mut usize,
 ) -> Result<Vec<u8>> {
     let envelope = Envelope::parse(payload)?;
     let mr_item = envelope
@@ -466,6 +489,37 @@ async fn handle_send_rr_data(
     let mut reply_ext_status: Vec<u16> = Vec::new();
     let (reply_service, reply_status, reply_body) = match service_code {
         s if s == service::FORWARD_OPEN => {
+            // Per-session + global caps on safety Forward_Opens. Reject
+            // before parsing the FO body so a hostile peer that blasts
+            // Forward_Opens can't allocate validator instances or
+            // HashMap slots past the configured cap. 0x0113 ("no more
+            // connection resources") is the CIP-standard reject.
+            if *session_fo_count >= MAX_SAFETY_FORWARD_OPENS_PER_SESSION {
+                tracing::warn!(
+                    peer=?peer,
+                    "safety Forward_Open rejected: session already holds {} connections (cap {})",
+                    *session_fo_count,
+                    MAX_SAFETY_FORWARD_OPENS_PER_SESSION,
+                );
+                reply_ext_status = vec![0x0113];
+                (
+                    service::FORWARD_OPEN | service::REPLY_FLAG,
+                    status::CONNECTION_FAILURE,
+                    Vec::new(),
+                )
+            } else if shared.lock().await.len() >= MAX_SAFETY_TOTAL_CONNECTIONS {
+                tracing::warn!(
+                    peer=?peer,
+                    "safety Forward_Open rejected: global connection table full (cap {})",
+                    MAX_SAFETY_TOTAL_CONNECTIONS,
+                );
+                reply_ext_status = vec![0x0113];
+                (
+                    service::FORWARD_OPEN | service::REPLY_FLAG,
+                    status::CONNECTION_FAILURE,
+                    Vec::new(),
+                )
+            } else {
             // Prefer the originator's advertised T→O endpoint from Sockaddr
             // Info; fall back to (peer_tcp_ip, cfg.peer_udp_port).
             let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
@@ -485,6 +539,7 @@ async fn handle_send_rr_data(
             .await
             {
                 Ok(reply) => {
+                    *session_fo_count += 1;
                     // Include our UDP endpoint in the reply so the scanner
                     // knows where to place O→T frames.
                     if let Ok(local) = udp.local_addr() {
@@ -511,6 +566,7 @@ async fn handle_send_rr_data(
                     (s | service::REPLY_FLAG, status::CONNECTION_FAILURE, Vec::new())
                 }
             }
+            }
         }
         s if s == service::FORWARD_CLOSE => {
             // Removing all rows keeps the semantics simple for now — the
@@ -533,6 +589,11 @@ async fn handle_send_rr_data(
             }
             guard.clear();
             drop(guard);
+            // Current FC path clears every row (the simplification kept
+            // from before — Finding 1 narrows this to the matching row).
+            // Zero the session's FO counter so a reconnect+FO sequence
+            // isn't permanently blocked by the cap.
+            *session_fo_count = 0;
             // Supervisor state transition: no connections left → back to
             // Idle. The FC service always clears the entire connection
             // table (the "close all rows" simplification kept from

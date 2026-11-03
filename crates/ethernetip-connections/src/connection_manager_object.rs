@@ -51,6 +51,32 @@ fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Produce an unpredictable starting value for the Connection Manager's
+/// T->O id allocator. Mixes the current wall-clock nanoseconds with the
+/// process id through a 64-bit SplitMix64 step, then forces the top bit
+/// set so the result stays in the originator-chosen half of the 32-bit
+/// connection-id space. Not cryptographically secure — adequate only to
+/// defeat a passive network observer predicting the next id a peer will
+/// receive, which is all this needs to accomplish.
+fn random_conn_id_seed() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    // SplitMix64 finalizer — one round is enough to decorrelate nearby
+    // nanosecond timestamps.
+    let mut z = nanos ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Keep the seed in 0x8000_0000..=0xBFFF_FFFF: still ~1 billion ids of
+    // headroom before fetch_add wraps out of the originator-chosen half of
+    // the id space, yet 30 bits of entropy against a passive guesser.
+    ((z as u32) & 0x3FFF_FFFF) | 0x8000_0000
+}
+
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -312,7 +338,15 @@ impl ConnectionManagerObject {
     pub fn new() -> Self {
         let counters = Arc::new(ConnectionManagerCounters::default());
         let connections = Arc::new(Mutex::new(ConnectionTable::default()));
-        let next_conn_id = Arc::new(AtomicU32::new(0x8000_0000));
+        // Seed the T->O id allocator with a per-process random value so a
+        // passive observer who sees (or makes) one Forward_Open cannot predict
+        // the ids issued to other peers. Class-1 non-safety I/O has no
+        // authentication at the UDP layer, so a predictable connection id
+        // would let an attacker inject frames into another peer's producer.
+        // We only need unpredictability from a network observer, not
+        // cryptographic randomness; the top bit must stay set to keep the id
+        // in the originator-chosen half of the id space.
+        let next_conn_id = Arc::new(AtomicU32::new(random_conn_id_seed()));
         let producer_spawner = Arc::new(Mutex::new(None::<ProducerSpawner>));
 
         let mut cls = CipClass::new(class_codes::CONNECTION_MANAGER, "Connection Manager", 1);

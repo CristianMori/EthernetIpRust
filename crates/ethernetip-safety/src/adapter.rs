@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -41,6 +41,18 @@ use crate::scanner::IO_UDP_PORT;
 use crate::segment::{SafetyNetworkSegment, SEGMENT_TYPE};
 use crate::types::{SafetyFormat, UniqueNetworkId};
 use crate::validator::{SafetyValidatorInstanceState, SafetyValidatorObject, SafetyValidatorState};
+
+/// Maximum concurrent TCP sessions. Idle sessions on `read_exact` park
+/// indefinitely, so without a cap a peer can exhaust tokio tasks (and file
+/// descriptors) by opening thousands of connections and never writing.
+pub const MAX_CONCURRENT_SESSIONS: usize = 64;
+
+/// Per-request idle timeout. If a peer opens a TCP session and goes quiet
+/// mid-frame the session is dropped so its slot in the semaphore above is
+/// returned to the pool. 60 s is long enough for any legitimate scanner's
+/// keep-alive gap and short enough that a parked idle session can't hold a
+/// slot forever.
+pub const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Configuration for [`start_safety_adapter`].
 #[derive(Debug, Clone)]
@@ -225,6 +237,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
     let connection_open_task = connection_open.clone();
     let next_conn_id_task = next_conn_id.clone();
     let udp_accept = udp.clone();
+    let session_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let accept_task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
         loop {
@@ -240,6 +253,22 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
                             continue;
                         }
                     };
+                    // Try to grab a session slot. If we're already at
+                    // MAX_CONCURRENT_SESSIONS, drop the connection rather
+                    // than queueing — a slow peer must not delay accept
+                    // for everyone else.
+                    let permit = match session_limit.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::warn!(
+                                "safety session limit reached ({}), rejecting {}",
+                                MAX_CONCURRENT_SESSIONS,
+                                peer
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     let cfg = cfg_clone.clone();
                     let shared = shared_accept.clone();
                     let open = connection_open_task.clone();
@@ -249,6 +278,7 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
                         if let Err(err) = handle_session(stream, peer, udp_task, cfg, shared, open, next_conn_id).await {
                             tracing::debug!("safety session ended: {err}");
                         }
+                        drop(permit);
                     });
                 }
             }
@@ -316,8 +346,18 @@ async fn handle_session(
     let session_handle = 0x0100_0000 ^ (peer.port() as u32).wrapping_mul(0x9E37_79B9);
     let mut header_buf = [0u8; HEADER_LEN];
     loop {
-        if stream.read_exact(&mut header_buf).await.is_err() {
-            break;
+        // Idle timeout on the next-request boundary: a peer that opens a
+        // TCP session and goes silent must not keep its slot in the
+        // global session semaphore forever. Mid-frame reads below are
+        // not timed out — once a header is in, the payload is already
+        // bounded.
+        match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut header_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::debug!("safety session {} idle timeout", peer);
+                break;
+            }
         }
         let header = Header::parse(&header_buf)?;
         let mut payload = vec![0u8; header.length as usize];

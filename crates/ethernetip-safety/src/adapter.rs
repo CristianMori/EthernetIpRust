@@ -427,11 +427,15 @@ async fn handle_session(
 ) -> Result<()> {
     let session_handle = 0x0100_0000 ^ (peer.port() as u32).wrapping_mul(0x9E37_79B9);
     let mut header_buf = [0u8; HEADER_LEN];
-    // Per-session FO count — bounds how many safety connections one TCP
-    // session can allocate. Incremented on each accepted FO, decremented
-    // on each FC and on session teardown. The global HashMap size caps
-    // the aggregate.
-    let mut session_fo_count: usize = 0;
+    // Per-session owned connection ids — the exact O→T ids this TCP
+    // session Forward_Open'd. Length is also the per-session FO count
+    // (bounds how many safety connections one TCP session can allocate).
+    // Pushed on each accepted FO, drained on each FC and on session
+    // teardown. The global HashMap size caps the aggregate across all
+    // sessions. Keeping the list per session is what lets abnormal TCP
+    // closes drop only THIS session's rows instead of every live safety
+    // connection on the adapter — see the teardown block below.
+    let mut active_conn_ids: Vec<u32> = Vec::new();
     loop {
         // Idle timeout on the next-request boundary: a peer that opens a
         // TCP session and goes silent must not keep its slot in the
@@ -468,7 +472,7 @@ async fn handle_session(
                     &shared,
                     &connection_open,
                     &next_conn_id,
-                    &mut session_fo_count,
+                    &mut active_conn_ids,
                 )
                 .await?;
                 let frame = encode_encap(
@@ -485,22 +489,29 @@ async fn handle_session(
             }
         }
     }
-    connection_open.store(false, Ordering::Relaxed);
     // TCP session ended without an explicit Forward_Close (peer closed the
-    // socket or crashed). Drop the same Validator instances the FC path
-    // would have removed so those leaks don't accumulate either.
+    // socket or crashed). Drop ONLY the rows this session Forward_Open'd —
+    // not every live row on the adapter. Before this change, teardown
+    // called `guard.clear()`, which meant any abnormal close (RST,
+    // SESSION_READ_TIMEOUT, hostile hangup) on one session wiped every
+    // other session's connections and forced the Supervisor Executing →
+    // Idle. The round-4 FC fix left this teardown path untouched.
     let mut guard = shared.lock().await;
-    let had_connections = !guard.is_empty();
-    if let (Some(dispatcher), Some(validator)) = (cfg.dispatcher.as_ref(), cfg.validator.as_ref()) {
-        for row in guard.values() {
-            validator.remove_instance_via_dispatcher(dispatcher, row.sv_inst);
+    for id in active_conn_ids.drain(..) {
+        if let Some(row) = guard.remove(&id) {
+            if let (Some(dispatcher), Some(validator)) =
+                (cfg.dispatcher.as_ref(), cfg.validator.as_ref())
+            {
+                validator.remove_instance_via_dispatcher(dispatcher, row.sv_inst);
+            }
         }
     }
-    guard.clear();
+    let now_empty = guard.is_empty();
     drop(guard);
-    // Supervisor: if we had live connections and the session's death
-    // took them all with it, transition back to Idle.
-    if had_connections {
+    // `connection_open` reflects whether ANY session holds a live
+    // connection, so flip it only when the last row disappeared.
+    if now_empty {
+        connection_open.store(false, Ordering::Relaxed);
         if let (Some(sup), Some(disp)) = (cfg.supervisor.as_ref(), cfg.dispatcher.as_ref()) {
             sup.transition_idle_via(disp);
         }
@@ -516,7 +527,7 @@ async fn handle_send_rr_data(
     shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
     connection_open: &AtomicBool,
     next_conn_id: &AtomicU32,
-    session_fo_count: &mut usize,
+    active_conn_ids: &mut Vec<u32>,
 ) -> Result<Vec<u8>> {
     let envelope = Envelope::parse(payload)?;
     let mr_item = envelope
@@ -560,11 +571,11 @@ async fn handle_send_rr_data(
             // Forward_Opens can't allocate validator instances or
             // HashMap slots past the configured cap. 0x0113 ("no more
             // connection resources") is the CIP-standard reject.
-            if *session_fo_count >= MAX_SAFETY_FORWARD_OPENS_PER_SESSION {
+            if active_conn_ids.len() >= MAX_SAFETY_FORWARD_OPENS_PER_SESSION {
                 tracing::warn!(
                     peer=?peer,
                     "safety Forward_Open rejected: session already holds {} connections (cap {})",
-                    *session_fo_count,
+                    active_conn_ids.len(),
                     MAX_SAFETY_FORWARD_OPENS_PER_SESSION,
                 );
                 reply_ext_status = vec![0x0113];
@@ -604,8 +615,8 @@ async fn handle_send_rr_data(
             )
             .await
             {
-                Ok(reply) => {
-                    *session_fo_count += 1;
+                Ok((assigned_oto_t, reply)) => {
+                    active_conn_ids.push(assigned_oto_t);
                     // Include our UDP endpoint in the reply so the scanner
                     // knows where to place O→T frames.
                     if let Ok(local) = udp.local_addr() {
@@ -690,7 +701,7 @@ async fn handle_send_rr_data(
                     // and closes one of them must keep the others live.
                     let is_empty_now = guard.is_empty();
                     drop(guard);
-                    *session_fo_count = session_fo_count.saturating_sub(1);
+                    active_conn_ids.retain(|x| *x != id);
                     if is_empty_now {
                         connection_open.store(false, Ordering::Relaxed);
                         if let (Some(sup), Some(disp)) =
@@ -791,7 +802,7 @@ async fn handle_safety_forward_open(
     shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
     connection_open: &AtomicBool,
     next_conn_id: &AtomicU32,
-) -> Result<Vec<u8>> {
+) -> Result<(u32, Vec<u8>)> {
     if body.len() < 36 {
         return Err(EipError::Short {
             expected: 36,
@@ -1092,7 +1103,7 @@ async fn handle_safety_forward_open(
         last_ping: 0xFF,
     });
     connection_open.store(true, Ordering::Relaxed);
-    Ok(reply)
+    Ok((assigned_oto_t, reply))
 }
 
 // -------------------- UDP consumer --------------------
@@ -1640,6 +1651,98 @@ mod tests {
         let surviving = guard.values().next().unwrap();
         assert_eq!(surviving.connection_serial, 0x1111);
         assert_eq!(surviving.orig_serial, 0xC0FF_EE01);
+    }
+
+    /// Finding 1 regression (round-5 CRITICAL): an abnormal TCP close on
+    /// one session must drop ONLY that session's rows from the shared
+    /// map. Pre-fix, `handle_session`'s teardown called `guard.clear()`,
+    /// so a RST or idle-timeout on any session wiped every live safety
+    /// connection on the adapter — including rows owned by other,
+    /// perfectly healthy sessions. This test exercises the per-session
+    /// drain the fix introduces by setting up two independent
+    /// `active_conn_ids` lists against one shared map and running the
+    /// drain loop for only one of them.
+    #[tokio::test]
+    async fn safety_session_teardown_drops_only_this_sessions_rows() {
+        let fo_cfg = test_cfg();
+        let wire_a = build_safety_forward_open(
+            &fo_cfg,
+            0x1111,
+            0x0001,
+            0xC0FF_EE01,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let wire_b = build_safety_forward_open(
+            &fo_cfg,
+            0x2222,
+            0x0001,
+            0xC0FF_EE02,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
+        let shared = Mutex::new(std::collections::HashMap::new());
+        let open = AtomicBool::new(false);
+        let next_id = AtomicU32::new(0x8000_0000);
+
+        // Session A opens one FO.
+        let mut session_a_ids: Vec<u32> = Vec::new();
+        let (id_a, _reply_a) = handle_safety_forward_open(
+            &wire_a.service_data,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect("FO A must verify");
+        session_a_ids.push(id_a);
+
+        // Session B opens its own FO on the SAME shared map.
+        let mut session_b_ids: Vec<u32> = Vec::new();
+        let (id_b, _reply_b) = handle_safety_forward_open(
+            &wire_b.service_data,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect("FO B must verify");
+        session_b_ids.push(id_b);
+        assert_eq!(shared.lock().await.len(), 2);
+        assert_ne!(id_a, id_b);
+
+        // Simulate session A's teardown (the exact code path the fix
+        // installed in `handle_session`): drain A's owned ids out of
+        // the shared map. Session B's `active_conn_ids` and its row in
+        // the shared map must survive.
+        {
+            let mut guard = shared.lock().await;
+            for id in session_a_ids.drain(..) {
+                guard.remove(&id);
+            }
+        }
+
+        let guard = shared.lock().await;
+        assert_eq!(
+            guard.len(),
+            1,
+            "session A teardown must leave exactly session B's row",
+        );
+        let surviving = guard.values().next().unwrap();
+        assert_eq!(surviving.o_to_t_conn_id, id_b);
+        assert_eq!(surviving.connection_serial, 0x2222);
+        assert!(session_a_ids.is_empty());
+        assert_eq!(session_b_ids, vec![id_b]);
     }
 
     /// Finding 4 companion: tampered TUNID in the FO's safety segment

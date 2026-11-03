@@ -6,7 +6,7 @@
 //! for the update itself — the buffer is copied out to the caller.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ethernetip_core::error::{EipError, Result};
 
@@ -149,6 +149,24 @@ impl TagRegistry {
         }
     }
 
+    /// Acquire a read guard, recovering transparently from lock poisoning.
+    ///
+    /// `std::sync::RwLock` poisons itself if a thread panics while holding
+    /// the write lock; every subsequent `.read()` / `.write()` then returns
+    /// `Err`. The registry has no invariants that a panicked write could
+    /// have left half-updated — `by_name` / `by_instance` are published in
+    /// a defined order (see `insert_entry`), and worst case the panicking
+    /// write just didn't commit — so taking the inner guard on poisoning
+    /// keeps the CIP handler fleet responsive instead of propagating one
+    /// panic into a permanent registry-wide outage.
+    fn read_or_recover(&self) -> RwLockReadGuard<'_, RegistryInner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_or_recover(&self) -> RwLockWriteGuard<'_, RegistryInner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Insert a scalar atomic tag. Returns the assigned instance id.
     pub fn add_atomic(&self, name: impl Into<String>, ty: CipType) -> Result<u32> {
         self.add_array(name, ty, 1)
@@ -275,7 +293,7 @@ impl TagRegistry {
         template_id: Option<u16>,
         data: Vec<u8>,
     ) -> Result<u32> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         if guard.by_name.contains_key(&name) {
             return Err(EipError::Protocol(format!(
                 "tag `{}` already registered",
@@ -303,15 +321,13 @@ impl TagRegistry {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<TagEntry> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_or_recover();
         let instance = *guard.by_name.get(name)?;
         guard.by_instance.get(&instance).cloned()
     }
 
     pub fn get_by_instance(&self, instance: u32) -> Option<TagEntry> {
-        self.inner
-            .read()
-            .unwrap()
+        self.read_or_recover()
             .by_instance
             .get(&instance)
             .cloned()
@@ -330,7 +346,7 @@ impl TagRegistry {
     }
 
     fn set_by_name_with_flag(&self, name: &str, data: &[u8], silent: bool) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let Some(&instance) = guard.by_name.get(name) else {
             return Err(EipError::Protocol(format!("no such tag `{}`", name)));
         };
@@ -353,7 +369,7 @@ impl TagRegistry {
     /// Write a slice at an arbitrary byte offset inside a tag's buffer.
     /// Used by the walker path after resolving `Motor.Timer.PRE` → offset.
     pub fn set_bytes_at(&self, instance: u32, offset: usize, bytes: &[u8]) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let entry = guard
             .by_instance
             .get_mut(&instance)
@@ -374,7 +390,7 @@ impl TagRegistry {
 
     /// Read a slice at an arbitrary byte offset from a tag's buffer.
     pub fn get_bytes_at(&self, instance: u32, offset: usize, len: usize) -> Option<Vec<u8>> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_or_recover();
         let entry = guard.by_instance.get(&instance)?;
         if offset + len > entry.data.len() {
             return None;
@@ -401,7 +417,7 @@ impl TagRegistry {
             }
         }
 
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let Some(&instance) = guard.by_name.get(name) else {
             return Err(EipError::Protocol(format!("no such tag `{name}`")));
         };
@@ -445,7 +461,7 @@ impl TagRegistry {
         bit: u8,
         value: bool,
     ) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let entry = guard
             .by_instance
             .get_mut(&instance)
@@ -469,7 +485,7 @@ impl TagRegistry {
     /// `Get_Instance_Attribute_List` sweeps. Sorted by instance id so browsing
     /// resumes correctly across chunk boundaries.
     pub fn browse_entries(&self) -> Vec<(u32, String, u16)> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_or_recover();
         let mut rows: Vec<_> = guard
             .by_instance
             .values()
@@ -486,9 +502,7 @@ impl TagRegistry {
     /// Array dimensions for a given tag instance — used by Symbol Object
     /// attribute 8 (which needs three UDINTs).
     pub fn dims_for(&self, instance: u32) -> Vec<u32> {
-        self.inner
-            .read()
-            .unwrap()
+        self.read_or_recover()
             .by_instance
             .get(&instance)
             .map(|e| e.dims.clone())
@@ -496,7 +510,7 @@ impl TagRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().by_instance.len()
+        self.read_or_recover().by_instance.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -509,7 +523,7 @@ impl TagRegistry {
     /// fresh id is allocated in the auto range; otherwise the caller's id is
     /// used and the auto counter bumped past it.
     pub fn add_template(&self, mut template: ServerTemplate) -> Result<u16> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         if template.instance_id == 0 {
             template.instance_id = guard.next_template;
             guard.next_template = guard.next_template.wrapping_add(1);
@@ -538,18 +552,18 @@ impl TagRegistry {
     }
 
     pub fn get_template(&self, id: u16) -> Option<Arc<ServerTemplate>> {
-        self.inner.read().unwrap().templates.get(&id).cloned()
+        self.read_or_recover().templates.get(&id).cloned()
     }
 
     pub fn all_templates(&self) -> Vec<Arc<ServerTemplate>> {
-        self.inner.read().unwrap().templates.values().cloned().collect()
+        self.read_or_recover().templates.values().cloned().collect()
     }
 
     // --- Program scope management ---
 
     /// Register (or return the pseudo id of) a program scope by name.
     pub fn register_program(&self, name: &str) -> u32 {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         if let Some(existing) = guard.programs.get(name) {
             return existing.pseudo_instance;
         }
@@ -567,9 +581,7 @@ impl TagRegistry {
     }
 
     pub fn program_pseudo_id(&self, name: &str) -> Option<u32> {
-        self.inner
-            .read()
-            .unwrap()
+        self.read_or_recover()
             .programs
             .get(name)
             .map(|p| p.pseudo_instance)
@@ -588,7 +600,7 @@ impl TagRegistry {
             .atomic_size()
             .ok_or_else(|| EipError::Protocol("unknown atomic size".into()))?;
         let sym_type = ty as u16;
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let program_entry = guard
             .programs
             .get_mut(program)
@@ -630,7 +642,7 @@ impl TagRegistry {
         let name = name.into();
         let sym_type = 0x8000 | (template.instance_id & 0x0FFF);
         let data = vec![0u8; template.structure_size as usize];
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let program_entry = guard
             .programs
             .get_mut(program)
@@ -658,7 +670,7 @@ impl TagRegistry {
 
     /// Look up a program-scoped tag by name.
     pub fn get_program_tag(&self, program: &str, name: &str) -> Option<TagEntry> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_or_recover();
         guard.programs.get(program)?.tags.get(name).cloned()
     }
 
@@ -670,7 +682,7 @@ impl TagRegistry {
         offset: usize,
         bytes: &[u8],
     ) -> Result<()> {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.write_or_recover();
         let program_entry = guard
             .programs
             .get_mut(program)
@@ -689,7 +701,7 @@ impl TagRegistry {
     /// Snapshot of every tag inside a program scope.  Returns
     /// `(local_instance, entry)` pairs.
     pub fn program_tags(&self, program: &str) -> Vec<(u32, TagEntry)> {
-        let guard = self.inner.read().unwrap();
+        let guard = self.read_or_recover();
         let Some(scope) = guard.programs.get(program) else {
             return Vec::new();
         };
@@ -701,9 +713,7 @@ impl TagRegistry {
     }
 
     pub fn all_programs(&self) -> Vec<(String, u32)> {
-        self.inner
-            .read()
-            .unwrap()
+        self.read_or_recover()
             .programs
             .iter()
             .map(|(n, p)| (n.clone(), p.pseudo_instance))
@@ -713,21 +723,21 @@ impl TagRegistry {
     // --- Gap 8: event suppression + dirty tracking ---
 
     pub fn set_suppress_events(&self, suppress: bool) {
-        self.inner.write().unwrap().suppress_events = suppress;
+        self.write_or_recover().suppress_events = suppress;
     }
 
     pub fn enable_dirty_tracking(&self) {
-        self.inner.write().unwrap().dirty_tracking = true;
+        self.write_or_recover().dirty_tracking = true;
     }
 
     pub fn disable_dirty_tracking(&self) {
-        let mut g = self.inner.write().unwrap();
+        let mut g = self.write_or_recover();
         g.dirty_tracking = false;
         g.dirty.clear();
     }
 
     pub fn drain_dirty(&self) -> Vec<u32> {
-        let mut g = self.inner.write().unwrap();
+        let mut g = self.write_or_recover();
         let out: Vec<u32> = g.dirty.iter().copied().collect();
         g.dirty.clear();
         out

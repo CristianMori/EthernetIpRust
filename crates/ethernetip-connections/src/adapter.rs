@@ -507,7 +507,16 @@ impl SessionState {
                 // refers to by querying the CM for a matching row; fall
                 // back to the first id when the parse fails so the
                 // single-connection common case still works.
-                let active = match ForwardCloseRequest::decode(&body) {
+                //
+                // Resolve against the GLOBAL connection table but then
+                // confirm the resulting id is one THIS session owns
+                // before closing it. Without that per-session gate an
+                // attacker who guessed (or observed) another originator's
+                // triplet could close that peer's connection from an
+                // unrelated session — CIP has no cross-session identity
+                // tying FC to the originator who opened the connection,
+                // so we enforce it ourselves.
+                let candidate = match ForwardCloseRequest::decode(&body) {
                     Ok(req) => self.cm.find_by_triplet(
                         req.connection_serial,
                         req.originator_vendor,
@@ -515,22 +524,41 @@ impl SessionState {
                     ),
                     Err(_) => self.active_conn_ids.first().copied(),
                 };
-                match self.cm.process_forward_close(&body, active) {
-                    Ok(resp) => {
-                        if let Some(id) = active {
-                            self.active_conn_ids.retain(|x| *x != id);
-                        }
-                        (
-                            service::FORWARD_CLOSE | service::REPLY_FLAG,
-                            status::SUCCESS,
-                            resp.encode(),
-                        )
-                    }
-                    Err(_) => (
+                let active = candidate.filter(|id| self.active_conn_ids.contains(id));
+                if candidate.is_some() && active.is_none() {
+                    // Triplet resolved to a real row — but it's not one
+                    // this session Forward_Open'd. Reject with the
+                    // standard "no more connection resources" code
+                    // rather than touching the other session's row.
+                    tracing::warn!(
+                        peer=?self.peer,
+                        "Forward_Close rejected: triplet resolves to connection id {:?} not owned by this session",
+                        candidate,
+                    );
+                    reply_ext_status = vec![0x0113];
+                    (
                         service::FORWARD_CLOSE | service::REPLY_FLAG,
                         status::CONNECTION_FAILURE,
                         Vec::new(),
-                    ),
+                    )
+                } else {
+                    match self.cm.process_forward_close(&body, active) {
+                        Ok(resp) => {
+                            if let Some(id) = active {
+                                self.active_conn_ids.retain(|x| *x != id);
+                            }
+                            (
+                                service::FORWARD_CLOSE | service::REPLY_FLAG,
+                                status::SUCCESS,
+                                resp.encode(),
+                            )
+                        }
+                        Err(_) => (
+                            service::FORWARD_CLOSE | service::REPLY_FLAG,
+                            status::CONNECTION_FAILURE,
+                            Vec::new(),
+                        ),
+                    }
                 }
             }
             other => {

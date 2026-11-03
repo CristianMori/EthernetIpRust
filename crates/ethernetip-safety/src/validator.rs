@@ -11,11 +11,25 @@
 //! (`packets_produced`, `crc_errors`, ...) live on
 //! [`SafetyValidatorInstance`] but aren't wired into the data-path yet.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ethernetip_core::cip::{
     class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType, CipDispatcher,
 };
+
+/// Acquire a `std::sync::Mutex` guard, recovering transparently from
+/// mutex poisoning.
+///
+/// `std::sync::Mutex` poisons itself if a thread panics while holding
+/// the guard; every subsequent `.lock()` then returns `Err`. The
+/// validator's internal maps have no half-committed invariants a
+/// panicked write could leave behind (every insert / remove is a single
+/// map operation), so recovering the inner guard keeps class 0x3A
+/// usable instead of letting one panic translate into a permanent
+/// validator-wide outage.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// State of a Safety Validator instance (Vol 5 §5-3.6.1).
 #[repr(u8)]
@@ -134,7 +148,7 @@ impl SafetyValidatorObject {
             AttributeAccess::READ,
             0,
         ));
-        self.runtime.lock().unwrap().insert(id, init);
+        lock_recover(&self.runtime).insert(id, init);
         Some(id)
     }
 
@@ -165,14 +179,14 @@ impl SafetyValidatorObject {
         if ok.is_none() {
             return None;
         }
-        self.runtime.lock().unwrap().insert(id, init);
+        lock_recover(&self.runtime).insert(id, init);
         Some(id)
     }
 
     /// Read the current runtime state for an instance. Returns a clone
     /// because the caller usually just wants a snapshot for logging.
     pub fn runtime_state(&self, instance_id: u32) -> Option<SafetyValidatorInstanceState> {
-        self.runtime.lock().unwrap().get(&instance_id).cloned()
+        lock_recover(&self.runtime).get(&instance_id).cloned()
     }
 
     /// Remove a validator instance through a dispatcher that already
@@ -190,7 +204,7 @@ impl SafetyValidatorObject {
                 cls.remove_instance(instance_id).is_some()
             })
             .unwrap_or(false);
-        let removed_runtime = self.runtime.lock().unwrap().remove(&instance_id).is_some();
+        let removed_runtime = lock_recover(&self.runtime).remove(&instance_id).is_some();
         removed_cip || removed_runtime
     }
 
@@ -200,13 +214,13 @@ impl SafetyValidatorObject {
     where
         F: FnOnce(&mut SafetyValidatorInstanceState),
     {
-        if let Some(state) = self.runtime.lock().unwrap().get_mut(&instance_id) {
+        if let Some(state) = lock_recover(&self.runtime).get_mut(&instance_id) {
             f(state);
         }
     }
 
     fn alloc_instance_id(&self) -> u32 {
-        let mut g = self.next_instance_id.lock().unwrap();
+        let mut g = lock_recover(&self.next_instance_id);
         *g += 1;
         *g
     }

@@ -33,7 +33,23 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Acquire a `std::sync::Mutex` guard, recovering transparently from
+/// mutex poisoning.
+///
+/// `std::sync::Mutex` poisons itself if a thread panics while holding
+/// the guard; every subsequent `.lock()` then returns `Err`. The
+/// Connection Manager's locks (`connections`, `producer_spawner`,
+/// `safety_handler`) have no half-committed invariants that a panicked
+/// section could have left — the connection table is append/remove-only
+/// and the two spawner/handler slots just hold an `Option<Arc<...>>`.
+/// Recovering the inner guard on poison keeps the entire CM responsive
+/// instead of translating one panic into a permanent connection-wide
+/// outage.
+fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -272,7 +288,7 @@ impl std::fmt::Debug for ConnectionManagerObject {
             .field("next_conn_id", &self.next_conn_id)
             .field(
                 "producer_spawner",
-                &self.producer_spawner.lock().unwrap().as_ref().map(|_| "..."),
+                &lock_recover(&self.producer_spawner).as_ref().map(|_| "..."),
             )
             .finish()
     }
@@ -338,7 +354,7 @@ impl ConnectionManagerObject {
                     );
                     return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
                 };
-                let handler = safety_handler_for_fo.lock().unwrap().as_ref().cloned();
+                let handler = lock_recover(&safety_handler_for_fo).as_ref().cloned();
                 match do_process_forward_open_with_safety(
                     &req.data,
                     ctx,
@@ -400,7 +416,7 @@ impl ConnectionManagerObject {
     where
         F: Fn(&[u8]) -> Option<u16> + Send + Sync + 'static,
     {
-        *self.safety_handler.lock().unwrap() = Some(Arc::new(handler));
+        *lock_recover(&self.safety_handler) = Some(Arc::new(handler));
     }
 
     /// Take the built CipClass so it can be registered on a dispatcher.
@@ -439,18 +455,18 @@ impl ConnectionManagerObject {
             + Sync
             + 'static,
     {
-        *self.producer_spawner.lock().unwrap() = Some(Arc::new(spawner));
+        *lock_recover(&self.producer_spawner) = Some(Arc::new(spawner));
     }
 
     /// Live connection count. Sync now — the connection table sits behind
     /// a `std::sync::Mutex`; the lock is held only for short lookups.
     pub fn connection_count(&self) -> usize {
-        self.connections.lock().unwrap().rows.len()
+        lock_recover(&self.connections).rows.len()
     }
 
     /// Snapshot every live connection.
     pub fn snapshot_connections(&self) -> Vec<ConnectionSummary> {
-        self.connections.lock().unwrap().summaries()
+        lock_recover(&self.connections).summaries()
     }
 
     /// Process a Forward_Open request. Parses the body, validates the
@@ -464,7 +480,7 @@ impl ConnectionManagerObject {
         body: &[u8],
         ctx: &ForwardOpenContext,
     ) -> Result<ForwardOpenResponse> {
-        let handler = self.safety_handler.lock().unwrap().as_ref().cloned();
+        let handler = lock_recover(&self.safety_handler).as_ref().cloned();
         do_process_forward_open_with_safety(
             body,
             ctx,
@@ -607,7 +623,7 @@ fn do_process_forward_open_with_safety(
     // Duplicate-triad check — a second FO with the same
     // (connSerial, origVendor, origSerial) is a "Connection In Use" (0x0100).
     {
-        let table = connections.lock().unwrap();
+        let table = lock_recover(connections);
         for row in table.rows.values() {
             if row.originator_vendor == req.originator_vendor
                 && row.originator_serial == req.originator_serial
@@ -678,7 +694,7 @@ fn do_process_forward_open_with_safety(
     );
 
     {
-        let mut table = connections.lock().unwrap();
+        let mut table = lock_recover(connections);
         table.rows.insert(
             assigned_oto_t,
             ConnectionRow {
@@ -724,7 +740,7 @@ fn do_process_forward_close(
         e
     })?;
     if let Some(id) = active_conn_id {
-        let mut table = connections.lock().unwrap();
+        let mut table = lock_recover(connections);
         if let Some(row) = table.rows.remove(&id) {
             // Signal the producer to stop. Drop the row's JoinHandle;
             // the task's own tokio::select! will see shutdown_rx and

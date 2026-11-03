@@ -9,12 +9,26 @@
 //! Attribute IDs, service codes, and reset-type semantics match Vol 5
 //! (CIP Safety) exactly.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ethernetip_core::cip::{
     class_codes, status, AttributeAccess, CipAttribute, CipClass, CipDataType, CipInstance,
     CipServiceDefinition, CipServiceRequest, CipServiceResponse,
 };
+
+/// Acquire the supervisor's inner-state guard, recovering transparently
+/// from mutex poisoning.
+///
+/// `std::sync::Mutex` poisons itself if a thread panics while holding
+/// the guard; every subsequent `.lock()` then returns `Err`. The
+/// supervisor keeps a plain `SupervisorInner` with no half-committed
+/// invariants (every field is overwritten atomically by its handler),
+/// so recovering the inner guard on poison keeps the Supervisor
+/// responsive instead of translating one panicked handler into a
+/// permanent commissioning-service outage.
+fn lock_inner(m: &Mutex<SupervisorInner>) -> MutexGuard<'_, SupervisorInner> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use crate::types::{SafetyConfigurationId, SafetyNetworkNumber, UniqueNetworkId};
 
@@ -198,7 +212,7 @@ impl SafetySupervisorObject {
     /// [`Self::sync_to_dispatcher`] to push the new values through the
     /// dispatcher.
     pub fn start(&mut self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = lock_inner(&self.inner);
         g.state = SafetySupervisorState::Executing;
         g.mode = SafetySupervisorMode::Run;
         let state = g.state as u8;
@@ -210,7 +224,7 @@ impl SafetySupervisorObject {
     /// Transition to Abort (safety fault detected). The application picks
     /// the moment to call this; the supervisor itself doesn't watchdog.
     pub fn abort(&mut self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = lock_inner(&self.inner);
         g.state = SafetySupervisorState::Abort;
         let state = g.state as u8;
         let mode = g.mode as u8;
@@ -220,7 +234,7 @@ impl SafetySupervisorObject {
 
     /// Reset from Abort back to Idle.
     pub fn reset(&mut self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = lock_inner(&self.inner);
         g.state = SafetySupervisorState::Idle;
         g.mode = SafetySupervisorMode::Idle;
         let state = g.state as u8;
@@ -248,14 +262,14 @@ impl SafetySupervisorObject {
     /// `Get_Attribute_Single` client. Convenience wrapper
     /// [`Self::transition_executing_via`] does both in one call.
     pub fn transition_executing(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = lock_inner(&self.inner);
         g.state = SafetySupervisorState::Executing;
         g.mode = SafetySupervisorMode::Run;
     }
 
     /// Transition to Idle / Idle via `&self` — safe through an `Arc`.
     pub fn transition_idle(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = lock_inner(&self.inner);
         g.state = SafetySupervisorState::Idle;
         g.mode = SafetySupervisorMode::Idle;
     }
@@ -286,7 +300,7 @@ impl SafetySupervisorObject {
     /// state-transition calls (`start`, `abort`, `reset`) need to reflect
     /// through the dispatcher.
     pub fn sync_to_dispatcher(&self, dispatcher: &ethernetip_core::cip::CipDispatcher) {
-        let g = self.inner.lock().unwrap();
+        let g = lock_inner(&self.inner);
         let state = g.state as u8;
         let mode = g.mode as u8;
         drop(g);
@@ -305,16 +319,16 @@ impl SafetySupervisorObject {
     }
 
     pub fn state(&self) -> SafetySupervisorState {
-        self.inner.lock().unwrap().state
+        lock_inner(&self.inner).state
     }
     pub fn mode(&self) -> SafetySupervisorMode {
-        self.inner.lock().unwrap().mode
+        lock_inner(&self.inner).mode
     }
     pub fn tunid(&self) -> UniqueNetworkId {
-        self.inner.lock().unwrap().tunid
+        lock_inner(&self.inner).tunid
     }
     pub fn tunid_assigned(&self) -> bool {
-        self.inner.lock().unwrap().tunid_assigned
+        lock_inner(&self.inner).tunid_assigned
     }
 
     /// Take the built `CipClass` so it can be registered on a dispatcher.
@@ -338,7 +352,7 @@ fn handle_safety_reset(
         return CipServiceResponse::error(req.service_code, status::NOT_ENOUGH_DATA);
     }
     let reset_type = req.data[0];
-    let mut g = inner.lock().unwrap();
+    let mut g = lock_inner(inner);
     match reset_type {
         0 | 1 => {
             // Type 0: device reset. Type 1: factory defaults. Both come
@@ -378,7 +392,7 @@ fn handle_propose_tunid(
     }
     // All-0xFF = cancel any pending proposal (Vol 5 convention).
     let all_ff = req.data[..UniqueNetworkId::SIZE].iter().all(|&b| b == 0xFF);
-    let mut g = inner.lock().unwrap();
+    let mut g = lock_inner(inner);
     if all_ff {
         g.proposed_tunid = None;
         return CipServiceResponse::success(req.service_code);
@@ -401,7 +415,7 @@ fn handle_apply_tunid(
     if req.data.len() < UniqueNetworkId::SIZE {
         return CipServiceResponse::error(req.service_code, status::NOT_ENOUGH_DATA);
     }
-    let mut g = inner.lock().unwrap();
+    let mut g = lock_inner(inner);
     let Some(proposed) = g.proposed_tunid else {
         return CipServiceResponse::error(req.service_code, status::OBJECT_STATE_CONFLICT);
     };

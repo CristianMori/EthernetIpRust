@@ -331,6 +331,15 @@ impl SafetySupervisorObject {
         lock_inner(&self.inner).tunid_assigned
     }
 
+    /// Safety Configuration Identifier (SCCRC + SCTS). Zero on an
+    /// unconfigured device; set by the originator through
+    /// Set_Attribute_Single(class 0x39, attr 6) or by the application.
+    /// The adapter uses it to accept or reject an incoming safety
+    /// Forward_Open whose safety network segment carries an SCCRC.
+    pub fn scid(&self) -> SafetyConfigurationId {
+        lock_inner(&self.inner).scid
+    }
+
     /// Take the built `CipClass` so it can be registered on a dispatcher.
     /// The supervisor keeps its own state handles, so accessors above keep
     /// working after this call.

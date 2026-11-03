@@ -34,6 +34,7 @@ use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 
+use crate::cpcrc;
 use crate::crc;
 use crate::forward_open::SafetyAppReply;
 use crate::frame_codec::{self, DecodedFrame, SafetyDecodeError};
@@ -46,6 +47,39 @@ use crate::validator::{SafetyValidatorInstanceState, SafetyValidatorObject, Safe
 /// indefinitely, so without a cap a peer can exhaust tokio tasks (and file
 /// descriptors) by opening thousands of connections and never writing.
 pub const MAX_CONCURRENT_SESSIONS: usize = 64;
+
+// Static Once's for "log this configuration warning on the first FO only"
+// — keeps a hot stream of Forward_Opens from spamming the log.
+static WARN_DEFAULT_TUNID: std::sync::Once = std::sync::Once::new();
+static WARN_NO_SUPERVISOR_SCID: std::sync::Once = std::sync::Once::new();
+static WARN_NO_CONFIGURED_SCID: std::sync::Once = std::sync::Once::new();
+
+fn warn_default_tunid_once() {
+    WARN_DEFAULT_TUNID.call_once(|| {
+        tracing::warn!(
+            "safety adapter has no configured TUNID — accepting safety Forward_Opens \
+             from any originator. Configure SafetyAdapterConfig::tunid for production use."
+        );
+    });
+}
+
+fn warn_no_supervisor_scid_once() {
+    WARN_NO_SUPERVISOR_SCID.call_once(|| {
+        tracing::warn!(
+            "safety adapter has no supervisor configured — skipping SCCRC check. \
+             Install SafetyAdapterConfig::supervisor to enable SCID enforcement."
+        );
+    });
+}
+
+fn warn_no_configured_scid_once() {
+    WARN_NO_CONFIGURED_SCID.call_once(|| {
+        tracing::warn!(
+            "safety supervisor has no configured SCID — skipping SCCRC check. \
+             Set attribute 6 on class 0x39 (Safety Supervisor) to enable SCID enforcement."
+        );
+    });
+}
 
 /// Hard cap on the number of simultaneous safety Forward_Opens a single TCP
 /// session is allowed to hold. Safety connections are heavier than ordinary
@@ -755,6 +789,99 @@ async fn handle_safety_forward_open(
     let safety_off =
         safety_off.ok_or_else(|| EipError::Protocol("no safety segment in Forward_Open".into()))?;
     let (safety_seg, _) = SafetyNetworkSegment::parse(&conn_path[safety_off..])?;
+
+    // Safety validation: before allocating any Validator instance or
+    // seat in the shared connection table, verify that the originator
+    // targeted THIS device and that the Forward_Open hasn't been
+    // tampered with in flight.
+    //
+    // 1. TUNID: when the adapter has a configured non-default TUNID,
+    //    compare it to safety_seg.tunid. CIP ext-status 0x080E is the
+    //    standard "wrong target" reject. For dev builds that run with
+    //    the default-zero TUNID, log a warning once and accept — the
+    //    user explicitly didn't configure one.
+    // 2. CPCRC: mandatory. Recompute from the Forward_Open bytes the
+    //    originator saw (the full body passed into this function) and
+    //    compare to safety_seg.cpcrc. Mismatch rejects with 0x0803
+    //    ("Connection Parameter CRC error").
+    // 3. SCCRC: only enforceable when the supervisor has a configured
+    //    Safety Configuration Identifier (SCID set via class 0x39 attr
+    //    6). On a configured device with sccrc != 0 AND a non-zero
+    //    seg.sccrc, mismatch rejects with 0x080F ("SCID mismatch").
+    //    Without a configured SCID, log once and skip (matches the
+    //    behavior in the C# and C++ ports — SCCRC is a hash over the
+    //    safety configuration data, which only the configuration tool
+    //    knows; the target can only reject an sccrc that explicitly
+    //    disagrees with a value it was told to expect).
+    {
+        let tunid_configured = cfg.target_tunid != UniqueNetworkId::default();
+        if tunid_configured {
+            if safety_seg.tunid != cfg.target_tunid {
+                tracing::warn!(
+                    "safety Forward_Open rejected: TUNID mismatch (seg={:?} cfg={:?})",
+                    safety_seg.tunid,
+                    cfg.target_tunid,
+                );
+                return Err(EipError::Cip {
+                    status: 0x01,
+                    ext: vec![0x080E],
+                });
+            }
+        } else {
+            warn_default_tunid_once();
+        }
+
+        // CPCRC — mandatory.
+        let nsd_size = if safety_seg.format == 0x02 { 50 } else { 48 };
+        if safety_off + nsd_size > conn_path.len() {
+            return Err(EipError::Protocol(
+                "safety segment NSD extends past connection path".into(),
+            ));
+        }
+        let nsd = &conn_path[safety_off..safety_off + nsd_size];
+        let app_path = &conn_path[..safety_off];
+        // Target sees the path as-is from body[35] once routing (if any)
+        // is stripped by intermediate bridges; use that for the CPCRC
+        // path_size byte (byte at offset 35 of the FO service data).
+        let effective_path_size_words = path_size_words as u8;
+        let computed_cpcrc =
+            cpcrc::compute_from_raw(body, app_path, nsd, effective_path_size_words)?;
+        if computed_cpcrc != safety_seg.cpcrc {
+            tracing::warn!(
+                "safety Forward_Open rejected: CPCRC mismatch (computed=0x{:08X} seg=0x{:08X})",
+                computed_cpcrc,
+                safety_seg.cpcrc,
+            );
+            return Err(EipError::Cip {
+                status: 0x01,
+                ext: vec![0x0803],
+            });
+        }
+
+        // SCCRC — compare against configured SCID when both sides have one.
+        if let Some(sup) = cfg.supervisor.as_ref() {
+            let configured = sup.scid();
+            if configured.sccrc != 0 && safety_seg.sccrc != 0
+                && configured.sccrc != safety_seg.sccrc
+            {
+                tracing::warn!(
+                    "safety Forward_Open rejected: SCCRC mismatch (seg=0x{:08X} supervisor=0x{:08X})",
+                    safety_seg.sccrc,
+                    configured.sccrc,
+                );
+                return Err(EipError::Cip {
+                    status: 0x01,
+                    ext: vec![0x080F],
+                });
+            }
+            if configured.sccrc == 0 {
+                warn_no_configured_scid_once();
+            }
+        } else {
+            warn_no_supervisor_scid_once();
+        }
+    }
+
     // Accept whichever format the scanner picked; per-connection state
     // records it so the consumer decodes each frame with the right CRC
     // family (Base = S1/S3, Extended = S5 with rollover-folded seeds).
@@ -1163,6 +1290,170 @@ impl TcooLoop {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forward_open::{build_safety_forward_open, SafetyForwardOpenConfig};
+    use crate::types::SafetyNetworkNumber;
+
+    fn test_cfg() -> SafetyForwardOpenConfig {
+        SafetyForwardOpenConfig {
+            consumed_assembly: 300,
+            produced_assembly: 301,
+            config_assembly: 302,
+            consumed_data_size: 8,
+            produced_data_size: 8,
+            rpi_us: 10_000,
+            format: SafetyFormat::Base,
+            tunid: UniqueNetworkId {
+                snn: SafetyNetworkNumber([1, 2, 3, 4, 5, 6]),
+                node_address: 0xC0A8_0158,
+            },
+            ounid: UniqueNetworkId {
+                snn: SafetyNetworkNumber([9, 8, 7, 6, 5, 4]),
+                node_address: 0xC0A8_014A,
+            },
+            ..SafetyForwardOpenConfig::default()
+        }
+    }
+
+    fn adapter_cfg_with_tunid(tunid: UniqueNetworkId) -> SafetyAdapterConfig {
+        SafetyAdapterConfig {
+            tcp_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            udp_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            target_vendor: 0x1234,
+            target_serial: 0xDEAD_BEEF,
+            target_tunid: tunid,
+            input_data_size: 8,
+            format: SafetyFormat::Base,
+            peer_udp_port: 2222,
+            tcoo_period_us: 100_000,
+            dispatcher: None,
+            validator: None,
+            supervisor: None,
+        }
+    }
+
+    /// Finding 4 regression: a Forward_Open body whose CPCRC field has been
+    /// tampered with must be rejected with CIP 0x01 ext 0x0803, and no
+    /// state must be inserted into the shared connection table.
+    #[tokio::test]
+    async fn safety_fo_rejects_cpcrc_mismatch_with_0x0803() {
+        let fo_cfg = test_cfg();
+        let wire = build_safety_forward_open(
+            &fo_cfg,
+            0x1111,
+            0x0001,
+            0xC0FF_EE01,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // The target TUNID in the adapter config matches the one baked
+        // into the FO path, so TUNID is accepted and the test exercises
+        // the CPCRC gate specifically.
+        let cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
+
+        // Baseline: unmodified wire — should be accepted.
+        {
+            let shared = Mutex::new(std::collections::HashMap::new());
+            let open = AtomicBool::new(false);
+            let next_id = AtomicU32::new(0x8000_0000);
+            let ok = handle_safety_forward_open(
+                &wire.service_data,
+                SocketAddr::from(([127, 0, 0, 1], 2222)),
+                &cfg,
+                &shared,
+                &open,
+                &next_id,
+            )
+            .await;
+            assert!(ok.is_ok(), "legitimate safety FO must verify: {:?}", ok.err());
+            assert_eq!(shared.lock().await.len(), 1);
+        }
+
+        // Attack: flip one byte inside the segment's CPCRC field. In the
+        // segment the CPCRC lives at offset 48 from the 0x50 leader (Base
+        // format), and the segment starts after the 36-byte FO prefix
+        // plus the 8-byte assembly shortcut.
+        let seg_start = 36 + 8;
+        let cpcrc_abs = seg_start + 48;
+        let mut tampered = wire.service_data.clone();
+        tampered[cpcrc_abs] ^= 0xFF;
+
+        let shared = Mutex::new(std::collections::HashMap::new());
+        let open = AtomicBool::new(false);
+        let next_id = AtomicU32::new(0x8000_0000);
+        let err = handle_safety_forward_open(
+            &tampered,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect_err("tampered CPCRC must be rejected");
+        match err {
+            EipError::Cip { status, ext } => {
+                assert_eq!(status, 0x01, "general status must be CONNECTION_FAILURE");
+                assert_eq!(ext, vec![0x0803], "ext status must be 0x0803 (CPCRC mismatch)");
+            }
+            other => panic!("expected CIP error, got {:?}", other),
+        }
+        // State must NOT have been inserted on reject.
+        assert_eq!(shared.lock().await.len(), 0);
+    }
+
+    /// Finding 4 companion: tampered TUNID in the FO's safety segment
+    /// is rejected with 0x080E when the adapter has a configured TUNID.
+    #[tokio::test]
+    async fn safety_fo_rejects_tunid_mismatch_with_0x080e() {
+        let fo_cfg = test_cfg();
+        let wire = build_safety_forward_open(
+            &fo_cfg,
+            0x1111,
+            0x0001,
+            0xC0FF_EE01,
+            0xA0,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        // Adapter is configured with a DIFFERENT TUNID than the FO carries.
+        let different = UniqueNetworkId {
+            snn: SafetyNetworkNumber([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]),
+            node_address: 0xC0A8_0199,
+        };
+        let cfg = adapter_cfg_with_tunid(different);
+
+        let shared = Mutex::new(std::collections::HashMap::new());
+        let open = AtomicBool::new(false);
+        let next_id = AtomicU32::new(0x8000_0000);
+        let err = handle_safety_forward_open(
+            &wire.service_data,
+            SocketAddr::from(([127, 0, 0, 1], 2222)),
+            &cfg,
+            &shared,
+            &open,
+            &next_id,
+        )
+        .await
+        .expect_err("mismatched TUNID must be rejected");
+        match err {
+            EipError::Cip { status, ext } => {
+                assert_eq!(status, 0x01);
+                assert_eq!(ext, vec![0x080E]);
+            }
+            other => panic!("expected CIP error, got {:?}", other),
+        }
+        assert_eq!(shared.lock().await.len(), 0);
     }
 }
 

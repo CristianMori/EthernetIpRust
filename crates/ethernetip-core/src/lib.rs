@@ -10,6 +10,7 @@ pub mod cpf;
 pub mod device;
 pub mod encap;
 pub mod error;
+pub mod lifecycle;
 pub mod path;
 pub mod path_parse;
 pub mod session;

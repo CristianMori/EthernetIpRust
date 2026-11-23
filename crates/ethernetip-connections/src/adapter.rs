@@ -21,7 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinHandle;
+use ethernetip_core::lifecycle::{drain_join_set, SESSION_DRAIN_TIMEOUT};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 
 /// Acquire a `std::sync::Mutex` guard, recovering transparently from
@@ -224,7 +225,9 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
     // Forward_Open it needs to launch the T→O tokio task, but the class
     // itself is transport-agnostic — the adapter is where the socket
     // types live, so we hand the CM a closure that spawns the task.
-    cm.set_producer_spawner(|args: ProducerSpawnArgs, shutdown_rx| {
+    let producers = Arc::new(ProducerTracker::default());
+    let producers_for_spawner = producers.clone();
+    cm.set_producer_spawner(move |args: ProducerSpawnArgs, shutdown_rx| {
         let producer = ProducerState {
             connection_id: args.connection_id,
             udp: args.udp,
@@ -236,7 +239,11 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
             seq: AtomicU32::new(0),
         };
         let _ = args.run_idle; // producer captures its own copy
-        tokio::spawn(producer.run(shutdown_rx))
+        let guard = producers_for_spawner.enter();
+        tokio::spawn(async move {
+            producer.run(shutdown_rx).await;
+            drop(guard);
+        })
     });
 
     // UDP consumer: decode incoming O→T frames and update the right assembly.
@@ -262,6 +269,10 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
 
     let combined = tokio::spawn(async move {
         let _ = tokio::join!(consumer_task, accept_task);
+        // Sessions are gone, so every producer they owned has been told to
+        // stop. Wait for them to actually exit: each holds an `Arc<UdpSocket>`
+        // and the port is not free until the last clone is dropped.
+        let _ = tokio::time::timeout(SESSION_DRAIN_TIMEOUT, producers.wait_idle()).await;
     });
 
     Ok(AdapterHandle {
@@ -271,6 +282,45 @@ pub async fn start(cfg: AdapterConfig) -> Result<AdapterHandle> {
         shutdown_tx,
         task: combined,
     })
+}
+
+/// Counts live producer tasks so shutdown can wait for them to release their
+/// UDP socket clones.
+#[derive(Default)]
+struct ProducerTracker {
+    live: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+struct ProducerGuard(Arc<ProducerTracker>);
+
+impl Drop for ProducerGuard {
+    fn drop(&mut self) {
+        if self.0.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl ProducerTracker {
+    fn enter(self: &Arc<Self>) -> ProducerGuard {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        ProducerGuard(self.clone())
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Arm the waiter before re-checking so a wake-up between the
+            // check and the await can't be missed.
+            notified.as_mut().enable();
+            if self.live.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct AcceptState {
@@ -285,11 +335,14 @@ struct AcceptState {
 
 impl AcceptState {
     async fn run(self, tcp: TcpListener, mut shutdown_rx: watch::Receiver<bool>) {
+        let mut sessions: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
                 // Any completion is a shutdown; `Err` means the handle was dropped
                 // without `shutdown()` and would otherwise fire on every pass.
                 _ = shutdown_rx.changed() => break,
+                // Reap finished sessions so the set doesn't grow unbounded.
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
                 accept = tcp.accept() => {
                     let (stream, peer) = match accept {
                         Ok(x) => x,
@@ -326,13 +379,18 @@ impl AcceptState {
                         session_handle: 0,
                         active_conn_ids: Vec::new(),
                     };
-                    tokio::spawn(async move {
-                        session.run().await;
+                    let session_shutdown = shutdown_rx.clone();
+                    sessions.spawn(async move {
+                        session.run(session_shutdown).await;
                         drop(permit);
                     });
                 }
             }
         }
+        // Stop listening, then let every session notice the signal, run its
+        // own teardown and release its UDP socket clone.
+        drop(tcp);
+        drain_join_set(&mut sessions, SESSION_DRAIN_TIMEOUT).await;
     }
 }
 
@@ -354,16 +412,45 @@ struct SessionState {
     active_conn_ids: Vec<u32>,
 }
 
+impl Drop for SessionState {
+    // Backstop for a session task that is aborted at shutdown: its
+    // connections must still leave the table so their producers stop.
+    fn drop(&mut self) {
+        self.release_connections();
+    }
+}
+
 impl SessionState {
-    async fn run(mut self) {
+    async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) {
+        self.serve(&mut shutdown_rx).await;
+        // TCP session ended without an explicit Forward_Close (peer
+        // dropped the socket, the adapter is shutting down, or the loop
+        // broke on error). Remove every connection this session still
+        // owned through the CM so their producer tasks shut down and the
+        // rows leave the table — otherwise a session that FO'd several
+        // connections and dropped without closing any of them would leak
+        // that many rows and tasks until process exit.
+        self.release_connections();
+    }
+
+    fn release_connections(&mut self) {
+        for id in self.active_conn_ids.drain(..) {
+            let _ = self.cm.remove_connection(id);
+        }
+    }
+
+    async fn serve(&mut self, shutdown_rx: &mut watch::Receiver<bool>) {
         loop {
             let mut header_buf = [0u8; HEADER_LEN];
             // Idle timeout on the next-request boundary: a peer that opens
             // a TCP session and goes silent must not keep its slot in the
-            // global session semaphore forever. Mid-frame reads below are
-            // not timed out — once a header is in, the payload is already
-            // bounded.
-            match tokio::time::timeout(SESSION_READ_TIMEOUT, self.stream.read_exact(&mut header_buf)).await {
+            // global session semaphore forever. The body read below gets the
+            // same bound, and both reads give way to the shutdown signal.
+            let read = tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                r = tokio::time::timeout(SESSION_READ_TIMEOUT, self.stream.read_exact(&mut header_buf)) => r,
+            };
+            match read {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
                     tracing::debug!(peer=?self.peer, "session read ended: {err}");
@@ -383,25 +470,28 @@ impl SessionState {
             };
             let mut payload = vec![0u8; header.length as usize];
             if header.length > 0 {
-                if let Err(err) = self.stream.read_exact(&mut payload).await {
-                    tracing::warn!(peer=?self.peer, "session body read ended: {err}");
-                    break;
+                // The body gets the same bound as the header: a peer that
+                // sends a header and stalls must not park the session.
+                let body = tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    r = tokio::time::timeout(SESSION_READ_TIMEOUT, self.stream.read_exact(&mut payload)) => r,
+                };
+                match body {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(peer=?self.peer, "session body read ended: {err}");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!(peer=?self.peer, "session body read timeout");
+                        break;
+                    }
                 }
             }
             if let Err(err) = self.dispatch(&header, &payload).await {
                 tracing::warn!(peer=?self.peer, "dispatch failed: {err}");
                 break;
             }
-        }
-        // TCP session ended without an explicit Forward_Close (peer
-        // dropped the socket, or the loop broke on error). Remove every
-        // connection this session still owned through the CM so their
-        // producer tasks shut down and the rows leave the table —
-        // otherwise a session that FO'd several connections and dropped
-        // without closing any of them would leak that many rows and
-        // tasks until process exit.
-        for id in self.active_conn_ids.drain(..) {
-            let _ = self.cm.remove_connection(id);
         }
     }
 

@@ -22,7 +22,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+
+use ethernetip_core::lifecycle::{drain_join_set, SESSION_DRAIN_TIMEOUT};
 
 use ethernetip_core::cip::{class_codes as class, service_codes as service, status};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
@@ -119,11 +121,14 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
     let session_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
+        let mut sessions: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
                 // Any completion is a shutdown; `Err` means the handle was dropped
                 // without `shutdown()` and would otherwise fire on every pass.
                 _ = shutdown_rx.changed() => break,
+                // Reap finished sessions so the set doesn't grow unbounded.
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
                 accept = tcp.accept() => {
                     match accept {
                         Ok((stream, peer)) => {
@@ -146,9 +151,17 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
                             let registry = registry.clone();
                             let identity = identity.clone();
                             let local = tcp_addr;
-                            tokio::spawn(async move {
-                                if let Err(err) = handle_session(stream, peer, local, registry, identity).await {
-                                    tracing::debug!("session ended: {err}");
+                            let mut session_shutdown = shutdown_rx.clone();
+                            sessions.spawn(async move {
+                                // The session owns no state beyond its socket, so
+                                // cancelling it on shutdown just closes the stream.
+                                tokio::select! {
+                                    _ = session_shutdown.changed() => {}
+                                    res = handle_session(stream, peer, local, registry, identity) => {
+                                        if let Err(err) = res {
+                                            tracing::debug!("session ended: {err}");
+                                        }
+                                    }
                                 }
                                 drop(permit);
                             });
@@ -158,6 +171,10 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
                 }
             }
         }
+        // Stop listening, then give sessions a bounded window to notice the
+        // signal before aborting stragglers.
+        drop(tcp);
+        drain_join_set(&mut sessions, SESSION_DRAIN_TIMEOUT).await;
     });
     Ok(TagServerHandle {
         tcp_addr,
@@ -198,8 +215,8 @@ async fn handle_session(
     loop {
         // Idle timeout on the next-request boundary: a peer that opens a
         // TCP session and goes silent must not keep its slot in the global
-        // session semaphore forever. Mid-frame reads below are not timed
-        // out — once a header is in, the payload is already bounded.
+        // session semaphore forever. The body read below gets the same bound,
+        // and both reads give way to the shutdown signal.
         match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut header_buf)).await {
             Ok(r) => r?,
             Err(_) => {
@@ -210,7 +227,17 @@ async fn handle_session(
         let header = Header::parse(&header_buf)?;
         let mut payload = vec![0u8; header.length as usize];
         if header.length > 0 {
-            stream.read_exact(&mut payload).await?;
+            // Same bound as the header read: a peer that sends a header and
+            // stalls must not park the session.
+            match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut payload)).await {
+                Ok(r) => {
+                    r?;
+                }
+                Err(_) => {
+                    tracing::debug!("session {} body read timeout", peer);
+                    return Ok(());
+                }
+            }
         }
         match header.command {
             x if x == Command::ListIdentity.as_u16() => {

@@ -16,6 +16,7 @@ use tokio::net::ToSocketAddrs;
 use crate::cpf::{self, Envelope, Item};
 use crate::encap::{self, Command, Header, HEADER_LEN};
 use crate::error::{EipError, Result};
+use crate::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
 
 /// Default request timeout used by [`EipSession::connect`].
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +28,10 @@ pub struct EipSession {
     peer: SocketAddr,
     ctx_counter: u64,
     registered: bool,
+    /// Bound on each request/reply exchange. `None` disables it.
+    request_timeout: Option<Duration>,
+    /// Set once a timeout dropped the stream; every later call fails `Closed`.
+    dead: bool,
 }
 
 impl EipSession {
@@ -43,12 +48,40 @@ impl EipSession {
             peer,
             ctx_counter: 0,
             registered: false,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            dead: false,
         })
+    }
+
+    /// Set the per-exchange reply timeout (default 5 s). `None` waits forever.
+    pub fn set_request_timeout(&mut self, timeout: Option<Duration>) {
+        self.request_timeout = timeout;
+    }
+
+    /// Builder form of [`Self::set_request_timeout`].
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Current per-exchange reply timeout.
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// Connect and register in one call.
     pub async fn connect_and_register<A: ToSocketAddrs>(addr: A) -> Result<Self> {
+        Self::connect_and_register_with(addr, Some(DEFAULT_REQUEST_TIMEOUT)).await
+    }
+
+    /// Like [`Self::connect_and_register`] with an explicit request timeout
+    /// (applied to `RegisterSession` too). `None` disables it.
+    pub async fn connect_and_register_with<A: ToSocketAddrs>(
+        addr: A,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let mut s = Self::connect(addr).await?;
+        s.request_timeout = request_timeout;
         s.register().await?;
         Ok(s)
     }
@@ -219,8 +252,25 @@ impl EipSession {
         session_handle: u32,
         payload: &[u8],
     ) -> Result<RawReply> {
+        if self.dead {
+            return Err(EipError::Closed);
+        }
         let ctx = self.next_ctx();
         let frame = encap::encode_frame(command, session_handle, ctx, payload);
+        let limit = self.request_timeout;
+        let r = bounded(limit, self.exchange_inner(frame)).await;
+        if let Err(EipError::Timeout(_)) = &r {
+            // A late reply would desync the stream: close it and reset the
+            // session state.
+            self.dead = true;
+            self.registered = false;
+            self.session_handle = 0;
+            let _ = self.stream.shutdown().await;
+        }
+        r
+    }
+
+    async fn exchange_inner(&mut self, frame: BytesMut) -> Result<RawReply> {
         self.stream.write_all(&frame).await?;
 
         let mut header_buf = [0u8; HEADER_LEN];

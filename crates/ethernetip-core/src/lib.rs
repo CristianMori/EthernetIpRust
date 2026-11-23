@@ -14,10 +14,12 @@ pub mod lifecycle;
 pub mod path;
 pub mod path_parse;
 pub mod session;
+pub mod timeout;
 pub mod unconnected_send;
 
 pub use error::{EipError, Result};
 pub use session::EipSession;
+pub use timeout::DEFAULT_REQUEST_TIMEOUT;
 
 /// Default EtherNet/IP TCP port.
 pub const EIP_PORT: u16 = 44818;

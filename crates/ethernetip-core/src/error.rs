@@ -38,6 +38,11 @@ pub enum EipError {
     /// Operation attempted on a closed session.
     #[error("session is closed")]
     Closed,
+
+    /// No reply arrived within the configured request timeout. The TCP
+    /// stream is out of sync after this and has been dropped.
+    #[error("request timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 fn format_ext(ext: &[u16]) -> String {

@@ -32,6 +32,9 @@ use crate::forward_open::{
 /// Assembly Object class id used in Class 1 connection paths.
 const ASSEMBLY_CLASS: u16 = 0x04;
 
+/// Default bound on the Forward_Close exchange in [`ScannerConnection::close`].
+pub const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Default originator vendor id reported in Forward_Open.
 const DEFAULT_ORIG_VENDOR: u16 = 0x0001;
 
@@ -64,6 +67,10 @@ pub struct ScannerConfig {
     /// Inline configuration data prepended into the connection path as a
     /// `Simple Data Segment (0x80)`. Empty vec means no config data segment.
     pub config_data: Vec<u8>,
+    /// Upper bound on each network exchange made by [`ScannerConnection::close`]
+    /// (Forward_Close reply). A target that keeps TCP open but never answers
+    /// would otherwise hang `close()` forever. Defaults to [`DEFAULT_CLOSE_TIMEOUT`].
+    pub close_timeout: Duration,
 }
 
 impl ScannerConfig {
@@ -97,6 +104,7 @@ impl ScannerConfig {
             connection_timeout_mult: 3,
             orig_vendor: DEFAULT_ORIG_VENDOR,
             config_data: Vec::new(),
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
     }
 
@@ -125,6 +133,12 @@ impl ScannerConfig {
         self.run_idle_header = on;
         self
     }
+
+    /// Bound the Forward_Close exchange performed by `close()`.
+    pub fn close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
 }
 
 /// Live connection handle. Drop-safe (drops issue Forward_Close best-effort).
@@ -144,6 +158,7 @@ pub struct ScannerConnection {
     conn_serial: u16,
     ctx_counter: u64,
     close_path: Vec<u8>,
+    close_timeout: Duration,
     closed: bool,
 }
 
@@ -163,14 +178,19 @@ impl ScannerConnection {
             Some(s) => s,
             None => return Ok(()),
         };
-        let _ = send_forward_close(
-            &mut stream,
-            self.session_handle,
-            self.next_ctx(),
-            self.conn_serial,
-            self.orig_vendor,
-            self.orig_serial,
-            &self.close_path,
+        // Bounded: a silent target must not hang close() on the reply.
+        let ctx = self.next_ctx();
+        let _ = time::timeout(
+            self.close_timeout,
+            send_forward_close(
+                &mut stream,
+                self.session_handle,
+                ctx,
+                self.conn_serial,
+                self.orig_vendor,
+                self.orig_serial,
+                &self.close_path,
+            ),
         )
         .await;
         // Unregister
@@ -347,6 +367,7 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
         conn_serial,
         ctx_counter,
         close_path: connection_path,
+        close_timeout: cfg.close_timeout,
         closed: false,
     })
 }

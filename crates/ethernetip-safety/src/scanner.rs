@@ -27,6 +27,7 @@ use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 
+use ethernetip_connections::scanner::DEFAULT_CLOSE_TIMEOUT;
 use crate::crc;
 use crate::forward_open::{
     build_safety_forward_open, SafetyAppReply, SafetyForwardOpenConfig, CM_PATH,
@@ -60,6 +61,11 @@ pub struct SafetyScannerConfig {
     /// interop tests override so scanner and adapter don't clash on a single
     /// host.
     pub peer_udp_port: u16,
+    /// Upper bound on each Forward_Close exchange made by
+    /// [`SafetyScannerConnection::close`]. A target that keeps TCP open but
+    /// never answers would otherwise hang `close()` forever. Defaults to
+    /// [`DEFAULT_CLOSE_TIMEOUT`].
+    pub close_timeout: Duration,
 }
 
 impl SafetyScannerConfig {
@@ -76,6 +82,7 @@ impl SafetyScannerConfig {
             orig_vendor: 0x0001,
             orig_serial: 0x1234_5678,
             peer_udp_port: IO_UDP_PORT,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
     }
 
@@ -93,6 +100,12 @@ impl SafetyScannerConfig {
 
     pub fn peer_udp_port(mut self, port: u16) -> Self {
         self.peer_udp_port = port;
+        self
+    }
+
+    /// Bound each Forward_Close exchange performed by `close()`.
+    pub fn close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
         self
     }
 
@@ -145,6 +158,7 @@ pub struct SafetyScannerConnection {
     orig_serial: u32,
     ctx: u64,
     route_prefix: Vec<u8>,
+    close_timeout: Duration,
     closed: bool,
 }
 
@@ -166,25 +180,34 @@ impl SafetyScannerConnection {
             Some(s) => s,
             None => return Ok(()),
         };
-        let _ = send_safety_forward_close(
-            &mut tcp,
-            self.session_handle,
-            self.next_ctx(),
-            self.server_conn_serial,
-            self.orig_vendor,
-            self.orig_serial,
-            &self.route_prefix,
-        )
-        .await;
-        if let Some(client_serial) = self.client_conn_serial {
-            let _ = send_safety_forward_close(
+        // Bounded: a silent target must not hang close() on the reply.
+        let ctx = self.next_ctx();
+        let _ = time::timeout(
+            self.close_timeout,
+            send_safety_forward_close(
                 &mut tcp,
                 self.session_handle,
-                self.next_ctx(),
-                client_serial,
+                ctx,
+                self.server_conn_serial,
                 self.orig_vendor,
                 self.orig_serial,
                 &self.route_prefix,
+            ),
+        )
+        .await;
+        if let Some(client_serial) = self.client_conn_serial {
+            let ctx = self.next_ctx();
+            let _ = time::timeout(
+                self.close_timeout,
+                send_safety_forward_close(
+                    &mut tcp,
+                    self.session_handle,
+                    ctx,
+                    client_serial,
+                    self.orig_vendor,
+                    self.orig_serial,
+                    &self.route_prefix,
+                ),
             )
             .await;
         }
@@ -486,6 +509,7 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
         orig_serial: cfg.orig_serial,
         ctx,
         route_prefix: cfg.route_prefix,
+        close_timeout: cfg.close_timeout,
         closed: false,
     })
 }

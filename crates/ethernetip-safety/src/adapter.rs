@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{watch, Mutex, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 
 use ethernetip_connections::epio::{
@@ -33,6 +33,7 @@ use ethernetip_core::cip::{service_codes as service, status, CipDispatcher, CipP
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
+use ethernetip_core::lifecycle::{drain_join_set, SESSION_DRAIN_TIMEOUT};
 
 use crate::cpcrc;
 use crate::crc;
@@ -316,11 +317,14 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
     let session_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_SESSIONS));
     let accept_task = tokio::spawn(async move {
         let mut shutdown_rx = shutdown_rx;
+        let mut sessions: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
                 // Any completion is a shutdown; `Err` means the handle was dropped
                 // without `shutdown()` and would otherwise fire on every pass.
                 _ = shutdown_rx.changed() => break,
+                // Reap finished sessions so the set doesn't grow unbounded.
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
                 accept = tcp.accept() => {
                     let (stream, peer) = match accept {
                         Ok(x) => x,
@@ -350,8 +354,9 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
                     let open = connection_open_task.clone();
                     let next_conn_id = next_conn_id_task.clone();
                     let udp_task = udp_accept.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_session(stream, peer, udp_task, cfg, shared, open, next_conn_id).await {
+                    let session_shutdown = shutdown_rx.clone();
+                    sessions.spawn(async move {
+                        if let Err(err) = handle_session(stream, peer, udp_task, cfg, shared, open, next_conn_id, session_shutdown).await {
                             tracing::debug!("safety session ended: {err}");
                         }
                         drop(permit);
@@ -359,6 +364,10 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
                 }
             }
         }
+        // Stop listening, then let every session notice the signal, run its
+        // teardown and release its UDP socket clone.
+        drop(tcp);
+        drain_join_set(&mut sessions, SESSION_DRAIN_TIMEOUT).await;
     });
 
     let combined = tokio::spawn(async move {
@@ -416,6 +425,7 @@ struct ActiveConnection {
     last_ping: u16,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -424,9 +434,8 @@ async fn handle_session(
     shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
     connection_open: Arc<AtomicBool>,
     next_conn_id: Arc<AtomicU32>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let session_handle = 0x0100_0000 ^ (peer.port() as u32).wrapping_mul(0x9E37_79B9);
-    let mut header_buf = [0u8; HEADER_LEN];
     // Per-session owned connection ids — the exact O→T ids this TCP
     // session Forward_Open'd. Length is also the per-session FO count
     // (bounds how many safety connections one TCP session can allocate).
@@ -436,13 +445,49 @@ async fn handle_session(
     // closes drop only THIS session's rows instead of every live safety
     // connection on the adapter — see the teardown block below.
     let mut active_conn_ids: Vec<u32> = Vec::new();
+    let result = session_loop(
+        &mut stream,
+        peer,
+        &udp,
+        &cfg,
+        &shared,
+        &connection_open,
+        &next_conn_id,
+        &mut active_conn_ids,
+        &mut shutdown_rx,
+    )
+    .await;
+    // Teardown runs on EVERY exit path (peer close, idle timeout, protocol
+    // error, UnRegisterSession, shutdown) — previously an early `?` or
+    // `return` in the loop skipped it and leaked the session's rows.
+    teardown_session(&cfg, &shared, &connection_open, &mut active_conn_ids).await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_loop(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    udp: &UdpSocket,
+    cfg: &SafetyAdapterConfig,
+    shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
+    connection_open: &AtomicBool,
+    next_conn_id: &AtomicU32,
+    active_conn_ids: &mut Vec<u32>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let session_handle = 0x0100_0000 ^ (peer.port() as u32).wrapping_mul(0x9E37_79B9);
+    let mut header_buf = [0u8; HEADER_LEN];
     loop {
         // Idle timeout on the next-request boundary: a peer that opens a
         // TCP session and goes silent must not keep its slot in the
-        // global session semaphore forever. Mid-frame reads below are
-        // not timed out — once a header is in, the payload is already
-        // bounded.
-        match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut header_buf)).await {
+        // global session semaphore forever. The body read below gets the
+        // same bound, and both reads give way to the shutdown signal.
+        let read = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            r = tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut header_buf)) => r,
+        };
+        match read {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => break,
             Err(_) => {
@@ -453,7 +498,19 @@ async fn handle_session(
         let header = Header::parse(&header_buf)?;
         let mut payload = vec![0u8; header.length as usize];
         if header.length > 0 {
-            stream.read_exact(&mut payload).await?;
+            let body = tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                r = tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut payload)) => r,
+            };
+            match body {
+                Ok(r) => {
+                    r?;
+                }
+                Err(_) => {
+                    tracing::debug!("safety session {} body read timeout", peer);
+                    break;
+                }
+            }
         }
         match header.command {
             x if x == Command::RegisterSession.as_u16() => {
@@ -467,12 +524,12 @@ async fn handle_session(
                 let reply_body = handle_send_rr_data(
                     &payload,
                     peer,
-                    &udp,
-                    &cfg,
-                    &shared,
-                    &connection_open,
-                    &next_conn_id,
-                    &mut active_conn_ids,
+                    udp,
+                    cfg,
+                    shared,
+                    connection_open,
+                    next_conn_id,
+                    active_conn_ids,
                 )
                 .await?;
                 let frame = encode_encap(
@@ -489,6 +546,15 @@ async fn handle_session(
             }
         }
     }
+    Ok(())
+}
+
+async fn teardown_session(
+    cfg: &SafetyAdapterConfig,
+    shared: &Mutex<std::collections::HashMap<u32, ActiveConnection>>,
+    connection_open: &AtomicBool,
+    active_conn_ids: &mut Vec<u32>,
+) {
     // TCP session ended without an explicit Forward_Close (peer closed the
     // socket or crashed). Drop ONLY the rows this session Forward_Open'd —
     // not every live row on the adapter. Before this change, teardown
@@ -521,7 +587,6 @@ async fn handle_session(
     if now_empty {
         connection_open.store(false, Ordering::Relaxed);
     }
-    Ok(())
 }
 
 async fn handle_send_rr_data(

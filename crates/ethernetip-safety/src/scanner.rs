@@ -655,9 +655,9 @@ impl ProducerState {
         let ts_delta = ((self.rpi_us as u32 / 128).max(1)) as u16;
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 _ = ticker.tick() => {
                     let active = self.consumer_active.load(Ordering::Relaxed);
                     let ping = (self.ping_count.load(Ordering::Relaxed) & 0x03) as u8;
@@ -735,9 +735,9 @@ impl ConsumerState {
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 res = self.udp.recv_from(&mut buf) => {
                     let (n, _peer) = match res {
                         Ok(x) => x,

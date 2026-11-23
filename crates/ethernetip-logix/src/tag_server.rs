@@ -121,9 +121,9 @@ pub async fn start(cfg: TagServerConfig) -> Result<TagServerHandle> {
         let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 accept = tcp.accept() => {
                     match accept {
                         Ok((stream, peer)) => {

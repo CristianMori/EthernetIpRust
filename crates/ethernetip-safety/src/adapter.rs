@@ -318,9 +318,9 @@ pub async fn start_safety_adapter(cfg: SafetyAdapterConfig) -> Result<SafetyAdap
         let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 accept = tcp.accept() => {
                     let (stream, peer) = match accept {
                         Ok(x) => x,
@@ -1169,9 +1169,9 @@ impl ConsumerLoop {
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 res = self.udp.recv_from(&mut buf) => {
                     let (n, sender) = match res {
                         Ok(x) => x,
@@ -1363,9 +1363,9 @@ impl TcooLoop {
         let seq = AtomicU32::new(0);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 _ = ticker.tick() => {
                     // Snapshot every active connection under one lock, then
                     // send TCOOs outside the critical section.

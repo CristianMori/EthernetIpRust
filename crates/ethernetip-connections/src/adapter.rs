@@ -163,8 +163,9 @@ impl AdapterConfig {
     }
 }
 
-/// Handle returned from [`start`] — dropping it does NOT stop the adapter;
-/// call [`AdapterHandle::shutdown`] to bring it down cleanly.
+/// Handle returned from [`start`]. Dropping it without calling
+/// [`AdapterHandle::shutdown`] still stops every background task, but without
+/// the bounded wait for sessions — prefer `shutdown().await`.
 pub struct AdapterHandle {
     pub tcp_addr: SocketAddr,
     pub udp_addr: SocketAddr,
@@ -286,9 +287,9 @@ impl AcceptState {
     async fn run(self, tcp: TcpListener, mut shutdown_rx: watch::Receiver<bool>) {
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 accept = tcp.accept() => {
                     let (stream, peer) = match accept {
                         Ok(x) => x,
@@ -687,9 +688,9 @@ impl ProducerState {
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 _ = ticker.tick() => {
                     let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
                     let data = self.assemblies.read(self.input_assembly).unwrap_or_default();
@@ -725,9 +726,9 @@ impl ConsumerState {
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 res = self.udp.recv_from(&mut buf) => {
                     let (n, sender) = match res {
                         Ok(x) => x,

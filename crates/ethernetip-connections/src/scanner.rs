@@ -499,9 +499,9 @@ impl ConsumerState {
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 res = self.udp.recv_from(&mut buf) => {
                     let (n, _peer) = match res {
                         Ok(x) => x,
@@ -553,9 +553,9 @@ impl ProducerState {
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() { break; }
-                }
+                // Any completion is a shutdown; `Err` means the handle was dropped
+                // without `shutdown()` and would otherwise fire on every pass.
+                _ = shutdown_rx.changed() => break,
                 _ = ticker.tick() => {
                     let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
                     let data = self.assemblies.read(self.o_to_t_assembly).unwrap_or_default();

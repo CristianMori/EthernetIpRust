@@ -12,13 +12,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ethernetip_core::cip::{class_codes as class, service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Item};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::{parse_route_path, EpathWriter};
-use ethernetip_core::{EipSession, EIP_PORT};
+use ethernetip_core::{EipSession, DEFAULT_REQUEST_TIMEOUT, EIP_PORT};
 
 use crate::browse::{
     build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo,
@@ -60,6 +60,7 @@ pub struct TagClientBuilder {
     route_path: Option<String>,
     use_connected: bool,
     reopen_on_drop: bool,
+    request_timeout: Option<Duration>,
 }
 
 impl TagClientBuilder {
@@ -70,7 +71,16 @@ impl TagClientBuilder {
             route_path: None,
             use_connected: false,
             reopen_on_drop: false,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
+    }
+
+    /// Bound every request/reply wait (default 5 s; `None` disables it).
+    /// On expiry the session is closed and [`EipError::Timeout`] is returned;
+    /// the client must be reconnected.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     /// When a Class 3 request fails with a "connection dead" CIP status
@@ -117,7 +127,7 @@ impl TagClientBuilder {
             None => Vec::new(),
         };
         let addr = format!("{}:{}", self.host, self.port);
-        let session = EipSession::connect_and_register(addr).await?;
+        let session = EipSession::connect_and_register_with(addr, self.request_timeout).await?;
         let mut client = TagClient {
             session,
             route_path: route,
@@ -673,6 +683,15 @@ impl TagClient {
     }
 
     async fn dispatch(&mut self, mr: Vec<u8>) -> Result<Vec<u8>> {
+        let r = self.dispatch_inner(mr).await;
+        if matches!(r, Err(EipError::Timeout(_))) {
+            // The session was dropped; the Class 3 connection went with it.
+            self.class3_open = false;
+        }
+        r
+    }
+
+    async fn dispatch_inner(&mut self, mr: Vec<u8>) -> Result<Vec<u8>> {
         if self.class3_open {
             // First try. If it fails with a symptom of a dead Class 3
             // connection AND reopen_on_drop is on, close + re-Forward_Open

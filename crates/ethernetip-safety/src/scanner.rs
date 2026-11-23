@@ -26,6 +26,7 @@ use ethernetip_core::cip::{service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
+use ethernetip_core::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
 
 use ethernetip_connections::scanner::DEFAULT_CLOSE_TIMEOUT;
 use crate::crc;
@@ -66,6 +67,12 @@ pub struct SafetyScannerConfig {
     /// never answers would otherwise hang `close()` forever. Defaults to
     /// [`DEFAULT_CLOSE_TIMEOUT`].
     pub close_timeout: Duration,
+    /// Upper bound on each reply wait during `open_safety_scanner`
+    /// (RegisterSession and each Forward_Open). On expiry the TCP stream is
+    /// dropped and [`EipError::Timeout`] is returned. `None` disables the
+    /// bound. Defaults to [`DEFAULT_REQUEST_TIMEOUT`]. Forward_Close in
+    /// `close()` is bounded by `close_timeout` alone.
+    pub request_timeout: Option<Duration>,
 }
 
 impl SafetyScannerConfig {
@@ -83,6 +90,7 @@ impl SafetyScannerConfig {
             orig_serial: 0x1234_5678,
             peer_udp_port: IO_UDP_PORT,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 
@@ -106,6 +114,13 @@ impl SafetyScannerConfig {
     /// Bound each Forward_Close exchange performed by `close()`.
     pub fn close_timeout(mut self, timeout: Duration) -> Self {
         self.close_timeout = timeout;
+        self
+    }
+
+    /// Bound each open-path reply wait (RegisterSession, Forward_Open).
+    /// `None` disables the bound.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -237,7 +252,9 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     tcp.set_nodelay(true)?;
 
     let mut ctx: u64 = 0;
-    let session_handle = register_session(&mut tcp, &mut ctx).await?;
+    // Any error below (timeout included) returns early and drops `tcp`.
+    let session_handle =
+        bounded(cfg.request_timeout, register_session(&mut tcp, &mut ctx)).await?;
 
     let ticks = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -270,8 +287,11 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
         Item::new(item_type::SOCKADDR_INFO_T_TO_O, sockaddr_bytes),
     ];
     let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
-    let (fo_header, fo_reply_bytes) =
-        exchange_with_header(&mut tcp, Command::SendRRData, session_handle, next_ctx(&mut ctx), &body).await?;
+    let (fo_header, fo_reply_bytes) = bounded(
+        cfg.request_timeout,
+        exchange_with_header(&mut tcp, Command::SendRRData, session_handle, next_ctx(&mut ctx), &body),
+    )
+    .await?;
     let _ = fo_header;
     let envelope = Envelope::parse(&fo_reply_bytes)?;
     let mr_item = envelope
@@ -340,12 +360,15 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
             Item::new(item_type::UNCONNECTED_DATA, mr),
         ];
         let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
-        let (_hdr, reply_bytes) = exchange_with_header(
-            &mut tcp,
-            Command::SendRRData,
-            session_handle,
-            next_ctx(&mut ctx),
-            &body,
+        let (_hdr, reply_bytes) = bounded(
+            cfg.request_timeout,
+            exchange_with_header(
+                &mut tcp,
+                Command::SendRRData,
+                session_handle,
+                next_ctx(&mut ctx),
+                &body,
+            ),
         )
         .await?;
         let envelope2 = Envelope::parse(&reply_bytes)?;

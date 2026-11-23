@@ -234,7 +234,9 @@ impl EipSession {
     }
 
     fn require_registered(&self) -> Result<()> {
-        if self.registered {
+        if self.dead {
+            Err(EipError::Closed)
+        } else if self.registered {
             Ok(())
         } else {
             Err(EipError::NotRegistered)

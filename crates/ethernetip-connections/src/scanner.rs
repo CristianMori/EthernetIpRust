@@ -21,6 +21,7 @@ use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
+use ethernetip_core::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
 
 use crate::adapter::IO_UDP_PORT;
 use crate::assembly::AssemblyRegistry;
@@ -71,6 +72,12 @@ pub struct ScannerConfig {
     /// (Forward_Close reply). A target that keeps TCP open but never answers
     /// would otherwise hang `close()` forever. Defaults to [`DEFAULT_CLOSE_TIMEOUT`].
     pub close_timeout: Duration,
+    /// Upper bound on each reply wait during `open_connection` (RegisterSession
+    /// and Forward_Open). On expiry the TCP stream is dropped and
+    /// [`EipError::Timeout`] is returned. `None` disables the bound. Defaults
+    /// to [`DEFAULT_REQUEST_TIMEOUT`]. The Forward_Close in `close()` is
+    /// bounded by `close_timeout` alone.
+    pub request_timeout: Option<Duration>,
 }
 
 impl ScannerConfig {
@@ -105,6 +112,7 @@ impl ScannerConfig {
             orig_vendor: DEFAULT_ORIG_VENDOR,
             config_data: Vec::new(),
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 
@@ -137,6 +145,13 @@ impl ScannerConfig {
     /// Bound the Forward_Close exchange performed by `close()`.
     pub fn close_timeout(mut self, timeout: Duration) -> Self {
         self.close_timeout = timeout;
+        self
+    }
+
+    /// Bound each open-path reply wait (RegisterSession, Forward_Open).
+    /// `None` disables the bound.
+    pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
         self
     }
 }
@@ -226,7 +241,12 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
 
     // Register session.
     let mut ctx_counter: u64 = 0;
-    let session_handle = register_session(&mut stream, &mut ctx_counter).await?;
+    // Any error below (timeout included) returns early and drops `stream`.
+    let session_handle = bounded(
+        cfg.request_timeout,
+        register_session(&mut stream, &mut ctx_counter),
+    )
+    .await?;
 
     // Build originator identifiers.
     let ticks = SystemTime::now()
@@ -293,12 +313,15 @@ pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
     ];
     let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
     ctx_counter = ctx_counter.wrapping_add(1);
-    let reply_bytes = exchange(
-        &mut stream,
-        Command::SendRRData,
-        session_handle,
-        ctx_counter.to_le_bytes(),
-        &body,
+    let reply_bytes = bounded(
+        cfg.request_timeout,
+        exchange(
+            &mut stream,
+            Command::SendRRData,
+            session_handle,
+            ctx_counter.to_le_bytes(),
+            &body,
+        ),
     )
     .await?;
     let reply_env = Envelope::parse(&reply_bytes)?;

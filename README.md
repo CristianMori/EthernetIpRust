@@ -1,5 +1,6 @@
 # EthernetIPRust
 
+[![CI](https://github.com/CristianMori/EthernetIpRust/actions/workflows/ci.yml/badge.svg)](https://github.com/CristianMori/EthernetIpRust/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/ethernetip-core)](https://crates.io/crates/ethernetip-core)
 [![Downloads](https://img.shields.io/crates/d/ethernetip-core)](https://crates.io/crates/ethernetip-core)
 [![docs.rs](https://img.shields.io/docsrs/ethernetip-core)](https://docs.rs/ethernetip-core)

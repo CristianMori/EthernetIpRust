@@ -111,8 +111,8 @@ fn write_sstring_shorter_over_longer_clears_trailing_bytes() {
     let entry = reg.get_by_name("asset").unwrap();
     assert_eq!(entry.read_sstring(0).unwrap(), "hi");
     // Confirm no leftover 'x' tails: scan from position 3 to end must be zero.
-    for i in 3..entry.data.len() {
-        assert_eq!(entry.data[i], 0, "byte {i} still set after shorter write");
+    for (i, b) in entry.data.iter().enumerate().skip(3) {
+        assert_eq!(*b, 0, "byte {i} still set after shorter write");
     }
 }
 

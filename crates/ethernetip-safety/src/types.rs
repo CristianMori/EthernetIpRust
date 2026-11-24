@@ -65,10 +65,7 @@ impl ModeByte {
         }
         let tbd = self.0 & 0x08 != 0;
         let n_tbd = self.0 & 0x04 != 0;
-        if tbd == n_tbd {
-            return false;
-        }
-        true
+        tbd != n_tbd
     }
 }
 

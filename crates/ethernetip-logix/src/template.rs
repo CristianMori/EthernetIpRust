@@ -574,11 +574,12 @@ mod tests {
         //                          attr2: id=2, gs=0, u16 count = 3
         //                          attr4: id=4, gs=0, u32 defsize = 10
         //                          attr5: id=5, gs=0, u32 structsize = 24
-        let mut r = Vec::new();
-        r.push(0x03 | 0x80); // reply service
-        r.push(0x00); // reserved
-        r.push(0x00); // general status
-        r.push(0x00); // ext size
+        let mut r = vec![
+            0x03 | 0x80, // reply service
+            0x00,        // reserved
+            0x00,        // general status
+            0x00,        // ext size
+        ];
         r.extend_from_slice(&4u16.to_le_bytes());
         for (id, val) in [(1u16, 0xABCDu32), (2, 3)] {
             r.extend_from_slice(&id.to_le_bytes());

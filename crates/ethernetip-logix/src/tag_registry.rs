@@ -284,6 +284,7 @@ impl TagRegistry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // private constructor helper; a params struct would add noise
     fn insert_entry(
         &self,
         name: String,

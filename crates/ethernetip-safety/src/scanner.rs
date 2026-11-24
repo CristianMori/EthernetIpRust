@@ -794,7 +794,9 @@ struct ConsumerState {
     input_data: Arc<Mutex<Vec<u8>>>,
     client: Option<ClientLegState>,
     target_udp: SocketAddr,
+    #[allow(dead_code)] // captured from the Forward Open; not consulted yet
     orig_vendor: u16,
+    #[allow(dead_code)] // captured from the Forward Open; not consulted yet
     orig_serial: u32,
 }
 

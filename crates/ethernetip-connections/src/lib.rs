@@ -16,6 +16,7 @@ pub mod epio;
 pub mod forward_open;
 pub mod scanner;
 
+#[allow(deprecated)] // re-exports the deprecated build* helpers for compatibility
 pub use connection_manager_object::{
     build as build_connection_manager,
     build_with_counters as build_connection_manager_with_counters, ConnectionManagerCounters,

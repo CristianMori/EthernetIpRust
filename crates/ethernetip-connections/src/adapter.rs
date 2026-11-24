@@ -773,6 +773,7 @@ struct ProducerState {
     rpi_us: u32,
     assemblies: AssemblyRegistry,
     input_assembly: u16,
+    #[allow(dead_code)] // currently never read; kept as part of the producer state
     run_idle: bool,
     seq: AtomicU32,
 }

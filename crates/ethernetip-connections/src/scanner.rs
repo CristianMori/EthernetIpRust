@@ -544,6 +544,7 @@ struct ConsumerState {
     assemblies: AssemblyRegistry,
     t_to_o_assembly: u16,
     expect_conn_id: u32,
+    #[allow(dead_code)] // currently never read; kept as part of the producer state
     run_idle: bool,
     rx_count: Arc<AtomicU64>,
 }

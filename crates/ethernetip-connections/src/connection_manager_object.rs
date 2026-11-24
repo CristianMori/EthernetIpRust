@@ -29,7 +29,6 @@
 //!  * 7 Close Other Requests
 //!  * 8 Connection Timeouts
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
@@ -626,26 +625,7 @@ impl Default for ConnectionManagerObject {
 // CipServiceHandler closures (which capture Arcs to the same shared
 // state and downcast the request context) can drive the same code.
 
-fn do_process_forward_open(
-    body: &[u8],
-    ctx: &ForwardOpenContext,
-    connections: &Arc<Mutex<ConnectionTable>>,
-    counters: &Arc<ConnectionManagerCounters>,
-    next_conn_id: &Arc<AtomicU32>,
-    producer_spawner: &Arc<Mutex<Option<ProducerSpawner>>>,
-) -> Result<ForwardOpenResponse> {
-    do_process_forward_open_with_safety(
-        body,
-        ctx,
-        connections,
-        counters,
-        next_conn_id,
-        producer_spawner,
-        None,
-    )
-}
-
-/// Same as `do_process_forward_open` but with optional safety hook. When
+/// Forward Open processing with optional safety hook. When
 /// present, the safety handler is called for any FO whose connection
 /// path carries a safety network segment (leader byte 0x50). This is
 /// what the CM's class-registered FO handler uses.
@@ -938,9 +918,11 @@ pub fn build_with_counters() -> (CipClass, Arc<ConnectionManagerCounters>) {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests exercise the deprecated build* helpers on purpose
 mod tests {
     use super::*;
     use ethernetip_core::cip::{CipDispatcher, CipPath};
+    use std::any::Any;
     use std::sync::Arc;
 
     #[tokio::test]

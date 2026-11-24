@@ -33,8 +33,7 @@ fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// State of a Safety Validator instance (Vol 5 §5-3.6.1).
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SafetyValidatorState {
     #[default]
     Idle = 0,
@@ -61,7 +60,6 @@ pub struct SafetyValidatorInstanceState {
     pub packets_consumed: u32,
     pub crc_errors: u32,
 }
-
 
 impl SafetyValidatorInstanceState {
     /// Advance the 128 µs timestamp, bumping [`Self::rollover_count`] on
@@ -269,8 +267,10 @@ mod tests {
 
     #[test]
     fn advance_timestamp_bumps_rollover_on_wrap() {
-        let mut s = SafetyValidatorInstanceState::default();
-        s.timestamp = 0xFF00;
+        let mut s = SafetyValidatorInstanceState {
+            timestamp: 0xFF00,
+            ..Default::default()
+        };
         s.advance_timestamp(0x200); // wraps from 0xFF00 → 0x0100
         assert_eq!(s.timestamp, 0x0100);
         assert_eq!(s.rollover_count, 1);

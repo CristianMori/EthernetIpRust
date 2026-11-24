@@ -155,10 +155,10 @@ pub fn walk(
         }
     }
 
-    if pending_dims.is_some() {
+    if let Some(dims) = &pending_dims {
         return Err(format!(
             "under-indexed array: expected {} element segments, got {}",
-            pending_dims.as_ref().unwrap().len(),
+            dims.len(),
             pending_dim_idx
         ));
     }

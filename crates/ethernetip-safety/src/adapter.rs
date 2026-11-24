@@ -400,6 +400,7 @@ struct ActiveConnection {
     pid_seed_s5: u32,
     cid_seed_s3: u16,
     cid_seed_s5: u32,
+    #[allow(dead_code)] // recorded with the connection; not consulted yet
     input_data_len: usize,
     /// Safety Validator instance id allocated for this connection at FO
     /// accept — needed so Forward_Close can drop the same instance and
@@ -593,6 +594,7 @@ async fn teardown_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // private helper threading connection state; a params struct would add noise
 async fn handle_send_rr_data(
     payload: &[u8],
     peer: SocketAddr,
@@ -1252,6 +1254,7 @@ struct ConsumerLoop {
     rx_valid: Arc<AtomicU64>,
     rx_crc_fail: Arc<AtomicU64>,
     shared: Arc<Mutex<std::collections::HashMap<u32, ActiveConnection>>>,
+    #[allow(dead_code)] // recorded with the connection; not consulted yet
     format: SafetyFormat,
     /// Optional Validator handle — when present, per-connection counters
     /// (`packets_consumed`, `crc_errors`, `rollover_count`, `timestamp`)
@@ -1451,8 +1454,12 @@ impl ConsumerLoop {
 
 // -------------------- TCOO producer --------------------
 
+/// One snapshot row per active connection, taken under the lock before sending TCOOs.
+type TcooRow = (u32, SocketAddr, u16, u32, SafetyFormat, u8, u16, u32);
+
 struct TcooLoop {
     udp: Arc<UdpSocket>,
+    #[allow(dead_code)] // captured from the peer address; not consulted yet
     peer_udp_port: u16,
     tcoo_period_us: u32,
     tx_tcoo: Arc<AtomicU64>,
@@ -1476,7 +1483,7 @@ impl TcooLoop {
                 _ = ticker.tick() => {
                     // Snapshot every active connection under one lock, then
                     // send TCOOs outside the critical section.
-                    let rows: Vec<(u32, SocketAddr, u16, u32, SafetyFormat, u8, u16, u32)> = {
+                    let rows: Vec<TcooRow> = {
                         let guard = self.shared.lock().await;
                         guard.values().map(|conn| {
                             // consumer_time = monotonic elapsed since FO

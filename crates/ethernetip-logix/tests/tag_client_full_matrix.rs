@@ -12,6 +12,8 @@
 //!
 //! Failures are collected across the matrix so the first assertion failure
 //! does not hide the others.
+// 3.14 / 2.71828 here are arbitrary round-trip test values, not meant as PI / E.
+#![allow(clippy::approx_constant)]
 
 use std::net::SocketAddr;
 

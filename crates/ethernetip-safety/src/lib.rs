@@ -30,6 +30,7 @@ pub use types::{
     ModeByte, SafetyConfigurationId, SafetyFormat, SafetyNetworkNumber, UniqueNetworkId,
 };
 
+#[allow(deprecated)] // re-exports the deprecated build_connection_manager for compatibility
 pub use ethernetip_connections::{build_connection_manager, ConnectionManagerObject};
 pub use ethernetip_core::cip::{CipClass, CipDispatcher, CipPath};
 pub use ethernetip_core::device;

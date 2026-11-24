@@ -6,6 +6,8 @@
 //! and ListServices and the Class 3 explicit-messaging path (Forward_Open /
 //! Forward_Close / SendUnitData). That full surface is what makes pycomm3
 //! happy — see `tests/pycomm3/test_pycomm3_roundtrip.py`.
+// 3.14 / 2.71828 here are arbitrary round-trip test values, not meant as PI / E.
+#![allow(clippy::approx_constant)]
 
 use std::net::SocketAddr;
 

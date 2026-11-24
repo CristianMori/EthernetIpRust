@@ -18,7 +18,7 @@ use ethernetip_core::cip::{class_codes as class, service_codes as service, statu
 use ethernetip_core::cpf::{item_type, Item};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::{parse_route_path, EpathWriter};
-use ethernetip_core::{EipSession, DEFAULT_REQUEST_TIMEOUT, EIP_PORT};
+use ethernetip_core::{EipSession, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, EIP_PORT};
 
 use crate::browse::{
     build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo,
@@ -61,6 +61,7 @@ pub struct TagClientBuilder {
     use_connected: bool,
     reopen_on_drop: bool,
     request_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
 }
 
 impl TagClientBuilder {
@@ -72,6 +73,7 @@ impl TagClientBuilder {
             use_connected: false,
             reopen_on_drop: false,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
         }
     }
 
@@ -80,6 +82,14 @@ impl TagClientBuilder {
     /// the client must be reconnected.
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Bound the TCP connect (default 5 s; `None` disables it). On expiry
+    /// [`EipError::Timeout`] is returned and no client is created. Refused or
+    /// unreachable hosts still fail fast.
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -127,7 +137,12 @@ impl TagClientBuilder {
             None => Vec::new(),
         };
         let addr = format!("{}:{}", self.host, self.port);
-        let session = EipSession::connect_and_register_with(addr, self.request_timeout).await?;
+        let session = EipSession::connect_and_register_with_timeouts(
+            addr,
+            self.connect_timeout,
+            self.request_timeout,
+        )
+        .await?;
         let mut client = TagClient {
             session,
             route_path: route,

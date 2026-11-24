@@ -39,9 +39,11 @@ pub enum EipError {
     #[error("session is closed")]
     Closed,
 
-    /// No reply arrived within the configured request timeout. The TCP
-    /// stream is out of sync after this and has been dropped.
-    #[error("request timed out after {0:?}")]
+    /// An operation exceeded its configured bound: either no reply arrived
+    /// within the request timeout (the TCP stream is out of sync and has been
+    /// dropped), or the TCP connect did not complete within the connect
+    /// timeout (no stream was opened).
+    #[error("operation timed out after {0:?}")]
     Timeout(std::time::Duration),
 }
 

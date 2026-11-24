@@ -19,7 +19,7 @@ pub mod unconnected_send;
 
 pub use error::{EipError, Result};
 pub use session::EipSession;
-pub use timeout::DEFAULT_REQUEST_TIMEOUT;
+pub use timeout::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 
 /// Default EtherNet/IP TCP port.
 pub const EIP_PORT: u16 = 44818;

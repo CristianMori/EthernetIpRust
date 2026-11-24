@@ -16,10 +16,8 @@ use tokio::net::ToSocketAddrs;
 use crate::cpf::{self, Envelope, Item};
 use crate::encap::{self, Command, Header, HEADER_LEN};
 use crate::error::{EipError, Result};
-use crate::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
-
-/// Default request timeout used by [`EipSession::connect`].
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub use crate::timeout::DEFAULT_CONNECT_TIMEOUT;
+use crate::timeout::{bounded, connect_bounded, DEFAULT_REQUEST_TIMEOUT};
 
 /// Owning wrapper around a registered EIP session.
 pub struct EipSession {
@@ -37,9 +35,21 @@ pub struct EipSession {
 impl EipSession {
     /// Open a TCP connection to the peer without registering yet.
     ///
-    /// Use [`Self::connect_and_register`] for the common case.
+    /// Use [`Self::connect_and_register`] for the common case. The connect is
+    /// bounded by [`DEFAULT_CONNECT_TIMEOUT`] (5 s); use
+    /// [`Self::connect_with_timeout`] to change or disable it.
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        Self::connect_with_timeout(addr, Some(DEFAULT_CONNECT_TIMEOUT)).await
+    }
+
+    /// Like [`Self::connect`] with an explicit TCP connect timeout. On expiry
+    /// the pending connect is dropped and [`EipError::Timeout`] is returned.
+    /// `None` waits for the OS to give up.
+    pub async fn connect_with_timeout<A: ToSocketAddrs>(
+        addr: A,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let stream = connect_bounded(addr, connect_timeout).await?;
         stream.set_nodelay(true)?;
         let peer = stream.peer_addr()?;
         Ok(Self {
@@ -80,7 +90,22 @@ impl EipSession {
         addr: A,
         request_timeout: Option<Duration>,
     ) -> Result<Self> {
-        let mut s = Self::connect(addr).await?;
+        Self::connect_and_register_with_timeouts(
+            addr,
+            Some(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout,
+        )
+        .await
+    }
+
+    /// Like [`Self::connect_and_register_with`] with an explicit TCP connect
+    /// timeout as well. `None` disables the respective bound.
+    pub async fn connect_and_register_with_timeouts<A: ToSocketAddrs>(
+        addr: A,
+        connect_timeout: Option<Duration>,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let mut s = Self::connect_with_timeout(addr, connect_timeout).await?;
         s.request_timeout = request_timeout;
         s.register().await?;
         Ok(s)

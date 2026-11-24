@@ -720,7 +720,7 @@ impl ProducerState {
         let mut ticker = time::interval(period);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         // 128 µs per timestamp tick; ticks-per-frame = rpi_us / 128.
-        let ts_delta = ((self.rpi_us as u32 / 128).max(1)) as u16;
+        let ts_delta = ((self.rpi_us / 128).max(1)) as u16;
         loop {
             tokio::select! {
                 // Any completion is a shutdown; `Err` means the handle was dropped
@@ -844,7 +844,7 @@ impl ConsumerState {
         if wire_len < 6 {
             return;
         }
-        let data_len = if wire_len >= 7 && wire_len <= 8 {
+        let data_len = if (7..=8).contains(&wire_len) {
             wire_len - 6
         } else if wire_len >= 14 && (wire_len - 8) % 2 == 0 {
             (wire_len - 8) / 2

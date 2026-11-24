@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
                 let tx = handle.tx_tcoo.load(Ordering::Relaxed);
                 let open = handle.connection_open.load(Ordering::Relaxed);
                 let inp = handle.input_data.lock().await;
-                let d0 = if inp.len() >= 1 { inp[0] } else { 0 };
+                let d0 = if !inp.is_empty() { inp[0] } else { 0 };
                 let d1 = if inp.len() >= 2 { inp[1] } else { 0 };
                 let d2 = if inp.len() >= 3 { inp[2] } else { 0 };
                 let d3 = if inp.len() >= 4 { inp[3] } else { 0 };

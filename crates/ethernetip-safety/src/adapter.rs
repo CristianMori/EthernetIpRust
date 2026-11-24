@@ -1428,7 +1428,7 @@ impl ConsumerLoop {
                         s.packets_consumed = s.packets_consumed.wrapping_add(1);
                         s.rollover_count = rollover_now;
                         s.timestamp = timestamp;
-                        s.ping_count = (mode.0 & 0x03) as u8;
+                        s.ping_count = mode.0 & 0x03;
                     });
                 }
                 let mut w = self.input_data.lock().await;
@@ -1597,14 +1597,14 @@ mod tests {
     fn random_conn_id_seed_differs_across_calls_and_stays_in_upper_half() {
         let first = random_conn_id_seed();
         assert!(
-            first >= 0x8000_0000 && first <= 0xBFFF_FFFF,
+            (0x8000_0000..=0xBFFF_FFFF).contains(&first),
             "seed {first:#010X} outside originator-chosen half 0x8000_0000..=0xBFFF_FFFF",
         );
         let mut saw_different = false;
         for _ in 0..32 {
             let next = random_conn_id_seed();
             assert!(
-                next >= 0x8000_0000 && next <= 0xBFFF_FFFF,
+                (0x8000_0000..=0xBFFF_FFFF).contains(&next),
                 "seed {next:#010X} outside originator-chosen half",
             );
             if next != first {

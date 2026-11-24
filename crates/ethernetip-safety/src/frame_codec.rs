@@ -550,7 +550,7 @@ pub fn encode_time_coordination(
     off += 2;
     // Alternating-bit-preserving twin of ack (bits from ack XOR 0xFF where the
     // low-nibble mask says so).
-    let ack2 = (((ack ^ 0xFF) & 0x55) | (ack & 0xAA)) & 0xFF;
+    let ack2 = ((ack ^ 0xFF) & 0x55) | (ack & 0xAA);
     output[off] = ack2;
     off += 1;
     let mut s3 = crc::compute_s3_byte(ack, cid_seed_s3);

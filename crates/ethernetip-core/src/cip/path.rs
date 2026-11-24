@@ -53,11 +53,10 @@ impl CipPath {
     }
 }
 
-fn decode_segment(
-    bytes: &[u8],
-    seg: u8,
-) -> Result<(usize, Option<u32>, Option<u32>, Option<u32>, Option<u32>)> {
-    // Return tuple: (bytes_consumed, class, instance, attribute, member)
+/// (bytes_consumed, class, instance, attribute, member)
+type DecodedSegment = (usize, Option<u32>, Option<u32>, Option<u32>, Option<u32>);
+
+fn decode_segment(bytes: &[u8], seg: u8) -> Result<DecodedSegment> {
     match seg {
         // Class — 8-bit
         0x20 => need(bytes, 2).map(|_| (2, Some(bytes[1] as u32), None, None, None)),

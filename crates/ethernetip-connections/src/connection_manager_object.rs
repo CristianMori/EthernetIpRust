@@ -696,7 +696,7 @@ fn do_process_forward_open_with_safety(
             "Forward_Open connection path missing O->T / T->O assemblies (got consumed={:?} produced={:?}) — raw path {:02X?}",
             path_result.consumed_assembly,
             path_result.produced_assembly,
-            &req.connection_path,
+            req.connection_path,
         )));
     };
     let output_asm: u16 = consumed_u32 as u16; // scanner produces, adapter consumes
@@ -972,7 +972,7 @@ mod tests {
             producer_task: task1,
         };
         table.insert_replacing(0x8000_0000, row1);
-        assert_eq!(*rx1.borrow(), false);
+        assert!(!*rx1.borrow());
 
         let (tx2, _rx2) = watch::channel(false);
         let task2 = tokio::spawn(async {});
@@ -1000,7 +1000,7 @@ mod tests {
         rx1.changed()
             .await
             .expect("shutdown signal must be deliverable");
-        assert_eq!(*rx1.borrow(), true);
+        assert!(*rx1.borrow());
         // Only one row remains in the table.
         assert_eq!(table.rows.len(), 1);
         assert_eq!(table.rows[&0x8000_0000].t_to_o_conn_id, 2);

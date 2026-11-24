@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn captures_safety_segment() {
         // `50 <words> <data...>` alongside a normal GEM path.
-        let mut path = vec![
+        let path = vec![
             0x34, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, // ekey
             0x50, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, // safety seg: 4 words
             0x20, 0x04, 0x24, 0x01, // class + inst

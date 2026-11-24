@@ -574,7 +574,7 @@ fn dispatch_mr(
 ) -> Vec<u8> {
     let (service_code, path, body) = match split_mr(mr) {
         Some(x) => x,
-        None => return build_mr_reply(0x00 | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, &[]),
+        None => return build_mr_reply(service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, &[]),
     };
     if depth > MAX_MR_DEPTH {
         return build_mr_reply(
@@ -1339,7 +1339,7 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
     let padded_short_string: Option<Vec<u8>> = if type_code == CipType::ShortString as u16
         && client_struct_handle.is_none()
         && !value.is_empty()
-        && value.len() >= 1 + value[0] as usize
+        && value.len() > value[0] as usize
     {
         let elem = CipType::ShortString
             .atomic_size()
@@ -1645,7 +1645,7 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
         && client_struct_handle.is_none()
         && byte_offset_in_elements == 0
         && !value.is_empty()
-        && value.len() >= 1 + value[0] as usize
+        && value.len() > value[0] as usize
     {
         let elem = CipType::ShortString
             .atomic_size()
@@ -1926,7 +1926,7 @@ fn append_attribute_field(out: &mut Vec<u8>, attr_id: u16, name: &str, sym_type:
             out.extend_from_slice(name.as_bytes());
         }
         2 => out.extend_from_slice(&sym_type.to_le_bytes()),
-        3 | 5 | 6 | 4 | 7 => out.extend_from_slice(&0u32.to_le_bytes()),
+        3..=7 => out.extend_from_slice(&0u32.to_le_bytes()),
         8 => {
             // Dimensions. Atomic scalars report [0, 0, 0]; this is what a
             // real controller returns for a non-array tag.
@@ -2002,7 +2002,7 @@ fn handle_template_get_attribute_list(path: &[u8], body: &[u8], registry: &TagRe
     let mut out = Vec::new();
     out.extend_from_slice(&(count as u16).to_le_bytes());
     let member_data_len = build_template_member_data(&tpl).len() as u32;
-    let def_size_dwords = (21 + member_data_len + 3) / 4;
+    let def_size_dwords = (21 + member_data_len).div_ceil(4);
     for i in 0..count {
         let off = 2 + 2 * i;
         let attr = u16::from_le_bytes([body[off], body[off + 1]]);
@@ -2102,7 +2102,7 @@ fn handle_template_read(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec
 fn build_template_member_data(tpl: &ServerTemplate) -> Vec<u8> {
     let mut out = Vec::new();
     for m in &tpl.members {
-        let info = (m.array_size as u16) & 0xFFFF;
+        let info = m.array_size as u16;
         out.extend_from_slice(&info.to_le_bytes());
         out.extend_from_slice(&m.data_type.to_le_bytes());
         out.extend_from_slice(&(m.offset as u32).to_le_bytes());

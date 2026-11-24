@@ -51,7 +51,7 @@ impl ServerTemplate {
             name_bytes += m.name.len() + 1;
         }
         let total = self.members.len() * 8 + name_bytes;
-        let padded = ((total + 3) / 4) * 4;
+        let padded = total.div_ceil(4) * 4;
         (padded / 4) as u32 + 6
     }
 }

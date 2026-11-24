@@ -5,7 +5,7 @@
 //! data flows through a caller-supplied [`AssemblyRegistry`], so multiple
 //! scanners can share buffers with application code without any extra sync.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

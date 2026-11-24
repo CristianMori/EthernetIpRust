@@ -55,7 +55,7 @@ use crate::connection_manager_object::{
     ProducerSpawnArgs,
 };
 use crate::epio::{self, Frame};
-use crate::forward_open::{ForwardCloseRequest, ForwardCloseResponse, ForwardOpenResponse};
+use crate::forward_open::ForwardCloseRequest;
 
 /// Default cyclic I/O UDP port (well-known EtherNet/IP value).
 pub const IO_UDP_PORT: u16 = 2222;

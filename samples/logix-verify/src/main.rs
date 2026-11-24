@@ -417,10 +417,7 @@ async fn run() -> Result<()> {
         .await
         .context("diag connect")?;
     ok("connected without browsing → atom cache is empty");
-    let probe_names: Vec<&str> = ["StopMolues", "StopComm", "TestModule:I"]
-        .iter()
-        .copied()
-        .collect();
+    let probe_names: Vec<&str> = ["StopMolues", "StopComm", "TestModule:I"].to_vec();
     for n in &probe_names {
         match diag.read_tag(n).await {
             Ok(v) => ok(&format!("symbolic read {n} = {:?}", v)),

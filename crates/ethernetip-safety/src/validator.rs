@@ -34,7 +34,9 @@ fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// State of a Safety Validator instance (Vol 5 §5-3.6.1).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SafetyValidatorState {
+    #[default]
     Idle = 0,
     Executing = 1,
     Faulted = 2,
@@ -60,11 +62,6 @@ pub struct SafetyValidatorInstanceState {
     pub crc_errors: u32,
 }
 
-impl Default for SafetyValidatorState {
-    fn default() -> Self {
-        SafetyValidatorState::Idle
-    }
-}
 
 impl SafetyValidatorInstanceState {
     /// Advance the 128 µs timestamp, bumping [`Self::rollover_count`] on
@@ -197,9 +194,7 @@ impl SafetyValidatorObject {
                 0,
             ));
         });
-        if ok.is_none() {
-            return None;
-        }
+        ok?;
         lock_recover(&self.runtime).insert(id, init);
         Some(id)
     }

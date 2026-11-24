@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         INPUT_SIZE as usize,
     ))?;
 
-    let rpi_us = (rpi_ms as u32).saturating_mul(1000).max(1_000);
+    let rpi_us = rpi_ms.saturating_mul(1000).max(1_000);
     let cfg = ScannerConfig::new(
         adapter_addr,
         assemblies.clone(),

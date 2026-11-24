@@ -20,7 +20,8 @@ const INPUT_SIZE: u16 = 500;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "echo_scanner=info,ethernetip_connections=info".into()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "echo_scanner=info,ethernetip_connections=info".into()),
         )
         .init();
 
@@ -47,10 +48,7 @@ async fn main() -> Result<()> {
                     .parse()?;
             }
             "--rpi-ms" => {
-                rpi_ms = args
-                    .next()
-                    .context("--rpi-ms needs a number")?
-                    .parse()?;
+                rpi_ms = args.next().context("--rpi-ms needs a number")?.parse()?;
             }
             other => anyhow::bail!("unexpected argument `{}`", other),
         }

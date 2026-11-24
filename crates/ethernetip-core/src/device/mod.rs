@@ -15,8 +15,8 @@ pub mod identity;
 pub mod tcpip_interface;
 
 pub use assembly::{
-    add_instance as add_assembly_instance,
-    add_instance_shared as add_assembly_instance_shared, build as build_assembly,
+    add_instance as add_assembly_instance, add_instance_shared as add_assembly_instance_shared,
+    build as build_assembly,
 };
 pub use ethernet_link::{
     build as build_ethernet_link, EthernetLinkConfig, DEFAULT_INTERFACE_FLAGS, FALLBACK_MAC,

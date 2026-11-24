@@ -130,9 +130,7 @@ impl EipSession {
     pub async fn register(&mut self) -> Result<()> {
         // Payload: protocol_version (u16 LE) = 1, options_flags (u16 LE) = 0.
         let payload: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
-        let reply = self
-            .exchange(Command::RegisterSession, 0, &payload)
-            .await?;
+        let reply = self.exchange(Command::RegisterSession, 0, &payload).await?;
         if reply.payload.len() < 4 {
             return Err(EipError::Short {
                 expected: 4,
@@ -222,9 +220,9 @@ impl EipSession {
             CpfItem::new(item_type::UNCONNECTED_DATA, mr),
         ];
         let envelope = self.send_rr_data(&items, 5).await?;
-        let reply = envelope
-            .find(item_type::UNCONNECTED_DATA)
-            .ok_or_else(|| crate::EipError::Protocol("SendRRData missing UnconnectedData".into()))?;
+        let reply = envelope.find(item_type::UNCONNECTED_DATA).ok_or_else(|| {
+            crate::EipError::Protocol("SendRRData missing UnconnectedData".into())
+        })?;
         // MR reply: service(1) + reserved(1) + status(1) + additional_size(1) + rest.
         if reply.data.len() < 4 {
             return Err(crate::EipError::Protocol("MR reply too short".into()));

@@ -17,11 +17,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ethernetip_core::lifecycle::{drain_join_set, SESSION_DRAIN_TIMEOUT};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{watch, Semaphore};
-use ethernetip_core::lifecycle::{drain_join_set, SESSION_DRAIN_TIMEOUT};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 
@@ -498,11 +498,17 @@ impl SessionState {
     async fn dispatch(&mut self, header: &Header, payload: &[u8]) -> Result<()> {
         match header.command {
             x if x == Command::RegisterSession.as_u16() => {
-                self.session_handle = 0x0000_0100 ^ (self.peer.port() as u32).wrapping_mul(0x9E37_79B9);
+                self.session_handle =
+                    0x0000_0100 ^ (self.peer.port() as u32).wrapping_mul(0x9E37_79B9);
                 // Echo protocol_version=1 back to the originator.
                 let reply = [0x01, 0x00, 0x00, 0x00];
-                self.write_reply(Command::RegisterSession, self.session_handle, header.sender_context, &reply)
-                    .await
+                self.write_reply(
+                    Command::RegisterSession,
+                    self.session_handle,
+                    header.sender_context,
+                    &reply,
+                )
+                .await
             }
             x if x == Command::UnRegisterSession.as_u16() => Err(EipError::Closed),
             x if x == Command::SendRRData.as_u16() => {
@@ -593,11 +599,7 @@ impl SessionState {
                         Err(EipError::Cip { status: s, ext }) => {
                             tracing::warn!("Forward_Open rejected: CIP 0x{s:02X} ext={ext:?}");
                             reply_ext_status = ext;
-                            (
-                                service::FORWARD_OPEN | service::REPLY_FLAG,
-                                s,
-                                Vec::new(),
-                            )
+                            (service::FORWARD_OPEN | service::REPLY_FLAG, s, Vec::new())
                         }
                         Err(err) => {
                             tracing::warn!("Forward_Open rejected: {err}");
@@ -677,10 +679,16 @@ impl SessionState {
                         Ok(cip_path) => {
                             let response = dispatcher.dispatch(other, cip_path, body.to_vec());
                             reply_ext_status = response.extended_status.clone();
-                            (response.service_code, response.general_status, response.data)
+                            (
+                                response.service_code,
+                                response.general_status,
+                                response.data,
+                            )
                         }
                         Err(err) => {
-                            tracing::debug!("adapter path parse failed for service 0x{other:02X}: {err}");
+                            tracing::debug!(
+                                "adapter path parse failed for service 0x{other:02X}: {err}"
+                            );
                             (
                                 other | service::REPLY_FLAG,
                                 status::PATH_SEGMENT_ERROR,
@@ -702,8 +710,7 @@ impl SessionState {
         // Path is echoed back untouched.
         let _ = path;
 
-        let mut mr_reply =
-            Vec::with_capacity(4 + reply_ext_status.len() * 2 + reply_body.len());
+        let mut mr_reply = Vec::with_capacity(4 + reply_ext_status.len() * 2 + reply_body.len());
         mr_reply.push(reply_service);
         mr_reply.push(0); // reserved
         mr_reply.push(reply_status);
@@ -734,7 +741,6 @@ impl SessionState {
         )
         .await
     }
-
 }
 
 fn split_mr_request(bytes: &[u8]) -> Result<(u8, Vec<u8>, Vec<u8>)> {

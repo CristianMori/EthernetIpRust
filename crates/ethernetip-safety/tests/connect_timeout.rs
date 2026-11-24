@@ -52,7 +52,11 @@ async fn open_times_out_on_hanging_peer() {
     let t = Instant::now();
     let r = open_safety_scanner(cfg).await;
     let el = t.elapsed();
-    assert!(matches!(r, Err(EipError::Timeout(d)) if d == SHORT), "got {:?}", r.err());
+    assert!(
+        matches!(r, Err(EipError::Timeout(d)) if d == SHORT),
+        "got {:?}",
+        r.err()
+    );
     assert!(el >= SHORT && el < Duration::from_secs(3), "took {el:?}");
 }
 
@@ -61,7 +65,10 @@ async fn none_disables_the_connect_bound() {
     let (addr, _held, _l) = spawn_blackhole().await;
     let cfg = config(addr).connect_timeout(None);
     let r = tokio::time::timeout(SHORT * 3, open_safety_scanner(cfg)).await;
-    assert!(r.is_err(), "connect_timeout(None) must not time out by itself");
+    assert!(
+        r.is_err(),
+        "connect_timeout(None) must not time out by itself"
+    );
 }
 
 #[tokio::test]

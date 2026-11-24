@@ -15,9 +15,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::cip::{
-    class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType,
-};
+use crate::cip::{class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType};
 
 /// Build an empty Assembly class (0x04) with the standard services. Add
 /// instances via [`add_instance`].
@@ -60,11 +58,7 @@ pub fn add_instance(cls: &mut CipClass, instance_id: u32, data_size: usize) {
 /// Register a new assembly instance whose data attribute is backed by the
 /// caller-supplied shared buffer. `shared`'s current length becomes the
 /// advertised size (attribute 4). Silent no-op on duplicate instance id.
-pub fn add_instance_shared(
-    cls: &mut CipClass,
-    instance_id: u32,
-    shared: Arc<RwLock<Vec<u8>>>,
-) {
+pub fn add_instance_shared(cls: &mut CipClass, instance_id: u32, shared: Arc<RwLock<Vec<u8>>>) {
     // Recover from a poisoned shared buffer the same way the attribute
     // layer's accessors do — the buffer holds only the raw assembly
     // bytes and has no half-committed invariant for a panicked writer
@@ -165,7 +159,10 @@ mod tests {
         let dispatcher = Arc::new(CipDispatcher::new());
         dispatcher.register_class(cls);
 
-        shared.write().unwrap().copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        shared
+            .write()
+            .unwrap()
+            .copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
 
         let path = CipPath::parse(&[0x20, 0x04, 0x24, 0x64, 0x30, 0x03]).unwrap();
         let r = dispatcher.dispatch(0x0E, path, Vec::new());

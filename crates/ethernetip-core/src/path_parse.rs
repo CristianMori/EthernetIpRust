@@ -130,8 +130,8 @@ mod tests {
     fn parses_program_scoped_tag() {
         // 0x91 "Program:Main" + 0x91 "MyTag"
         let bytes = [
-            0x91, 12, b'P', b'r', b'o', b'g', b'r', b'a', b'm', b':', b'M', b'a', b'i', b'n',
-            0x91, 5, b'M', b'y', b'T', b'a', b'g', 0x00,
+            0x91, 12, b'P', b'r', b'o', b'g', b'r', b'a', b'm', b':', b'M', b'a', b'i', b'n', 0x91,
+            5, b'M', b'y', b'T', b'a', b'g', 0x00,
         ];
         let (segs, consumed) = parse_epath(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
@@ -147,9 +147,8 @@ mod tests {
     #[test]
     fn parses_member_chain() {
         let bytes = [
-            0x91, 5, b'M', b'o', b't', b'o', b'r', 0x00,
-            0x91, 5, b'T', b'i', b'm', b'e', b'r', 0x00,
-            0x91, 3, b'P', b'R', b'E', 0x00,
+            0x91, 5, b'M', b'o', b't', b'o', b'r', 0x00, 0x91, 5, b'T', b'i', b'm', b'e', b'r',
+            0x00, 0x91, 3, b'P', b'R', b'E', 0x00,
         ];
         let (segs, _) = parse_epath(&bytes).unwrap();
         assert_eq!(
@@ -166,10 +165,8 @@ mod tests {
     fn parses_element_between_members() {
         // Line[2].Motor.Fault
         let bytes = [
-            0x91, 4, b'L', b'i', b'n', b'e',
-            0x28, 0x02,
-            0x91, 5, b'M', b'o', b't', b'o', b'r', 0x00,
-            0x91, 5, b'F', b'a', b'u', b'l', b't', 0x00,
+            0x91, 4, b'L', b'i', b'n', b'e', 0x28, 0x02, 0x91, 5, b'M', b'o', b't', b'o', b'r',
+            0x00, 0x91, 5, b'F', b'a', b'u', b'l', b't', 0x00,
         ];
         let (segs, _) = parse_epath(&bytes).unwrap();
         assert_eq!(
@@ -187,9 +184,7 @@ mod tests {
     fn parses_multi_dim_indices() {
         // Matrix[1,2]
         let bytes = [
-            0x91, 6, b'M', b'a', b't', b'r', b'i', b'x',
-            0x28, 0x01,
-            0x28, 0x02,
+            0x91, 6, b'M', b'a', b't', b'r', b'i', b'x', 0x28, 0x01, 0x28, 0x02,
         ];
         let (segs, _) = parse_epath(&bytes).unwrap();
         assert_eq!(
@@ -209,8 +204,14 @@ mod tests {
         assert_eq!(
             segs,
             vec![
-                PathSegment::Logical { kind: LogicalKind::ClassId, value: 6 },
-                PathSegment::Logical { kind: LogicalKind::InstanceId, value: 1 },
+                PathSegment::Logical {
+                    kind: LogicalKind::ClassId,
+                    value: 6
+                },
+                PathSegment::Logical {
+                    kind: LogicalKind::InstanceId,
+                    value: 1
+                },
             ]
         );
     }
@@ -222,7 +223,10 @@ mod tests {
         let (segs, _) = parse_epath(&bytes).unwrap();
         assert_eq!(
             segs,
-            vec![PathSegment::Logical { kind: LogicalKind::InstanceId, value: 0x1234 }]
+            vec![PathSegment::Logical {
+                kind: LogicalKind::InstanceId,
+                value: 0x1234
+            }]
         );
     }
 }

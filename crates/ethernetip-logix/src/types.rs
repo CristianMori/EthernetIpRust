@@ -110,7 +110,10 @@ pub enum TagValue {
     /// CIP SHORT_STRING: ASCII payload (not including the length byte).
     ShortString(String),
     /// Undecoded structure: caller must know the UDT layout to interpret it.
-    Struct { crc: u16, bytes: Vec<u8> },
+    Struct {
+        crc: u16,
+        bytes: Vec<u8>,
+    },
 }
 
 impl TagValue {

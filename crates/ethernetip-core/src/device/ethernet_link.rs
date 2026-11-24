@@ -9,9 +9,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::cip::{
-    class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType,
-};
+use crate::cip::{class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType};
 
 /// Interface Flags bitfield (attribute 2). Bit 0 = link active, bit 1 =
 /// full duplex, bits 2-4 = negotiation status (4 = forced settings used),
@@ -57,7 +55,9 @@ impl EthernetLinkConfig {
     pub fn probe(bind_ip: Ipv4Addr) -> Self {
         use network_interface::{NetworkInterface, NetworkInterfaceConfig};
         let mut cfg = Self::default();
-        let Ok(nics) = NetworkInterface::show() else { return cfg };
+        let Ok(nics) = NetworkInterface::show() else {
+            return cfg;
+        };
         for nic in nics {
             if nic.addr.iter().any(|a| match a.ip() {
                 std::net::IpAddr::V4(v4) => v4 == bind_ip,

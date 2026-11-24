@@ -26,15 +26,17 @@ use ethernetip_core::cip::{service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
-use ethernetip_core::timeout::{bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
+use ethernetip_core::timeout::{
+    bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
+};
 
-use ethernetip_connections::scanner::DEFAULT_CLOSE_TIMEOUT;
 use crate::crc;
 use crate::forward_open::{
     build_safety_forward_open, SafetyAppReply, SafetyForwardOpenConfig, CM_PATH,
 };
 use crate::frame_codec;
 use crate::types::{ModeByte, SafetyFormat};
+use ethernetip_connections::scanner::DEFAULT_CLOSE_TIMEOUT;
 
 /// Well-known safety I/O port.
 pub const IO_UDP_PORT: u16 = 2222;
@@ -266,8 +268,7 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
 
     let mut ctx: u64 = 0;
     // Any error below (timeout included) returns early and drops `tcp`.
-    let session_handle =
-        bounded(cfg.request_timeout, register_session(&mut tcp, &mut ctx)).await?;
+    let session_handle = bounded(cfg.request_timeout, register_session(&mut tcp, &mut ctx)).await?;
 
     let ticks = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -292,7 +293,11 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     // Build the MR request (Forward_Open service) via the CM path.
     // Include a Sockaddr Info T→O CPF item so the target knows our UDP
     // endpoint for T→O safety data.
-    let mr = build_mr_request(service::FORWARD_OPEN, &fo_wire.cm_path, &fo_wire.service_data);
+    let mr = build_mr_request(
+        service::FORWARD_OPEN,
+        &fo_wire.cm_path,
+        &fo_wire.service_data,
+    );
     let sockaddr_bytes = ethernetip_core::cpf::encode_sockaddr_in_v4(our_udp)?;
     let items = [
         Item::null_address(),
@@ -302,7 +307,13 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
     let body = ethernetip_core::cpf::encode_envelope(0, 5, &items);
     let (fo_header, fo_reply_bytes) = bounded(
         cfg.request_timeout,
-        exchange_with_header(&mut tcp, Command::SendRRData, session_handle, next_ctx(&mut ctx), &body),
+        exchange_with_header(
+            &mut tcp,
+            Command::SendRRData,
+            session_handle,
+            next_ctx(&mut ctx),
+            &body,
+        ),
     )
     .await?;
     let _ = fo_header;
@@ -436,7 +447,10 @@ pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScann
 
     // UDP socket was bound earlier so we could advertise it in Sockaddr Info.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let output_data = Arc::new(Mutex::new(vec![0u8; cfg.server.consumed_data_size as usize]));
+    let output_data = Arc::new(Mutex::new(vec![
+        0u8;
+        cfg.server.consumed_data_size as usize
+    ]));
     let input_data = Arc::new(Mutex::new(vec![
         0u8;
         client_state
@@ -606,14 +620,8 @@ fn build_mr_request(service_code: u8, path: &[u8], body: &[u8]) -> Vec<u8> {
 
 async fn register_session(tcp: &mut TcpStream, ctx: &mut u64) -> Result<u32> {
     let payload = [0x01, 0x00, 0x00, 0x00];
-    let (header, _body) = exchange_with_header(
-        tcp,
-        Command::RegisterSession,
-        0,
-        next_ctx(ctx),
-        &payload,
-    )
-    .await?;
+    let (header, _body) =
+        exchange_with_header(tcp, Command::RegisterSession, 0, next_ctx(ctx), &payload).await?;
     Ok(header.session_handle)
 }
 

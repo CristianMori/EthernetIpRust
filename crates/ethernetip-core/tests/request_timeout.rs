@@ -16,7 +16,9 @@ async fn spawn_silent_target(answer_register: bool, register_delay: Duration) ->
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = listener.accept().await else { return };
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut first = true;
                 loop {
@@ -65,7 +67,11 @@ async fn silent_register_times_out() {
     let t = Instant::now();
     let r = EipSession::connect_and_register_with(addr, Some(SHORT)).await;
     assert!(matches!(r, Err(EipError::Timeout(_))), "got {:?}", r.err());
-    assert!(t.elapsed() < SHORT + Duration::from_secs(1), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < SHORT + Duration::from_secs(1),
+        "took {:?}",
+        t.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -78,7 +84,11 @@ async fn silent_exchange_times_out_and_resets_session() {
     let t = Instant::now();
     let r = s.send_generic(0x0E, 1, 1, Some(1), &[], &[]).await;
     assert!(matches!(r, Err(EipError::Timeout(_))), "got {:?}", r.err());
-    assert!(t.elapsed() < SHORT + Duration::from_secs(1), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < SHORT + Duration::from_secs(1),
+        "took {:?}",
+        t.elapsed()
+    );
     assert!(!s.is_registered());
     assert_eq!(s.session_handle(), 0);
     // The stream was dropped: later calls fail fast instead of desyncing.
@@ -94,7 +104,9 @@ async fn none_disables_the_timeout() {
     // Same delayed reply: bounded fails, unbounded waits and succeeds.
     let r = EipSession::connect_and_register_with(addr, Some(SHORT)).await;
     assert!(matches!(r, Err(EipError::Timeout(_))));
-    let s = EipSession::connect_and_register_with(addr, None).await.unwrap();
+    let s = EipSession::connect_and_register_with(addr, None)
+        .await
+        .unwrap();
     assert!(s.is_registered());
     assert_eq!(s.request_timeout(), None);
 }

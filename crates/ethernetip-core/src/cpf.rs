@@ -75,7 +75,11 @@ pub fn resolve_peer_udp(
     use std::net::{IpAddr, SocketAddr};
     if let Some(item) = envelope.find(sockaddr_type_id) {
         if let Ok(v4) = decode_sockaddr_in_v4(&item.data) {
-            let port = if v4.port() != 0 { v4.port() } else { default_port };
+            let port = if v4.port() != 0 {
+                v4.port()
+            } else {
+                default_port
+            };
             let ip = if v4.ip().is_unspecified() {
                 default_ip
             } else {
@@ -116,7 +120,8 @@ impl Item {
 /// * `timeout` — request timeout in seconds (only meaningful for `SendRRData`,
 ///   ignored on Unit Data — pass 0 there).
 pub fn encode_envelope(interface_handle: u32, timeout: u16, items: &[Item]) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(8 + items.iter().map(|i| 4 + i.data.len()).sum::<usize>());
+    let mut buf =
+        BytesMut::with_capacity(8 + items.iter().map(|i| 4 + i.data.len()).sum::<usize>());
     buf.put_u32_le(interface_handle);
     buf.put_u16_le(timeout);
     buf.put_u16_le(items.len() as u16);

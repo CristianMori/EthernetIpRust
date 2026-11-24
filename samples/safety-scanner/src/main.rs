@@ -21,7 +21,8 @@ use ethernetip_safety::{
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "safety_scanner=info,ethernetip_safety=info".into()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "safety_scanner=info,ethernetip_safety=info".into()),
         )
         .init();
 
@@ -42,9 +43,16 @@ async fn main() -> Result<()> {
         match a.as_str() {
             "--adapter" => adapter = args.next().context("--adapter needs an addr")?.parse()?,
             "--udp" => udp_bind = args.next().context("--udp needs a bind")?.parse()?,
-            "--peer-udp-port" => peer_udp_port = args.next().context("--peer-udp-port needs a number")?.parse()?,
+            "--peer-udp-port" => {
+                peer_udp_port = args
+                    .next()
+                    .context("--peer-udp-port needs a number")?
+                    .parse()?
+            }
             "--rpi-ms" => rpi_ms = args.next().context("--rpi-ms needs a number")?.parse()?,
-            "--data-size" => data_size = args.next().context("--data-size needs a number")?.parse()?,
+            "--data-size" => {
+                data_size = args.next().context("--data-size needs a number")?.parse()?
+            }
             "--client" => open_client = true,
             "--snn" => {
                 tunid.snn = parse_snn(&args.next().context("--snn needs 12 hex chars")?)?;
@@ -53,8 +61,12 @@ async fn main() -> Result<()> {
                 tunid.node_address =
                     parse_hex_u32(&args.next().context("--node needs a hex value")?)?;
             }
-            "--consumed" => consumed_asm = args.next().context("--consumed needs a number")?.parse()?,
-            "--produced" => produced_asm = args.next().context("--produced needs a number")?.parse()?,
+            "--consumed" => {
+                consumed_asm = args.next().context("--consumed needs a number")?.parse()?
+            }
+            "--produced" => {
+                produced_asm = args.next().context("--produced needs a number")?.parse()?
+            }
             "--config" => config_asm = args.next().context("--config needs a number")?.parse()?,
             other => anyhow::bail!("unexpected argument `{}`", other),
         }
@@ -161,7 +173,11 @@ fn parse_hex_u32(s: &str) -> Result<u32> {
 
 fn parse_snn(s: &str) -> Result<SafetyNetworkNumber> {
     let hex: String = s.chars().filter(|c| !"_- ".contains(*c)).collect();
-    anyhow::ensure!(hex.len() == 12, "SNN must be 12 hex chars (got {})", hex.len());
+    anyhow::ensure!(
+        hex.len() == 12,
+        "SNN must be 12 hex chars (got {})",
+        hex.len()
+    );
     let mut bytes = [0u8; 6];
     // Human-readable form is big-endian ("4D90_0101_A35C") but on the wire the
     // 6-byte SNN is little-endian, matching the C# adapter's parser.

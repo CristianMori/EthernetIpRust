@@ -82,7 +82,11 @@ mod shutdown {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown hung");
-        assert!(t.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            t.elapsed()
+        );
 
         assert_eof(client).await;
         // No polling: the ports must be free the moment shutdown() returns.
@@ -106,7 +110,11 @@ mod shutdown {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown hung");
-        assert!(t.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            t.elapsed()
+        );
         assert_eof(client).await;
         UdpSocket::bind(udp).await.expect("udp rebind");
     }

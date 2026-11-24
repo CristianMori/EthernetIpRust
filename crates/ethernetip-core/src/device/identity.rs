@@ -5,8 +5,8 @@
 //! discovery tools at all.
 
 use crate::cip::{
-    class_codes, service_codes, AttributeAccess, CipAttribute, CipClass, CipDataType,
-    CipInstance, CipServiceDefinition, CipServiceRequest, CipServiceResponse,
+    class_codes, service_codes, AttributeAccess, CipAttribute, CipClass, CipDataType, CipInstance,
+    CipServiceDefinition, CipServiceRequest, CipServiceResponse,
 };
 
 /// Device identity block — the raw values that populate Identity attributes

@@ -41,7 +41,11 @@ async fn connect_times_out_on_hanging_peer() {
     let t0 = Instant::now();
     let r = EipSession::connect_with_timeout(addr, Some(SHORT)).await;
     let el = t0.elapsed();
-    assert!(matches!(r, Err(EipError::Timeout(d)) if d == SHORT), "got {:?}", r.err());
+    assert!(
+        matches!(r, Err(EipError::Timeout(d)) if d == SHORT),
+        "got {:?}",
+        r.err()
+    );
     assert!(el >= SHORT && el < Duration::from_secs(3), "elapsed {el:?}");
 }
 

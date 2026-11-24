@@ -122,7 +122,10 @@ impl ForwardOpenRequest {
         buf.put_u32_le(self.t_to_o_rpi_us);
         buf.put_u16_le(self.t_to_o_params.encode());
         buf.put_u8(self.transport_type);
-        assert!(self.connection_path.len() % 2 == 0, "path must be word-aligned");
+        assert!(
+            self.connection_path.len() % 2 == 0,
+            "path must be word-aligned"
+        );
         buf.put_u8((self.connection_path.len() / 2) as u8);
         buf.put_slice(&self.connection_path);
         buf.to_vec()
@@ -203,7 +206,10 @@ impl ForwardOpenResponse {
         buf.put_u32_le(self.originator_serial);
         buf.put_u32_le(self.o_to_t_actual_rpi_us);
         buf.put_u32_le(self.t_to_o_actual_rpi_us);
-        assert!(self.app_reply.len() % 2 == 0, "app_reply must be word-aligned");
+        assert!(
+            self.app_reply.len() % 2 == 0,
+            "app_reply must be word-aligned"
+        );
         buf.put_u8((self.app_reply.len() / 2) as u8);
         buf.put_u8(0);
         buf.put_slice(&self.app_reply);
@@ -268,7 +274,10 @@ impl ForwardCloseRequest {
         buf.put_u16_le(self.connection_serial);
         buf.put_u16_le(self.originator_vendor);
         buf.put_u32_le(self.originator_serial);
-        assert!(self.connection_path.len() % 2 == 0, "path must be word-aligned");
+        assert!(
+            self.connection_path.len() % 2 == 0,
+            "path must be word-aligned"
+        );
         buf.put_u8((self.connection_path.len() / 2) as u8);
         buf.put_u8(0);
         buf.put_slice(&self.connection_path);
@@ -325,7 +334,10 @@ impl ForwardCloseResponse {
         buf.put_u16_le(self.connection_serial);
         buf.put_u16_le(self.originator_vendor);
         buf.put_u32_le(self.originator_serial);
-        assert!(self.app_reply.len() % 2 == 0, "app_reply must be word-aligned");
+        assert!(
+            self.app_reply.len() % 2 == 0,
+            "app_reply must be word-aligned"
+        );
         buf.put_u8((self.app_reply.len() / 2) as u8);
         buf.put_u8(0);
         buf.put_slice(&self.app_reply);
@@ -443,7 +455,9 @@ mod tests {
             connection_path: vec![0x20, 0x02, 0x24, 0x01],
         };
         assert_eq!(
-            ForwardCloseRequest::decode(&req.encode()).unwrap().connection_serial,
+            ForwardCloseRequest::decode(&req.encode())
+                .unwrap()
+                .connection_serial,
             req.connection_serial
         );
 

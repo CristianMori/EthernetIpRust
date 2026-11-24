@@ -21,10 +21,7 @@ const STRUCT_TYPE_INDICATOR: u16 = 0x02A0;
 
 async fn spawn_server(
     registry: TagRegistry,
-) -> (
-    ethernetip_logix::tag_server::TagServerHandle,
-    SocketAddr,
-) {
+) -> (ethernetip_logix::tag_server::TagServerHandle, SocketAddr) {
     let cfg = TagServerConfig::new(registry).tcp_bind("127.0.0.1:0".parse().unwrap());
     let handle = start_server(cfg).await.expect("server start");
     let addr = handle.tcp_addr;
@@ -96,11 +93,8 @@ fn register_motor_and_timer(reg: &TagRegistry) -> (u16, u16) {
 async fn read_nested_struct_member_emits_four_byte_prefix() {
     let reg = TagRegistry::new();
     let (motor_id, timer_handle) = register_motor_and_timer(&reg);
-    reg.add_struct_from_template(
-        "MyMotor",
-        &reg.get_template(motor_id).unwrap(),
-    )
-    .unwrap();
+    reg.add_struct_from_template("MyMotor", &reg.get_template(motor_id).unwrap())
+        .unwrap();
 
     // Preload Timer.PRE = 111, Timer.ACC = 222. Motor layout:
     //   bytes 0..4   Speed (REAL, zero)
@@ -136,11 +130,8 @@ async fn read_atomic_member_stays_two_byte_prefix() {
     // asserts via a decoded TagValue; this one asserts the raw byte shape.
     let reg = TagRegistry::new();
     let (motor_id, _) = register_motor_and_timer(&reg);
-    reg.add_struct_from_template(
-        "MyMotor",
-        &reg.get_template(motor_id).unwrap(),
-    )
-    .unwrap();
+    reg.add_struct_from_template("MyMotor", &reg.get_template(motor_id).unwrap())
+        .unwrap();
 
     let mut blob = vec![0u8; 12];
     blob[4..8].copy_from_slice(&777i32.to_le_bytes());
@@ -169,11 +160,8 @@ async fn read_whole_struct_tag_uses_stored_structure_handle() {
     // Studio export) must put that custom value on the wire.
     let reg = TagRegistry::new();
     let (motor_id, _) = register_motor_and_timer(&reg);
-    reg.add_struct_from_template(
-        "MyMotor",
-        &reg.get_template(motor_id).unwrap(),
-    )
-    .unwrap();
+    reg.add_struct_from_template("MyMotor", &reg.get_template(motor_id).unwrap())
+        .unwrap();
 
     let (handle, addr) = spawn_server(reg).await;
     let mut c = client(addr).await;

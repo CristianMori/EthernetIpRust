@@ -234,8 +234,7 @@ pub fn parse(path: &[u8], request: &ForwardOpenRequest) -> ConnectionPathResult 
                 if offset + seg_total_bytes > path.len() {
                     break;
                 }
-                result.safety_segment =
-                    Some(path[offset..offset + seg_total_bytes].to_vec());
+                result.safety_segment = Some(path[offset..offset + seg_total_bytes].to_vec());
                 offset += seg_total_bytes;
             } else {
                 offset += 1;
@@ -359,9 +358,7 @@ mod tests {
     fn strips_logix_emulate_wrapper() {
         // Wrapper: 21 00 FC 04 2C 01 followed by a normal GEM path.
         let mut path = vec![0x21, 0x00, 0xFC, 0x04, 0x2C, 0x01];
-        path.extend_from_slice(&[
-            0x20, 0x04, 0x24, 0x01, 0x2C, 0x02, 0x2C, 0x03,
-        ]);
+        path.extend_from_slice(&[0x20, 0x04, 0x24, 0x01, 0x2C, 0x02, 0x2C, 0x03]);
         let r = parse(&path, &dummy_request());
         assert_eq!(r.config_assembly, Some(1));
         assert_eq!(r.consumed_assembly, Some(2));
@@ -387,7 +384,7 @@ mod tests {
         // `50 <words> <data...>` alongside a normal GEM path.
         let mut path = vec![
             0x34, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, // ekey
-            0x50, 0x04, 1, 2, 3, 4, 5, 6, 7, 8,   // safety seg: 4 words
+            0x50, 0x04, 1, 2, 3, 4, 5, 6, 7, 8, // safety seg: 4 words
             0x20, 0x04, 0x24, 0x01, // class + inst
             0x2C, 0x02, 0x2C, 0x03, // two conn points
         ];
@@ -414,7 +411,7 @@ mod tests {
         // Half-open where a single conn point serves both O→T and T→O.
         let path: &[u8] = &[
             0x20, 0x04, 0x24, 0x05, // class + config inst
-            0x2C, 0x07,             // single conn point
+            0x2C, 0x07, // single conn point
         ];
         let mut req = dummy_request();
         // Both connection types non-null → both directions get the CP.

@@ -40,12 +40,7 @@ impl AtomCache {
         self.controller.insert(name.into(), id);
     }
 
-    pub fn insert_program(
-        &mut self,
-        program: impl Into<String>,
-        name: impl Into<String>,
-        id: u32,
-    ) {
+    pub fn insert_program(&mut self, program: impl Into<String>, name: impl Into<String>, id: u32) {
         self.programs
             .entry(program.into())
             .or_default()
@@ -100,10 +95,7 @@ pub fn encode_with_cache(name: &str, cache: &AtomCache) -> Result<Vec<u8>> {
             }
             let (local_name, local_idx) = split_indexers(segments[1])?;
             if program_tail.is_empty() || local_name.is_empty() {
-                return Err(EipError::Protocol(format!(
-                    "empty component in `{}`",
-                    name
-                )));
+                return Err(EipError::Protocol(format!("empty component in `{}`", name)));
             }
             if let Some(local_id) = cache.get_program(program_tail, local_name) {
                 writer.push_symbolic(program);

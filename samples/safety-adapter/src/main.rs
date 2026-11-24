@@ -19,7 +19,8 @@ use ethernetip_safety::{
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "safety_adapter=info,ethernetip_safety=info".into()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "safety_adapter=info,ethernetip_safety=info".into()),
         )
         .init();
 
@@ -40,8 +41,18 @@ async fn main() -> Result<()> {
         match a.as_str() {
             "--tcp" => tcp_bind = args.next().context("--tcp needs a bind")?.parse()?,
             "--udp" => udp_bind = args.next().context("--udp needs a bind")?.parse()?,
-            "--peer-udp-port" => peer_udp_port = args.next().context("--peer-udp-port needs a number")?.parse()?,
-            "--input-size" => input_size = args.next().context("--input-size needs a number")?.parse()?,
+            "--peer-udp-port" => {
+                peer_udp_port = args
+                    .next()
+                    .context("--peer-udp-port needs a number")?
+                    .parse()?
+            }
+            "--input-size" => {
+                input_size = args
+                    .next()
+                    .context("--input-size needs a number")?
+                    .parse()?
+            }
             "--bind" => {
                 let ip: Ipv4Addr = args
                     .next()
@@ -176,8 +187,7 @@ fn parse_snn(s: &str) -> Result<SafetyNetworkNumber> {
     }
     let mut out = [0u8; 6];
     for i in 0..6 {
-        out[5 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .context("SNN parse")?;
+        out[5 - i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).context("SNN parse")?;
     }
     Ok(SafetyNetworkNumber(out))
 }

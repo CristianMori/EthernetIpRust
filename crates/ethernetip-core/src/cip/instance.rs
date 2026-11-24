@@ -19,7 +19,10 @@ pub struct CipInstance {
 impl CipInstance {
     /// Create an empty instance with the given id.
     pub fn new(id: u32) -> Self {
-        Self { id, attributes: BTreeMap::new() }
+        Self {
+            id,
+            attributes: BTreeMap::new(),
+        }
     }
 
     /// Register an attribute on this instance. If the id already existed it

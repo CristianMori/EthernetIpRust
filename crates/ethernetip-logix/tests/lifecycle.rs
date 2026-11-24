@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use ethernetip_logix::tag_registry::TagRegistry;
 use ethernetip_logix::tag_server::{start, TagServerConfig};
-use tokio::net::TcpListener;
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 fn config() -> TagServerConfig {
     TagServerConfig::new(TagRegistry::new()).tcp_bind("127.0.0.1:0".parse().unwrap())
@@ -21,15 +21,18 @@ async fn dropped_handle_stops_accept_loop_and_frees_port() {
         if TcpListener::bind(addr).await.is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "port still bound after handle drop");
+        assert!(
+            Instant::now() < deadline,
+            "port still bound after handle drop"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 mod shutdown {
     use super::*;
-    use tokio::net::TcpListener;
     use ethernetip_core::encap::{encode_frame, Command};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::net::TcpStream;
 
     /// Connect and complete RegisterSession so the session task is
@@ -66,7 +69,11 @@ mod shutdown {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown hung");
-        assert!(t.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            t.elapsed()
+        );
 
         assert_eof(client).await;
         // No polling: the ports must be free the moment shutdown() returns.
@@ -89,7 +96,11 @@ mod shutdown {
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown hung");
-        assert!(t.elapsed() < Duration::from_secs(1), "shutdown took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            t.elapsed()
+        );
         assert_eof(client).await;
     }
 }

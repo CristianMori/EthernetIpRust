@@ -14,9 +14,12 @@ const SHORT: Duration = Duration::from_millis(300);
 
 fn config(addr: SocketAddr) -> ScannerConfig {
     let a = AssemblyRegistry::new();
-    a.insert(Assembly::new(100, AssemblyKind::Input, 8)).unwrap();
-    a.insert(Assembly::new(150, AssemblyKind::Output, 8)).unwrap();
-    a.insert(Assembly::new(151, AssemblyKind::Config, 0)).unwrap();
+    a.insert(Assembly::new(100, AssemblyKind::Input, 8))
+        .unwrap();
+    a.insert(Assembly::new(150, AssemblyKind::Output, 8))
+        .unwrap();
+    a.insert(Assembly::new(151, AssemblyKind::Config, 0))
+        .unwrap();
     ScannerConfig::new(addr, a, 151, 150, 100, 8, 8).udp_bind("127.0.0.1:0".parse().unwrap())
 }
 
@@ -52,7 +55,11 @@ async fn open_times_out_on_hanging_peer() {
     let t = Instant::now();
     let r = open_scanner_connection(cfg).await;
     let el = t.elapsed();
-    assert!(matches!(r, Err(EipError::Timeout(d)) if d == SHORT), "got {:?}", r.err());
+    assert!(
+        matches!(r, Err(EipError::Timeout(d)) if d == SHORT),
+        "got {:?}",
+        r.err()
+    );
     assert!(el >= SHORT && el < Duration::from_secs(3), "took {el:?}");
 }
 
@@ -61,7 +68,10 @@ async fn none_disables_the_connect_bound() {
     let (addr, _held, _l) = spawn_blackhole().await;
     let cfg = config(addr).connect_timeout(None);
     let r = tokio::time::timeout(SHORT * 3, open_scanner_connection(cfg)).await;
-    assert!(r.is_err(), "connect_timeout(None) must not time out by itself");
+    assert!(
+        r.is_err(),
+        "connect_timeout(None) must not time out by itself"
+    );
 }
 
 #[tokio::test]

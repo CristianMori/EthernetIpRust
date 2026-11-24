@@ -229,7 +229,8 @@ async fn handle_session(
         if header.length > 0 {
             // Same bound as the header read: a peer that sends a header and
             // stalls must not park the session.
-            match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut payload)).await {
+            match tokio::time::timeout(SESSION_READ_TIMEOUT, stream.read_exact(&mut payload)).await
+            {
                 Ok(r) => {
                     r?;
                 }
@@ -278,15 +279,8 @@ async fn handle_session(
                 .await?;
             }
             x if x == Command::SendUnitData.as_u16() => {
-                handle_send_unit_data(
-                    &mut stream,
-                    &header,
-                    &payload,
-                    &registry,
-                    &identity,
-                    &conn,
-                )
-                .await?;
+                handle_send_unit_data(&mut stream, &header, &payload, &registry, &identity, &conn)
+                    .await?;
             }
             other => {
                 tracing::debug!("unhandled command 0x{:04X}", other);
@@ -400,7 +394,8 @@ async fn handle_send_rr_data(
         .find(item_type::UNCONNECTED_DATA)
         .ok_or_else(|| EipError::Protocol("SendRRData missing UnconnectedData item".into()))?;
     // Unwrap Unconnected_Send if present (service 0x52 to Connection Manager).
-    let inner = maybe_unwrap_unconnected_send(&mr_item.data).unwrap_or_else(|| mr_item.data.clone());
+    let inner =
+        maybe_unwrap_unconnected_send(&mr_item.data).unwrap_or_else(|| mr_item.data.clone());
     let mr_reply = dispatch_mr(&inner, registry, identity, conn, header.session_handle, 0);
 
     let items = [
@@ -447,11 +442,9 @@ async fn handle_send_unit_data(
     // SendUnitData with the wrong address item, so this is purely a
     // defensive gate against a misbehaving / malicious peer.
     if let Some(conn) = conn.as_ref() {
-        let addr_item = envelope
-            .find(item_type::CONNECTED_ADDRESS)
-            .ok_or_else(|| EipError::Protocol(
-                "SendUnitData missing ConnectedAddress item".into(),
-            ))?;
+        let addr_item = envelope.find(item_type::CONNECTED_ADDRESS).ok_or_else(|| {
+            EipError::Protocol("SendUnitData missing ConnectedAddress item".into())
+        })?;
         if addr_item.data.len() < 4 {
             return Err(EipError::Protocol(
                 "SendUnitData ConnectedAddress < 4 bytes".into(),
@@ -476,7 +469,9 @@ async fn handle_send_unit_data(
         .find(item_type::CONNECTED_DATA)
         .ok_or_else(|| EipError::Protocol("SendUnitData missing ConnectedData item".into()))?;
     if data_item.data.len() < 2 {
-        return Err(EipError::Protocol("SendUnitData ConnectedData < 2 bytes".into()));
+        return Err(EipError::Protocol(
+            "SendUnitData ConnectedData < 2 bytes".into(),
+        ));
     }
     let seq = u16::from_le_bytes([data_item.data[0], data_item.data[1]]);
     let mr = &data_item.data[2..];
@@ -485,7 +480,14 @@ async fn handle_send_unit_data(
     // We still accept the whole dispatch_mr surface so Multiple_Service_Packet
     // and other inline services keep working.
     let mut local_conn: Option<SessionConn> = None;
-    let mr_reply = dispatch_mr(mr, registry, identity, &mut local_conn, header.session_handle, 0);
+    let mr_reply = dispatch_mr(
+        mr,
+        registry,
+        identity,
+        &mut local_conn,
+        header.session_handle,
+        0,
+    );
 
     let reply_cid = conn.as_ref().map(|c| c.to_id).unwrap_or(0);
     let mut data = Vec::with_capacity(2 + mr_reply.len());
@@ -608,9 +610,7 @@ fn dispatch_mr(
         s if s == service::LARGE_FORWARD_OPEN => {
             handle_forward_open(&path, &body, conn, session_handle, true)
         }
-        s if s == service::FORWARD_CLOSE
-            && path_class == Some(class::CONNECTION_MANAGER) =>
-        {
+        s if s == service::FORWARD_CLOSE && path_class == Some(class::CONNECTION_MANAGER) => {
             handle_forward_close(&path, &body, conn)
         }
         s if s == READ_MODIFY_WRITE => handle_read_modify_write(&path, &body, registry),
@@ -628,7 +628,11 @@ fn dispatch_mr(
             session_handle,
             depth,
         ),
-        other => build_mr_reply(other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, &[]),
+        other => build_mr_reply(
+            other | service::REPLY_FLAG,
+            status::SERVICE_NOT_SUPPORTED,
+            &[],
+        ),
     }
 }
 
@@ -696,11 +700,9 @@ fn handle_get_attribute_single(path: &[u8], identity: &IdentityInfo) -> Vec<u8> 
             status::SUCCESS,
             &[identity.major_revision, identity.minor_revision],
         ),
-        (class::IDENTITY, Some(5)) => build_mr_reply(
-            reply_svc,
-            status::SUCCESS,
-            &identity.status.to_le_bytes(),
-        ),
+        (class::IDENTITY, Some(5)) => {
+            build_mr_reply(reply_svc, status::SUCCESS, &identity.status.to_le_bytes())
+        }
         (class::IDENTITY, Some(6)) => build_mr_reply(
             reply_svc,
             status::SUCCESS,
@@ -816,7 +818,11 @@ fn handle_multiple_service_packet(
     let mut sub_replies = Vec::with_capacity(n);
     for i in 0..n {
         let start = offsets[i];
-        let end = if i + 1 < n { offsets[i + 1] } else { body.len() };
+        let end = if i + 1 < n {
+            offsets[i + 1]
+        } else {
+            body.len()
+        };
         if start > body.len() || end > body.len() || start > end {
             return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
         }
@@ -926,11 +932,7 @@ fn handle_forward_open(
 /// We tear down the session's connection slot unconditionally — the Rust
 /// server only tracks one Class 3 connection per TCP session anyway — and
 /// mirror the request's triad back so the originator can match the reply.
-fn handle_forward_close(
-    _path: &[u8],
-    body: &[u8],
-    conn: &mut Option<SessionConn>,
-) -> Vec<u8> {
+fn handle_forward_close(_path: &[u8], body: &[u8], conn: &mut Option<SessionConn>) -> Vec<u8> {
     let reply_svc = service::FORWARD_CLOSE | service::REPLY_FLAG;
     if body.len() < 10 {
         return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
@@ -1012,8 +1014,14 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
     // init_tags populates its tag cache.
     if segments.len() >= 2 {
         if let (
-            PathSegment::Logical { kind: k1, value: v1 },
-            PathSegment::Logical { kind: k2, value: v2 },
+            PathSegment::Logical {
+                kind: k1,
+                value: v1,
+            },
+            PathSegment::Logical {
+                kind: k2,
+                value: v2,
+            },
         ) = (&segments[0], &segments[1])
         {
             use ethernetip_core::path_parse::LogicalKind;
@@ -1022,8 +1030,7 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
                 && matches!(k2, LogicalKind::InstanceId)
             {
                 let entry = registry.get_by_instance(*v2)?;
-                let post: Vec<PathSegment> =
-                    segments.iter().skip(2).cloned().collect();
+                let post: Vec<PathSegment> = segments.iter().skip(2).cloned().collect();
                 if post.is_empty() {
                     return Some(ResolvedPath::Controller(entry, None));
                 }
@@ -1032,7 +1039,9 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
             }
         }
     }
-    let first_sym_idx = segments.iter().position(|s| matches!(s, PathSegment::Symbolic(_)))?;
+    let first_sym_idx = segments
+        .iter()
+        .position(|s| matches!(s, PathSegment::Symbolic(_)))?;
     let PathSegment::Symbolic(first_name) = &segments[first_sym_idx] else {
         return None;
     };
@@ -1058,7 +1067,11 @@ fn resolve_tag_path(path: &[u8], registry: &TagRegistry) -> Option<ResolvedPath>
             return Some(ResolvedPath::Program(program_tail.to_string(), entry, None));
         }
         let w = walk(&entry, &post, registry).ok()?;
-        return Some(ResolvedPath::Program(program_tail.to_string(), entry, Some(w)));
+        return Some(ResolvedPath::Program(
+            program_tail.to_string(),
+            entry,
+            Some(w),
+        ));
     }
 
     let entry = registry.get_by_name(first_name)?;
@@ -1128,7 +1141,11 @@ fn handle_read_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> 
         let want = take.min(entry.data.len());
         out.extend_from_slice(&entry.data[..want]);
     }
-    build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
+    build_mr_reply(
+        service::READ_TAG | service::REPLY_FLAG,
+        status::SUCCESS,
+        &out,
+    )
 }
 
 fn build_walker_read_reply(
@@ -1144,7 +1161,11 @@ fn build_walker_read_reply(
         let mut out = Vec::with_capacity(3);
         out.extend_from_slice(&(CipType::Bool as u16).to_le_bytes());
         out.push(value);
-        return build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out);
+        return build_mr_reply(
+            service::READ_TAG | service::REPLY_FLAG,
+            status::SUCCESS,
+            &out,
+        );
     }
     let bytes_to_read = count * w.element_size;
     if w.offset + bytes_to_read > entry.data.len() {
@@ -1179,12 +1200,20 @@ fn build_walker_read_reply(
         out.extend_from_slice(&(CipType::Struct as u16).to_le_bytes());
         out.extend_from_slice(&handle.to_le_bytes());
         out.extend_from_slice(&entry.data[w.offset..w.offset + bytes_to_read]);
-        return build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out);
+        return build_mr_reply(
+            service::READ_TAG | service::REPLY_FLAG,
+            status::SUCCESS,
+            &out,
+        );
     }
     let mut out = Vec::with_capacity(2 + bytes_to_read);
     out.extend_from_slice(&w.type_code.to_le_bytes());
     out.extend_from_slice(&entry.data[w.offset..w.offset + bytes_to_read]);
-    build_mr_reply(service::READ_TAG | service::REPLY_FLAG, status::SUCCESS, &out)
+    build_mr_reply(
+        service::READ_TAG | service::REPLY_FLAG,
+        status::SUCCESS,
+        &out,
+    )
 }
 
 fn handle_read_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> {
@@ -1312,7 +1341,9 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         && !value.is_empty()
         && value.len() >= 1 + value[0] as usize
     {
-        let elem = CipType::ShortString.atomic_size().unwrap_or(SHORT_STRING_STORAGE_SIZE);
+        let elem = CipType::ShortString
+            .atomic_size()
+            .unwrap_or(SHORT_STRING_STORAGE_SIZE);
         let want = count.max(1) * elem;
         if value.len() < want {
             let mut v = Vec::with_capacity(want);
@@ -1361,12 +1392,13 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
             // because the Element segment doesn't rewrite type_code. Treat
             // either shape as "struct" so Write_Tag on `GreetingArr[1]`
             // doesn't trip the atomic-against-struct arm.
-            let member_is_struct =
-                (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
+            let member_is_struct = (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
             match (client_struct_handle, member_is_struct) {
-                (None, false)  => type_code != w.type_code,
+                (None, false) => type_code != w.type_code,
                 (Some(h), true) => {
-                    let expected = w.template.and_then(lookup_handle)
+                    let expected = w
+                        .template
+                        .and_then(lookup_handle)
                         .unwrap_or(w.type_code & 0x0FFF);
                     h != expected
                 }
@@ -1378,9 +1410,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         ResolvedPath::Controller(e, None) | ResolvedPath::Program(_, e, None) => {
             let tag_is_struct = e.cip_type == CipType::Struct;
             match (client_struct_handle, tag_is_struct) {
-                (None, false)  => type_code != e.cip_type as u16,
+                (None, false) => type_code != e.cip_type as u16,
                 (Some(h), true) => {
-                    let expected = e.template_id.and_then(lookup_handle)
+                    let expected = e
+                        .template_id
+                        .and_then(lookup_handle)
                         .unwrap_or(e.sym_type & 0x0FFF);
                     h != expected
                 }
@@ -1389,12 +1423,7 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
         }
     };
     if type_check_failed {
-        return build_mr_reply_ext(
-            service::WRITE_TAG | service::REPLY_FLAG,
-            0xFF,
-            0x2107,
-            &[],
-        );
+        return build_mr_reply_ext(service::WRITE_TAG | service::REPLY_FLAG, 0xFF, 0x2107, &[]);
     }
 
     // Walker path — write into a specific member/element offset (with BOOL
@@ -1424,7 +1453,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                         &[],
                     );
                 }
-                return build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[]);
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::SUCCESS,
+                    &[],
+                );
             }
             let bytes_to_write = count.max(1) * w.element_size;
             if value.len() < bytes_to_write {
@@ -1444,7 +1477,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                     &[],
                 );
             }
-            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+            build_mr_reply(
+                service::WRITE_TAG | service::REPLY_FLAG,
+                status::SUCCESS,
+                &[],
+            )
         }
         ResolvedPath::Program(program, entry, Some(w)) => {
             if let Some(bit) = w.bit_pos {
@@ -1480,7 +1517,12 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                     cur.data[w.offset] &= !mask;
                 }
                 if registry
-                    .set_program_tag_bytes(&program, &entry.name, w.offset, &cur.data[w.offset..w.offset + 1])
+                    .set_program_tag_bytes(
+                        &program,
+                        &entry.name,
+                        w.offset,
+                        &cur.data[w.offset..w.offset + 1],
+                    )
                     .is_err()
                 {
                     return build_mr_reply(
@@ -1489,7 +1531,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                         &[],
                     );
                 }
-                return build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[]);
+                return build_mr_reply(
+                    service::WRITE_TAG | service::REPLY_FLAG,
+                    status::SUCCESS,
+                    &[],
+                );
             }
             let bytes_to_write = count.max(1) * w.element_size;
             if value.len() < bytes_to_write {
@@ -1509,11 +1555,13 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                     &[],
                 );
             }
-            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+            build_mr_reply(
+                service::WRITE_TAG | service::REPLY_FLAG,
+                status::SUCCESS,
+                &[],
+            )
         }
-        ResolvedPath::Controller(entry, None) => {
-            write_whole_tag(&entry, value, count, registry)
-        }
+        ResolvedPath::Controller(entry, None) => write_whole_tag(&entry, value, count, registry),
         ResolvedPath::Program(program, entry, None) => {
             let per = entry.atomic_size().unwrap_or(entry.data.len());
             let take = per * count.max(1);
@@ -1534,7 +1582,11 @@ fn handle_write_tag(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8>
                     &[],
                 );
             }
-            build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+            build_mr_reply(
+                service::WRITE_TAG | service::REPLY_FLAG,
+                status::SUCCESS,
+                &[],
+            )
         }
     }
 }
@@ -1561,25 +1613,29 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
     let type_code = u16::from_le_bytes([body[0], body[1]]);
     const CIP_TYPE_STRUCT_MARKER: u16 = 0x02A0;
 
-    let (client_struct_handle, count, byte_offset_in_elements, value): (Option<u16>, u16, u32, &[u8]) =
-        if type_code == CIP_TYPE_STRUCT_MARKER {
-            if body.len() < 10 {
-                return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
-            }
-            (
-                Some(u16::from_le_bytes([body[2], body[3]])),
-                u16::from_le_bytes([body[4], body[5]]),
-                u32::from_le_bytes([body[6], body[7], body[8], body[9]]),
-                &body[10..],
-            )
-        } else {
-            (
-                None,
-                u16::from_le_bytes([body[2], body[3]]),
-                u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
-                &body[8..],
-            )
-        };
+    let (client_struct_handle, count, byte_offset_in_elements, value): (
+        Option<u16>,
+        u16,
+        u32,
+        &[u8],
+    ) = if type_code == CIP_TYPE_STRUCT_MARKER {
+        if body.len() < 10 {
+            return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);
+        }
+        (
+            Some(u16::from_le_bytes([body[2], body[3]])),
+            u16::from_le_bytes([body[4], body[5]]),
+            u32::from_le_bytes([body[6], body[7], body[8], body[9]]),
+            &body[10..],
+        )
+    } else {
+        (
+            None,
+            u16::from_le_bytes([body[2], body[3]]),
+            u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
+            &body[8..],
+        )
+    };
 
     // pycomm3-compat: fragmented SHORT_STRING write at offset 0 arrives as
     // `[length_byte][chars]` with no fixed-slot padding.  Pad to the full
@@ -1591,7 +1647,9 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
         && !value.is_empty()
         && value.len() >= 1 + value[0] as usize
     {
-        let elem = CipType::ShortString.atomic_size().unwrap_or(SHORT_STRING_STORAGE_SIZE);
+        let elem = CipType::ShortString
+            .atomic_size()
+            .unwrap_or(SHORT_STRING_STORAGE_SIZE);
         let want = (count as usize).max(1) * elem;
         if value.len() < want {
             let mut v = Vec::with_capacity(want);
@@ -1616,8 +1674,7 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
     let lookup_handle = |tid: u16| registry.get_template(tid).map(|t| t.structure_handle);
     let type_check_failed = match &resolved {
         ResolvedPath::Controller(_, Some(w)) | ResolvedPath::Program(_, _, Some(w)) => {
-            let member_is_struct =
-                (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
+            let member_is_struct = (w.type_code & 0x8000) != 0 || w.type_code == 0x02A0;
             match (client_struct_handle, member_is_struct) {
                 (None, false) => type_code != w.type_code,
                 (Some(h), true) => {
@@ -1687,7 +1744,12 @@ fn handle_write_tag_fragmented(path: &[u8], body: &[u8], registry: &TagRegistry)
     build_mr_reply(reply_svc, status::SUCCESS, &[])
 }
 
-fn write_whole_tag(entry: &TagEntry, value: &[u8], count: usize, registry: &TagRegistry) -> Vec<u8> {
+fn write_whole_tag(
+    entry: &TagEntry,
+    value: &[u8],
+    count: usize,
+    registry: &TagRegistry,
+) -> Vec<u8> {
     let per = entry.atomic_size().unwrap_or(entry.data.len());
     let take = per * count.max(1);
     if value.len() < take {
@@ -1707,7 +1769,11 @@ fn write_whole_tag(entry: &TagEntry, value: &[u8], count: usize, registry: &TagR
             &[],
         );
     }
-    build_mr_reply(service::WRITE_TAG | service::REPLY_FLAG, status::SUCCESS, &[])
+    build_mr_reply(
+        service::WRITE_TAG | service::REPLY_FLAG,
+        status::SUCCESS,
+        &[],
+    )
 }
 
 fn handle_get_instance_attribute_list(
@@ -1911,11 +1977,7 @@ fn read_instance_id(path: &[u8]) -> Option<u32> {
 /// where value is UDINT for attr 4/5 and UINT for attr 1/2. The attribute
 /// list is prefixed with a count (echo of the request count), matching
 /// pycomm3's `StructTemplateAttributes` layout.
-fn handle_template_get_attribute_list(
-    path: &[u8],
-    body: &[u8],
-    registry: &TagRegistry,
-) -> Vec<u8> {
+fn handle_template_get_attribute_list(path: &[u8], body: &[u8], registry: &TagRegistry) -> Vec<u8> {
     let reply_svc = GET_ATTRIBUTE_LIST | service::REPLY_FLAG;
     if body.len() < 2 {
         return build_mr_reply(reply_svc, status::NOT_ENOUGH_DATA, &[]);

@@ -203,7 +203,10 @@ impl SafetySupervisorObject {
             move |inst, req| handle_apply_tunid(inst, req, &inner_apply),
         ));
 
-        Self { inner, cip_class: Some(cls) }
+        Self {
+            inner,
+            cip_class: Some(cls),
+        }
     }
 
     /// Transition to Executing / Run — ready to accept safety connections.
@@ -246,8 +249,12 @@ impl SafetySupervisorObject {
     /// Write the current State / Mode into attributes 1 / 2 of the not-yet-
     /// consumed CipClass. Silent no-op once `into_cip_class` has run.
     fn sync_state_mode_local(&mut self, state: u8, mode: u8) {
-        let Some(cls) = self.cip_class.as_mut() else { return };
-        let Some(inst) = cls.get_instance_mut(1) else { return };
+        let Some(cls) = self.cip_class.as_mut() else {
+            return;
+        };
+        let Some(inst) = cls.get_instance_mut(1) else {
+            return;
+        };
         if let Some(a) = inst.get_attribute_mut(1) {
             a.set_data(&[state]);
         }
@@ -277,19 +284,13 @@ impl SafetySupervisorObject {
     /// Convenience: transition to Executing and immediately sync the new
     /// state through the dispatcher so a scanner's next
     /// `Get_Attribute_Single(0x39/1/1)` sees Executing.
-    pub fn transition_executing_via(
-        &self,
-        dispatcher: &ethernetip_core::cip::CipDispatcher,
-    ) {
+    pub fn transition_executing_via(&self, dispatcher: &ethernetip_core::cip::CipDispatcher) {
         self.transition_executing();
         self.sync_to_dispatcher(dispatcher);
     }
 
     /// Convenience: transition to Idle and sync.
-    pub fn transition_idle_via(
-        &self,
-        dispatcher: &ethernetip_core::cip::CipDispatcher,
-    ) {
+    pub fn transition_idle_via(&self, dispatcher: &ethernetip_core::cip::CipDispatcher) {
         self.transition_idle();
         self.sync_to_dispatcher(dispatcher);
     }
@@ -408,9 +409,7 @@ fn handle_propose_tunid(
     }
     let proposed = match UniqueNetworkId::parse(&req.data[..UniqueNetworkId::SIZE]) {
         Ok(u) => u,
-        Err(_) => {
-            return CipServiceResponse::error(req.service_code, status::INVALID_PARAMETER)
-        }
+        Err(_) => return CipServiceResponse::error(req.service_code, status::INVALID_PARAMETER),
     };
     g.proposed_tunid = Some(proposed);
     CipServiceResponse::success(req.service_code)
@@ -430,9 +429,7 @@ fn handle_apply_tunid(
     };
     let applied = match UniqueNetworkId::parse(&req.data[..UniqueNetworkId::SIZE]) {
         Ok(u) => u,
-        Err(_) => {
-            return CipServiceResponse::error(req.service_code, status::INVALID_PARAMETER)
-        }
+        Err(_) => return CipServiceResponse::error(req.service_code, status::INVALID_PARAMETER),
     };
     // Applied UNID must match the previously proposed one exactly — this
     // is the two-service commit that guards against drop/replay between
@@ -549,10 +546,7 @@ mod tests {
     fn start_before_register_reflects_in_attribute() {
         // Transition to Executing BEFORE the class is consumed — the state
         // should already show through on the first Get_Attribute_Single.
-        let mut sup = SafetySupervisorObject::new(
-            SafetyNetworkNumber([0; 6]),
-            0xC0A8_0001,
-        );
+        let mut sup = SafetySupervisorObject::new(SafetyNetworkNumber([0; 6]), 0xC0A8_0001);
         sup.start();
         let dispatcher = Arc::new(CipDispatcher::new());
         dispatcher.register_class(sup.into_cip_class());
@@ -592,20 +586,23 @@ mod tests {
         // Propose something.
         let path1 = CipPath::parse(&PATH_CLS_INST).unwrap();
         assert_eq!(
-            dispatcher.dispatch(PROPOSE_TUNID_SERVICE, path1, new_tunid.to_vec()).general_status,
+            dispatcher
+                .dispatch(PROPOSE_TUNID_SERVICE, path1, new_tunid.to_vec())
+                .general_status,
             status::SUCCESS
         );
         // Cancel with all-0xFF.
         let path2 = CipPath::parse(&PATH_CLS_INST).unwrap();
         let cancel = vec![0xFFu8; UniqueNetworkId::SIZE];
         assert_eq!(
-            dispatcher.dispatch(PROPOSE_TUNID_SERVICE, path2, cancel).general_status,
+            dispatcher
+                .dispatch(PROPOSE_TUNID_SERVICE, path2, cancel)
+                .general_status,
             status::SUCCESS
         );
         // Apply after cancel → OBJECT_STATE_CONFLICT (no pending proposal).
         let path3 = CipPath::parse(&PATH_CLS_INST).unwrap();
-        let response =
-            dispatcher.dispatch(APPLY_TUNID_SERVICE, path3, new_tunid.to_vec());
+        let response = dispatcher.dispatch(APPLY_TUNID_SERVICE, path3, new_tunid.to_vec());
         assert_eq!(response.general_status, status::OBJECT_STATE_CONFLICT);
     }
 }

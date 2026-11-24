@@ -515,8 +515,12 @@ async fn session_loop(
         match header.command {
             x if x == Command::RegisterSession.as_u16() => {
                 let reply = [0x01, 0x00, 0x00, 0x00];
-                let frame =
-                    encode_encap(Command::RegisterSession, session_handle, header.sender_context, &reply);
+                let frame = encode_encap(
+                    Command::RegisterSession,
+                    session_handle,
+                    header.sender_context,
+                    &reply,
+                );
                 stream.write_all(&frame).await?;
             }
             x if x == Command::UnRegisterSession.as_u16() => return Ok(()),
@@ -667,46 +671,50 @@ async fn handle_send_rr_data(
                     Vec::new(),
                 )
             } else {
-            // Prefer the originator's advertised T→O endpoint from Sockaddr
-            // Info; fall back to (peer_tcp_ip, cfg.peer_udp_port).
-            let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
-                &envelope,
-                item_type::SOCKADDR_INFO_T_TO_O,
-                peer.ip(),
-                cfg.peer_udp_port,
-            );
-            match handle_safety_forward_open(
-                body,
-                peer_udp,
-                cfg,
-                shared,
-                connection_open,
-                next_conn_id,
-            )
-            .await
-            {
-                Ok((assigned_oto_t, reply)) => {
-                    active_conn_ids.push(assigned_oto_t);
-                    // Include our UDP endpoint in the reply so the scanner
-                    // knows where to place O→T frames.
-                    if let Ok(local) = udp.local_addr() {
-                        if let Ok(sa) = ethernetip_core::cpf::encode_sockaddr_in_v4(local) {
-                            sockaddr_reply_bytes = Some(sa);
+                // Prefer the originator's advertised T→O endpoint from Sockaddr
+                // Info; fall back to (peer_tcp_ip, cfg.peer_udp_port).
+                let peer_udp = ethernetip_core::cpf::resolve_peer_udp(
+                    &envelope,
+                    item_type::SOCKADDR_INFO_T_TO_O,
+                    peer.ip(),
+                    cfg.peer_udp_port,
+                );
+                match handle_safety_forward_open(
+                    body,
+                    peer_udp,
+                    cfg,
+                    shared,
+                    connection_open,
+                    next_conn_id,
+                )
+                .await
+                {
+                    Ok((assigned_oto_t, reply)) => {
+                        active_conn_ids.push(assigned_oto_t);
+                        // Include our UDP endpoint in the reply so the scanner
+                        // knows where to place O→T frames.
+                        if let Ok(local) = udp.local_addr() {
+                            if let Ok(sa) = ethernetip_core::cpf::encode_sockaddr_in_v4(local) {
+                                sockaddr_reply_bytes = Some(sa);
+                            }
                         }
+                        // Supervisor Idle → Executing is performed INSIDE
+                        // handle_safety_forward_open, in the same lock
+                        // scope as the shared-map insert, so concurrent FOs
+                        // on different sessions can't race past the
+                        // transition. No work here beyond the state
+                        // bookkeeping already done above.
+                        (s | service::REPLY_FLAG, status::SUCCESS, reply)
                     }
-                    // Supervisor Idle → Executing is performed INSIDE
-                    // handle_safety_forward_open, in the same lock
-                    // scope as the shared-map insert, so concurrent FOs
-                    // on different sessions can't race past the
-                    // transition. No work here beyond the state
-                    // bookkeeping already done above.
-                    (s | service::REPLY_FLAG, status::SUCCESS, reply)
+                    Err(err) => {
+                        tracing::warn!("safety Forward_Open rejected: {err}");
+                        (
+                            s | service::REPLY_FLAG,
+                            status::CONNECTION_FAILURE,
+                            Vec::new(),
+                        )
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!("safety Forward_Open rejected: {err}");
-                    (s | service::REPLY_FLAG, status::CONNECTION_FAILURE, Vec::new())
-                }
-            }
             }
         }
         s if s == service::FORWARD_CLOSE => {
@@ -724,12 +732,15 @@ async fn handle_send_rr_data(
             // (adapter.rs:552-562).
             if body.len() < 10 {
                 tracing::warn!("safety Forward_Close body too short ({} bytes)", body.len());
-                (s | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, Vec::new())
+                (
+                    s | service::REPLY_FLAG,
+                    status::PATH_SEGMENT_ERROR,
+                    Vec::new(),
+                )
             } else {
                 let fc_conn_serial = u16::from_le_bytes([body[2], body[3]]);
                 let fc_orig_vendor = u16::from_le_bytes([body[4], body[5]]);
-                let fc_orig_serial =
-                    u32::from_le_bytes([body[6], body[7], body[8], body[9]]);
+                let fc_orig_serial = u32::from_le_bytes([body[6], body[7], body[8], body[9]]);
 
                 let mut guard = shared.lock().await;
                 let matching_id: Option<u32> = guard
@@ -829,15 +840,29 @@ async fn handle_send_rr_data(
                     Ok(path) => {
                         let response = dispatcher.dispatch(other, path, body.to_vec());
                         reply_ext_status = response.extended_status.clone();
-                        (response.service_code, response.general_status, response.data)
+                        (
+                            response.service_code,
+                            response.general_status,
+                            response.data,
+                        )
                     }
                     Err(err) => {
-                        tracing::debug!("safety adapter path parse failed for service 0x{other:02X}: {err}");
-                        (other | service::REPLY_FLAG, status::PATH_SEGMENT_ERROR, Vec::new())
+                        tracing::debug!(
+                            "safety adapter path parse failed for service 0x{other:02X}: {err}"
+                        );
+                        (
+                            other | service::REPLY_FLAG,
+                            status::PATH_SEGMENT_ERROR,
+                            Vec::new(),
+                        )
                     }
                 }
             } else {
-                (other | service::REPLY_FLAG, status::SERVICE_NOT_SUPPORTED, Vec::new())
+                (
+                    other | service::REPLY_FLAG,
+                    status::SERVICE_NOT_SUPPORTED,
+                    Vec::new(),
+                )
             }
         }
     };
@@ -1032,7 +1057,8 @@ async fn handle_safety_forward_open(
         // SCCRC — compare against configured SCID when both sides have one.
         if let Some(sup) = cfg.supervisor.as_ref() {
             let configured = sup.scid();
-            if configured.sccrc != 0 && safety_seg.sccrc != 0
+            if configured.sccrc != 0
+                && safety_seg.sccrc != 0
                 && configured.sccrc != safety_seg.sccrc
             {
                 tracing::warn!(
@@ -1076,8 +1102,7 @@ async fn handle_safety_forward_open(
     // A `None` here therefore means "no more connection resources":
     // reject the Forward_Open with CIP 0x01 ext 0x0100 instead of
     // silently reusing a stale id.
-    let target_connection_serial: u16 = match (cfg.validator.as_ref(), cfg.dispatcher.as_ref())
-    {
+    let target_connection_serial: u16 = match (cfg.validator.as_ref(), cfg.dispatcher.as_ref()) {
         (Some(v), Some(d)) => match v.create_instance_via_dispatcher(
             d,
             SafetyValidatorInstanceState {
@@ -1108,8 +1133,16 @@ async fn handle_safety_forward_open(
     // the CID belongs to the CONSUMER of the corresponding data direction;
     // for a target-side server connection that's the target itself
     // (target_vendor + target_serial + our safety validator instance id).
-    let cid_seed_s3 = crc::pid_cid_seed_s3(cfg.target_vendor, cfg.target_serial, target_connection_serial);
-    let cid_seed_s5 = crc::pid_cid_seed_s5(cfg.target_vendor, cfg.target_serial, target_connection_serial);
+    let cid_seed_s3 = crc::pid_cid_seed_s3(
+        cfg.target_vendor,
+        cfg.target_serial,
+        target_connection_serial,
+    );
+    let cid_seed_s5 = crc::pid_cid_seed_s5(
+        cfg.target_vendor,
+        cfg.target_serial,
+        target_connection_serial,
+    );
 
     let assigned_oto_t = next_conn_id.fetch_add(1, Ordering::SeqCst);
 
@@ -1271,7 +1304,9 @@ impl ConsumerLoop {
 
         let (seeds, conn_format, sv_inst) = {
             let mut guard = self.shared.lock().await;
-            let Some(conn) = guard.get_mut(&frame.connection_id) else { return };
+            let Some(conn) = guard.get_mut(&frame.connection_id) else {
+                return;
+            };
             // Track the scanner's actual UDP source — its port is typically
             // ephemeral, not the well-known 2222. Producer / TCOO tasks read
             // peer_udp on every tick so they send back where the scanner is
@@ -1303,7 +1338,9 @@ impl ConsumerLoop {
 
         let (candidate_rollover, prev_last_ts, prev_initialized) = {
             let guard = self.shared.lock().await;
-            let Some(conn) = guard.get(&frame.connection_id) else { return };
+            let Some(conn) = guard.get(&frame.connection_id) else {
+                return;
+            };
             let mut candidate = conn.rollover_count;
             if conn.rollover_initialized {
                 let delta = this_ts as i32 - conn.last_ts as i32;
@@ -1369,7 +1406,12 @@ impl ConsumerLoop {
         let rollover_now = used_rollover;
 
         match result {
-            Ok(DecodedFrame { actual_data, mode, timestamp, .. }) => {
+            Ok(DecodedFrame {
+                actual_data,
+                mode,
+                timestamp,
+                ..
+            }) => {
                 let ping = (mode.0 & 0x03) as u16;
                 {
                     let mut guard = self.shared.lock().await;
@@ -1582,16 +1624,8 @@ mod tests {
     #[tokio::test]
     async fn safety_fo_rejects_cpcrc_mismatch_with_0x0803() {
         let fo_cfg = test_cfg();
-        let wire = build_safety_forward_open(
-            &fo_cfg,
-            0x1111,
-            0x0001,
-            0xC0FF_EE01,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let wire = build_safety_forward_open(&fo_cfg, 0x1111, 0x0001, 0xC0FF_EE01, 0xA0, &[], &[])
+            .unwrap();
 
         // The target TUNID in the adapter config matches the one baked
         // into the FO path, so TUNID is accepted and the test exercises
@@ -1612,7 +1646,11 @@ mod tests {
                 &next_id,
             )
             .await;
-            assert!(ok.is_ok(), "legitimate safety FO must verify: {:?}", ok.err());
+            assert!(
+                ok.is_ok(),
+                "legitimate safety FO must verify: {:?}",
+                ok.err()
+            );
             assert_eq!(shared.lock().await.len(), 1);
         }
 
@@ -1641,7 +1679,11 @@ mod tests {
         match err {
             EipError::Cip { status, ext } => {
                 assert_eq!(status, 0x01, "general status must be CONNECTION_FAILURE");
-                assert_eq!(ext, vec![0x0803], "ext status must be 0x0803 (CPCRC mismatch)");
+                assert_eq!(
+                    ext,
+                    vec![0x0803],
+                    "ext status must be 0x0803 (CPCRC mismatch)"
+                );
             }
             other => panic!("expected CIP error, got {:?}", other),
         }
@@ -1660,26 +1702,12 @@ mod tests {
         let mut fo_cfg_a = test_cfg();
         let mut fo_cfg_b = test_cfg();
         // Two distinct originator triplets.
-        let wire_a = build_safety_forward_open(
-            &fo_cfg_a,
-            0x1111,
-            0x0001,
-            0xC0FF_EE01,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
-        let wire_b = build_safety_forward_open(
-            &fo_cfg_b,
-            0x2222,
-            0x0001,
-            0xC0FF_EE02,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let wire_a =
+            build_safety_forward_open(&fo_cfg_a, 0x1111, 0x0001, 0xC0FF_EE01, 0xA0, &[], &[])
+                .unwrap();
+        let wire_b =
+            build_safety_forward_open(&fo_cfg_b, 0x2222, 0x0001, 0xC0FF_EE02, 0xA0, &[], &[])
+                .unwrap();
         let _ = (&mut fo_cfg_a, &mut fo_cfg_b);
 
         let cfg = adapter_cfg_with_tunid(test_cfg().tunid);
@@ -1770,26 +1798,12 @@ mod tests {
     #[tokio::test]
     async fn safety_session_teardown_drops_only_this_sessions_rows() {
         let fo_cfg = test_cfg();
-        let wire_a = build_safety_forward_open(
-            &fo_cfg,
-            0x1111,
-            0x0001,
-            0xC0FF_EE01,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
-        let wire_b = build_safety_forward_open(
-            &fo_cfg,
-            0x2222,
-            0x0001,
-            0xC0FF_EE02,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let wire_a =
+            build_safety_forward_open(&fo_cfg, 0x1111, 0x0001, 0xC0FF_EE01, 0xA0, &[], &[])
+                .unwrap();
+        let wire_b =
+            build_safety_forward_open(&fo_cfg, 0x2222, 0x0001, 0xC0FF_EE02, 0xA0, &[], &[])
+                .unwrap();
 
         let cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
         let shared = Mutex::new(std::collections::HashMap::new());
@@ -1860,26 +1874,12 @@ mod tests {
     #[tokio::test]
     async fn safety_fc_rejects_triplet_not_owned_by_session() {
         let fo_cfg = test_cfg();
-        let wire_a = build_safety_forward_open(
-            &fo_cfg,
-            0x1111,
-            0x0001,
-            0xC0FF_EE01,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
-        let wire_b = build_safety_forward_open(
-            &fo_cfg,
-            0x2222,
-            0x0001,
-            0xC0FF_EE02,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let wire_a =
+            build_safety_forward_open(&fo_cfg, 0x1111, 0x0001, 0xC0FF_EE01, 0xA0, &[], &[])
+                .unwrap();
+        let wire_b =
+            build_safety_forward_open(&fo_cfg, 0x2222, 0x0001, 0xC0FF_EE02, 0xA0, &[], &[])
+                .unwrap();
 
         let cfg = adapter_cfg_with_tunid(fo_cfg.tunid);
         let shared = Mutex::new(std::collections::HashMap::new());
@@ -1973,8 +1973,15 @@ mod tests {
             let hi = mr_reply[4 + i * 2 + 1];
             ext_status.push(u16::from_le_bytes([lo, hi]));
         }
-        assert_eq!(general_status, 0x01, "general status must be CONNECTION_FAILURE");
-        assert_eq!(ext_status, vec![0x0113], "ext status must be 0x0113 (no resources / not owned)");
+        assert_eq!(
+            general_status, 0x01,
+            "general status must be CONNECTION_FAILURE"
+        );
+        assert_eq!(
+            ext_status,
+            vec![0x0113],
+            "ext status must be 0x0113 (no resources / not owned)"
+        );
 
         // Both rows must remain in the shared map.
         assert_eq!(
@@ -2087,16 +2094,8 @@ mod tests {
     #[tokio::test]
     async fn safety_fo_rejects_tunid_mismatch_with_0x080e() {
         let fo_cfg = test_cfg();
-        let wire = build_safety_forward_open(
-            &fo_cfg,
-            0x1111,
-            0x0001,
-            0xC0FF_EE01,
-            0xA0,
-            &[],
-            &[],
-        )
-        .unwrap();
+        let wire = build_safety_forward_open(&fo_cfg, 0x1111, 0x0001, 0xC0FF_EE01, 0xA0, &[], &[])
+            .unwrap();
 
         // Adapter is configured with a DIFFERENT TUNID than the FO carries.
         let different = UniqueNetworkId {
@@ -2128,4 +2127,3 @@ mod tests {
         assert_eq!(shared.lock().await.len(), 0);
     }
 }
-

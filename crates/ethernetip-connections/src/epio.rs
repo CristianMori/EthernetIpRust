@@ -90,7 +90,9 @@ pub fn decode_frame(bytes: &[u8], expect_run_idle: bool) -> Result<Frame> {
 /// leading 2-byte CIP Class 1 sequence count. Use this for CIP Safety frames
 /// — see the note on [`encode_frame_raw`].
 pub fn decode_frame_raw(bytes: &[u8]) -> Result<Frame> {
-    decode_frame_inner(bytes, /*expect_run_idle=*/ false, /*expect_cip_sequence=*/ false)
+    decode_frame_inner(
+        bytes, /*expect_run_idle=*/ false, /*expect_cip_sequence=*/ false,
+    )
 }
 
 fn decode_frame_inner(
@@ -151,10 +153,7 @@ fn decode_frame_inner(
                 actual: payload.len(),
             });
         }
-        (
-            u16::from_le_bytes([payload[0], payload[1]]),
-            &payload[2..],
-        )
+        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
     } else {
         (0u16, payload)
     };

@@ -26,9 +26,7 @@ pub use dispatcher::CipDispatcher;
 pub use instance::CipInstance;
 pub use path::CipPath;
 pub use reply_header::ReplyHeader;
-pub use service::{
-    CipServiceDefinition, CipServiceHandler, CipServiceRequest, CipServiceResponse,
-};
+pub use service::{CipServiceDefinition, CipServiceHandler, CipServiceRequest, CipServiceResponse};
 
 /// CIP service codes.
 pub mod service_codes {
@@ -107,18 +105,23 @@ mod tests {
 
         // Path: class 0x39, instance 1, attribute 3 — Get_Attribute_Single.
         let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x01, 0x30, 0x03]).unwrap();
-        let response = dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
+        let response =
+            dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
 
         assert_eq!(response.general_status, status::SUCCESS);
         assert_eq!(response.data, vec![0x5C, 0xA3, 0x01, 0x01, 0x90, 0x4D]);
-        assert_eq!(response.service_code, standard_services::GET_ATTRIBUTE_SINGLE | 0x80);
+        assert_eq!(
+            response.service_code,
+            standard_services::GET_ATTRIBUTE_SINGLE | 0x80
+        );
     }
 
     #[test]
     fn dispatcher_missing_class_returns_path_dest_unknown() {
         let dispatcher = CipDispatcher::new();
         let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x01]).unwrap();
-        let response = dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
+        let response =
+            dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
         assert_eq!(response.general_status, status::PATH_DESTINATION_UNKNOWN);
     }
 
@@ -130,7 +133,8 @@ mod tests {
         let dispatcher = CipDispatcher::new();
         dispatcher.register_class(cls);
         let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x05]).unwrap();
-        let response = dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
+        let response =
+            dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
         assert_eq!(response.general_status, status::OBJECT_DOES_NOT_EXIST);
     }
 
@@ -145,11 +149,9 @@ mod tests {
 
         let mut cls = CipClass::new(0x39, "Safety Supervisor", 1);
         cls.add_standard_instance_services();
-        cls.add_instance_service(CipServiceDefinition::new(
-            0x55,
-            "Boom",
-            |_inst, _req| panic!("intentional handler panic"),
-        ));
+        cls.add_instance_service(CipServiceDefinition::new(0x55, "Boom", |_inst, _req| {
+            panic!("intentional handler panic")
+        }));
         cls.create_instance(1);
         let dispatcher = Arc::new(CipDispatcher::new());
         dispatcher.register_class(cls);
@@ -165,15 +167,15 @@ mod tests {
         // Second call on a surviving thread: dispatcher still works,
         // instance still exists.
         let path = CipPath::parse(&[0x20, 0x39, 0x24, 0x01]).unwrap();
-        let response = dispatcher.dispatch(
-            standard_services::GET_ATTRIBUTE_SINGLE,
-            path,
-            Vec::new(),
-        );
+        let response =
+            dispatcher.dispatch(standard_services::GET_ATTRIBUTE_SINGLE, path, Vec::new());
         // Attribute 0 is not present, but the response should carry a
         // normal CIP status rather than hanging / propagating a poison
         // panic.
-        assert_eq!(response.service_code, standard_services::GET_ATTRIBUTE_SINGLE | 0x80);
+        assert_eq!(
+            response.service_code,
+            standard_services::GET_ATTRIBUTE_SINGLE | 0x80
+        );
     }
 
     #[test]

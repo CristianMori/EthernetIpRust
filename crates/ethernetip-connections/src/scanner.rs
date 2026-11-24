@@ -21,7 +21,9 @@ use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
-use ethernetip_core::timeout::{bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
+use ethernetip_core::timeout::{
+    bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
+};
 
 use crate::adapter::IO_UDP_PORT;
 use crate::assembly::AssemblyRegistry;
@@ -532,12 +534,7 @@ async fn send_forward_close(
 }
 
 async fn send_unregister(stream: &mut TcpStream, session_handle: u32) -> Result<()> {
-    let frame = encode_encap(
-        Command::UnRegisterSession,
-        session_handle,
-        [0; 8],
-        &[],
-    );
+    let frame = encode_encap(Command::UnRegisterSession, session_handle, [0; 8], &[]);
     let _ = stream.write_all(&frame).await;
     Ok(())
 }
@@ -653,4 +650,3 @@ async fn register_session(stream: &mut TcpStream, ctx: &mut u64) -> Result<u32> 
     }
     Ok(header.session_handle)
 }
-

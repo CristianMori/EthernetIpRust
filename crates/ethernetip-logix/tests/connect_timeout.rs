@@ -38,7 +38,11 @@ async fn connect_times_out_on_hanging_peer() {
     let t = Instant::now();
     let r = builder(addr).connect_timeout(Some(SHORT)).connect().await;
     let el = t.elapsed();
-    assert!(matches!(r, Err(EipError::Timeout(d)) if d == SHORT), "got {:?}", r.err());
+    assert!(
+        matches!(r, Err(EipError::Timeout(d)) if d == SHORT),
+        "got {:?}",
+        r.err()
+    );
     assert!(el >= SHORT && el < Duration::from_secs(3), "took {el:?}");
 }
 
@@ -47,10 +51,16 @@ async fn default_is_bounded_and_none_disables() {
     let (addr, _held, _l) = spawn_blackhole().await;
     // None: still pending well past SHORT.
     let r = tokio::time::timeout(SHORT * 3, builder(addr).connect_timeout(None).connect()).await;
-    assert!(r.is_err(), "connect_timeout(None) must not time out by itself");
+    assert!(
+        r.is_err(),
+        "connect_timeout(None) must not time out by itself"
+    );
     // Default (5 s) is still pending after SHORT, i.e. neither immediate nor disabled-to-zero.
     let r = tokio::time::timeout(SHORT, builder(addr).connect()).await;
-    assert!(r.is_err(), "default connect must still be pending after {SHORT:?}");
+    assert!(
+        r.is_err(),
+        "default connect must still be pending after {SHORT:?}"
+    );
 }
 
 #[tokio::test]

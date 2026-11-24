@@ -74,9 +74,8 @@ async fn run() -> Result<()> {
     ok(&format!("controller-scope tags: {}", tags.len()));
 
     // Split into user-visible vs internal.
-    let (user_tags, hidden): (Vec<&TagInfo>, Vec<&TagInfo>) = tags
-        .iter()
-        .partition(|t| !is_internal(&t.name));
+    let (user_tags, hidden): (Vec<&TagInfo>, Vec<&TagInfo>) =
+        tags.iter().partition(|t| !is_internal(&t.name));
     info(&format!(
         "user-visible: {}, hidden (__/Map:/Task:/Program:/UDI:): {}",
         user_tags.len(),
@@ -174,8 +173,13 @@ async fn run() -> Result<()> {
                     info(&format!("  ... ({} more)", def.members.len() - 8));
                 }
                 match client.read_tag_typed(name).await {
-                    Ok(TypedValue::Struct { name: n, fields, .. }) => {
-                        ok(&format!("typed decode of {name} → {n} ({} fields)", fields.len()));
+                    Ok(TypedValue::Struct {
+                        name: n, fields, ..
+                    }) => {
+                        ok(&format!(
+                            "typed decode of {name} → {n} ({} fields)",
+                            fields.len()
+                        ));
                         for (k, v) in fields.iter().take(8) {
                             info(&format!("  {k}: {:?}", v));
                         }
@@ -244,7 +248,9 @@ async fn run() -> Result<()> {
                 if mismatch == 0 {
                     ok("batch == sequential for every tag");
                 } else {
-                    fail(&format!("{mismatch} values differ between batch/sequential"));
+                    fail(&format!(
+                        "{mismatch} values differ between batch/sequential"
+                    ));
                 }
             }
             Err(e) => fail(&format!("batch: {e}")),
@@ -343,7 +349,10 @@ async fn run() -> Result<()> {
             )),
             Err(e) => fail(&format!("post-idle read: {e}")),
         }
-        info(&format!("class3_open after retry = {}", c3r.is_class3_open()));
+        info(&format!(
+            "class3_open after retry = {}",
+            c3r.is_class3_open()
+        ));
     }
     c3r.close().await.ok();
 
@@ -370,8 +379,13 @@ async fn run() -> Result<()> {
             .context("write probe")?;
         let mid = wc.read_tag(name).await.context("read after probe")?;
         match mid {
-            TagValue::Dint(v) if v == probe => ok(&format!("wrote probe {} and read back {}", probe, v)),
-            other => fail(&format!("probe mismatch: expected {} got {:?}", probe, other)),
+            TagValue::Dint(v) if v == probe => {
+                ok(&format!("wrote probe {} and read back {}", probe, v))
+            }
+            other => fail(&format!(
+                "probe mismatch: expected {} got {:?}",
+                probe, other
+            )),
         }
         wc.write_tag(name, &TagValue::Dint(v_before))
             .await
@@ -379,7 +393,10 @@ async fn run() -> Result<()> {
         let after = wc.read_tag(name).await.context("read after restore")?;
         match after {
             TagValue::Dint(v) if v == v_before => ok(&format!("restored {name} to {}", v)),
-            other => fail(&format!("restore mismatch: expected {} got {:?}", v_before, other)),
+            other => fail(&format!(
+                "restore mismatch: expected {} got {:?}",
+                v_before, other
+            )),
         }
         wc.close().await.ok();
     } else {

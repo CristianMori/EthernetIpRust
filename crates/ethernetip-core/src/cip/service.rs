@@ -31,7 +31,9 @@ impl CipServiceRequest {
     /// Downcast the context to a concrete type. Returns `None` when the
     /// request has no context or when the concrete type doesn't match.
     pub fn context<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.context.as_ref().and_then(|arc| arc.downcast_ref::<T>())
+        self.context
+            .as_ref()
+            .and_then(|arc| arc.downcast_ref::<T>())
     }
 }
 

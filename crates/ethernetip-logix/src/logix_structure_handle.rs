@@ -38,10 +38,10 @@ pub fn try_build_formal_struc_spec(template: &ServerTemplate) -> Option<Vec<u8>>
     let mut types = Vec::with_capacity(template.members.len());
     for m in &template.members {
         if m.array_size > 0 {
-            return None;                       // arrays — out of scope
+            return None; // arrays — out of scope
         }
         if (m.data_type & 0x8000) != 0 {
-            return None;                       // nested struct — out of scope
+            return None; // nested struct — out of scope
         }
         // Scalar BOOLs packed into a host byte are marked by element_size == 0
         // (array_size then carries the bit position 0..7).  The simple
@@ -121,10 +121,7 @@ mod tests {
 
     #[test]
     fn unsigned_and_bitstring_members_encode_as_expected_bytes() {
-        let tpl = mk_scalar_tpl(
-            "Mixed",
-            &[("U32", 0x00C8), ("U8", 0x00C6), ("W", 0x00D2)],
-        );
+        let tpl = mk_scalar_tpl("Mixed", &[("U32", 0x00C8), ("U8", 0x00C6), ("W", 0x00D2)]);
         assert_eq!(
             try_build_formal_struc_spec(&tpl).unwrap(),
             vec![0xA2, 0x03, 0xC8, 0xC6, 0xD2]

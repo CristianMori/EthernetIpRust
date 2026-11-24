@@ -4,9 +4,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::cip::{
-    class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType,
-};
+use crate::cip::{class_codes, AttributeAccess, CipAttribute, CipClass, CipDataType};
 
 /// Configuration for the TCP/IP Interface object. Defaults produce a
 /// statically-configured interface with a `/24` subnet and no gateway or

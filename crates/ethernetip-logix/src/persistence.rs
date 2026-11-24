@@ -38,7 +38,12 @@ pub fn save<W: Write>(reg: &TagRegistry, mut w: W) -> std::io::Result<()> {
     write_u32(&mut w, controller.len() as u32)?;
     for (inst, _name, _sym) in &controller {
         if let Some(entry) = reg.get_by_instance(*inst) {
-            write_tag_record(&mut w, &entry.name, entry.sym_type & 0x0FFF | (entry.sym_type & 0x8000), &entry.data)?;
+            write_tag_record(
+                &mut w,
+                &entry.name,
+                entry.sym_type & 0x0FFF | (entry.sym_type & 0x8000),
+                &entry.data,
+            )?;
             // NB: for compat with the C# format we serialize the tag_type
             // parameter used in Read/Write_Tag (either the atomic type code
             // or the struct handle). Keep the same computation as the C#
@@ -52,14 +57,16 @@ pub fn save<W: Write>(reg: &TagRegistry, mut w: W) -> std::io::Result<()> {
     write_u32(&mut w, programs.len() as u32)?;
     for (program_name, _) in &programs {
         write_string(&mut w, program_name)?;
-        let mut ptags: Vec<_> = reg
-            .program_tags(program_name)
-            .into_iter()
-            .collect();
+        let mut ptags: Vec<_> = reg.program_tags(program_name).into_iter().collect();
         ptags.sort_by_key(|(_, t)| t.instance);
         write_u32(&mut w, ptags.len() as u32)?;
         for (_, entry) in &ptags {
-            write_tag_record(&mut w, &entry.name, entry.sym_type & 0x0FFF | (entry.sym_type & 0x8000), &entry.data)?;
+            write_tag_record(
+                &mut w,
+                &entry.name,
+                entry.sym_type & 0x0FFF | (entry.sym_type & 0x8000),
+                &entry.data,
+            )?;
         }
     }
     Ok(())
@@ -102,9 +109,9 @@ pub fn load<R: Read>(reg: &TagRegistry, mut r: R) -> std::io::Result<LoadResult>
                 // Consume + skip.
                 skip_tag_record(&mut r)?;
                 result.tags_skipped += 1;
-                result
-                    .warnings
-                    .push(format!("Program '{program_name}' not registered — skipping tag records"));
+                result.warnings.push(format!(
+                    "Program '{program_name}' not registered — skipping tag records"
+                ));
             }
         }
     }
@@ -174,7 +181,12 @@ fn skip_tag_record<R: Read>(r: &mut R) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_tag_record<W: Write>(w: &mut W, name: &str, tag_type: u16, data: &[u8]) -> std::io::Result<()> {
+fn write_tag_record<W: Write>(
+    w: &mut W,
+    name: &str,
+    tag_type: u16,
+    data: &[u8],
+) -> std::io::Result<()> {
     write_string(w, name)?;
     write_u16(w, tag_type)?;
     write_u32(w, data.len() as u32)?;
@@ -211,8 +223,7 @@ fn read_string<R: Read>(r: &mut R) -> std::io::Result<String> {
     let len = read_u16(r)? as usize;
     let mut b = vec![0u8; len];
     r.read_exact(&mut b)?;
-    String::from_utf8(b)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    String::from_utf8(b).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]
@@ -246,9 +257,15 @@ mod tests {
         let result = load(&reg2, &buf[..]).unwrap();
         assert_eq!(result.tags_restored, 3);
         assert_eq!(result.tags_skipped, 0);
-        assert_eq!(reg2.get_by_name("rate").unwrap().data, 12345i32.to_le_bytes());
+        assert_eq!(
+            reg2.get_by_name("rate").unwrap().data,
+            12345i32.to_le_bytes()
+        );
         assert_eq!(reg2.get_by_name("arr").unwrap().data, arr);
-        assert_eq!(reg2.get_by_name("flags").unwrap().data, [0xAB, 0xCD, 0xEF, 0x12]);
+        assert_eq!(
+            reg2.get_by_name("flags").unwrap().data,
+            [0xAB, 0xCD, 0xEF, 0x12]
+        );
     }
 
     #[test]
@@ -273,10 +290,13 @@ mod tests {
     fn program_scope_round_trip() {
         let reg = TagRegistry::new();
         reg.add_atomic("controller_tag", CipType::Dint).unwrap();
-        reg.set_by_name("controller_tag", &111i32.to_le_bytes()).unwrap();
+        reg.set_by_name("controller_tag", &111i32.to_le_bytes())
+            .unwrap();
         reg.register_program("Cell");
-        reg.add_program_atomic("Cell", "Rate", CipType::Dint).unwrap();
-        reg.set_program_tag_bytes("Cell", "Rate", 0, &222i32.to_le_bytes()).unwrap();
+        reg.add_program_atomic("Cell", "Rate", CipType::Dint)
+            .unwrap();
+        reg.set_program_tag_bytes("Cell", "Rate", 0, &222i32.to_le_bytes())
+            .unwrap();
 
         let mut buf = Vec::new();
         save(&reg, &mut buf).unwrap();
@@ -284,7 +304,8 @@ mod tests {
         let reg2 = TagRegistry::new();
         reg2.add_atomic("controller_tag", CipType::Dint).unwrap();
         reg2.register_program("Cell");
-        reg2.add_program_atomic("Cell", "Rate", CipType::Dint).unwrap();
+        reg2.add_program_atomic("Cell", "Rate", CipType::Dint)
+            .unwrap();
 
         let result = load(&reg2, &buf[..]).unwrap();
         assert_eq!(result.tags_restored, 2);

@@ -25,7 +25,9 @@ async fn spawn_silent_target() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = listener.accept().await else { return };
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut first = true;
                 loop {
@@ -55,7 +57,6 @@ async fn spawn_silent_target() -> SocketAddr {
     addr
 }
 
-
 #[test]
 fn request_timeout_defaults_to_five_seconds_and_can_be_disabled() {
     let cfg = config("127.0.0.1:1".parse().unwrap());
@@ -70,5 +71,9 @@ async fn open_times_out_against_silent_target() {
     let t = Instant::now();
     let r = open_safety_scanner(cfg).await;
     assert!(matches!(r, Err(EipError::Timeout(_))), "got {:?}", r.err());
-    assert!(t.elapsed() < Duration::from_millis(1300), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(1300),
+        "took {:?}",
+        t.elapsed()
+    );
 }

@@ -35,10 +35,18 @@ impl CipPath {
         while i < bytes.len() {
             let seg = bytes[i];
             let (advance, class, instance, attribute, member) = decode_segment(&bytes[i..], seg)?;
-            if let Some(v) = class { out.class_id = Some(v); }
-            if let Some(v) = instance { out.instance_id = Some(v); }
-            if let Some(v) = attribute { out.attribute_id = Some(v); }
-            if let Some(v) = member { out.member_id = Some(v); }
+            if let Some(v) = class {
+                out.class_id = Some(v);
+            }
+            if let Some(v) = instance {
+                out.instance_id = Some(v);
+            }
+            if let Some(v) = attribute {
+                out.attribute_id = Some(v);
+            }
+            if let Some(v) = member {
+                out.member_id = Some(v);
+            }
             i += advance;
         }
         Ok(out)
@@ -118,7 +126,10 @@ fn decode_segment(
 
 fn need(bytes: &[u8], min: usize) -> Result<()> {
     if bytes.len() < min {
-        Err(EipError::Short { expected: min, actual: bytes.len() })
+        Err(EipError::Short {
+            expected: min,
+            actual: bytes.len(),
+        })
     } else {
         Ok(())
     }

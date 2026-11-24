@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ethernetip_safety::forward_open::SafetyForwardOpenConfig;
 use ethernetip_safety::{
     open_safety_scanner, start_safety_adapter, SafetyAdapterConfig, SafetyScannerConfig,
 };
-use ethernetip_safety::forward_open::SafetyForwardOpenConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -72,7 +72,11 @@ async fn close_returns_within_timeout_against_silent_target() {
         .await
         .expect("close() hung on a silent target")
         .expect("close");
-    assert!(t.elapsed() < Duration::from_secs(2), "close took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "close took {:?}",
+        t.elapsed()
+    );
 
     adapter.shutdown().await;
 }

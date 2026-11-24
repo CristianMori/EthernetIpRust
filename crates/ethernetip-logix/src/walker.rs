@@ -74,7 +74,12 @@ pub fn walk(
                     let member = tpl
                         .find_member(name)
                         .ok_or_else(|| format!("member `{name}` not found in `{}`", tpl.name))?;
-                    (member.offset, member.data_type, member.array_size, member.element_size)
+                    (
+                        member.offset,
+                        member.data_type,
+                        member.array_size,
+                        member.element_size,
+                    )
                 };
 
                 offset += m_offset;
@@ -88,9 +93,9 @@ pub fn walk(
                     template = None;
                 } else if type_code & 0x8000 != 0 {
                     let tid = type_code & 0x0FFF;
-                    let nested = registry
-                        .get_template(tid)
-                        .ok_or_else(|| format!("member `{name}` references unknown template 0x{tid:X}"))?;
+                    let nested = registry.get_template(tid).ok_or_else(|| {
+                        format!("member `{name}` references unknown template 0x{tid:X}")
+                    })?;
                     element_size = nested.structure_size as usize;
                     tpl_arc = Some(nested);
                     template = Some(tid);
@@ -179,11 +184,41 @@ mod tests {
             structure_handle: 0x8100,
             structure_size: 12,
             members: vec![
-                ServerTemplateMember { name: "PRE".into(), data_type: 0x00C4, offset: 0, array_size: 0, element_size: 4 },
-                ServerTemplateMember { name: "ACC".into(), data_type: 0x00C4, offset: 4, array_size: 0, element_size: 4 },
-                ServerTemplateMember { name: "EN".into(),  data_type: 0x00C1, offset: 8, array_size: 0, element_size: 0 },
-                ServerTemplateMember { name: "TT".into(),  data_type: 0x00C1, offset: 8, array_size: 1, element_size: 0 },
-                ServerTemplateMember { name: "DN".into(),  data_type: 0x00C1, offset: 8, array_size: 2, element_size: 0 },
+                ServerTemplateMember {
+                    name: "PRE".into(),
+                    data_type: 0x00C4,
+                    offset: 0,
+                    array_size: 0,
+                    element_size: 4,
+                },
+                ServerTemplateMember {
+                    name: "ACC".into(),
+                    data_type: 0x00C4,
+                    offset: 4,
+                    array_size: 0,
+                    element_size: 4,
+                },
+                ServerTemplateMember {
+                    name: "EN".into(),
+                    data_type: 0x00C1,
+                    offset: 8,
+                    array_size: 0,
+                    element_size: 0,
+                },
+                ServerTemplateMember {
+                    name: "TT".into(),
+                    data_type: 0x00C1,
+                    offset: 8,
+                    array_size: 1,
+                    element_size: 0,
+                },
+                ServerTemplateMember {
+                    name: "DN".into(),
+                    data_type: 0x00C1,
+                    offset: 8,
+                    array_size: 2,
+                    element_size: 0,
+                },
             ],
         }
     }
@@ -192,7 +227,9 @@ mod tests {
     fn resolves_scalar_member() {
         let reg = TagRegistry::new();
         let tpl_id = reg.add_template(timer_template()).unwrap();
-        let inst = reg.add_struct_from_template("t1", &reg.get_template(tpl_id).unwrap()).unwrap();
+        let inst = reg
+            .add_struct_from_template("t1", &reg.get_template(tpl_id).unwrap())
+            .unwrap();
         let root = reg.get_by_instance(inst).unwrap();
 
         let segs = vec![PathSegment::Symbolic("ACC".into())];
@@ -206,7 +243,9 @@ mod tests {
     fn resolves_bool_member_bit_position() {
         let reg = TagRegistry::new();
         let tpl_id = reg.add_template(timer_template()).unwrap();
-        let inst = reg.add_struct_from_template("t1", &reg.get_template(tpl_id).unwrap()).unwrap();
+        let inst = reg
+            .add_struct_from_template("t1", &reg.get_template(tpl_id).unwrap())
+            .unwrap();
         let root = reg.get_by_instance(inst).unwrap();
 
         let segs = vec![PathSegment::Symbolic("DN".into())];
@@ -230,7 +269,11 @@ mod tests {
         let reg = TagRegistry::new();
         reg.add_multi_dim("m", CipType::Dint, &[5, 10, 4]).unwrap();
         let root = reg.get_by_name("m").unwrap();
-        let segs = vec![PathSegment::Element(1), PathSegment::Element(2), PathSegment::Element(3)];
+        let segs = vec![
+            PathSegment::Element(1),
+            PathSegment::Element(2),
+            PathSegment::Element(3),
+        ];
         let r = walk(&root, &segs, &reg).unwrap();
         // ((1*10+2)*4+3)*4 = 204
         assert_eq!(r.offset, 204);

@@ -15,7 +15,9 @@ async fn spawn_silent_target() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = listener.accept().await else { return };
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut first = true;
                 loop {
@@ -45,7 +47,6 @@ async fn spawn_silent_target() -> SocketAddr {
     addr
 }
 
-
 fn builder(addr: SocketAddr, t: Option<Duration>) -> ethernetip_logix::TagClientBuilder {
     TagClient::builder(addr.ip().to_string())
         .port(addr.port())
@@ -62,7 +63,11 @@ async fn read_times_out_against_silent_target() {
     let t = Instant::now();
     let r = c.read_tag("Tag1").await;
     assert!(matches!(r, Err(EipError::Timeout(_))), "got {:?}", r.err());
-    assert!(t.elapsed() < Duration::from_millis(1300), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(1300),
+        "took {:?}",
+        t.elapsed()
+    );
     // Session is dropped: the next call fails fast.
     let r = c.read_tag("Tag1").await;
     assert!(matches!(r, Err(EipError::Closed)), "got {:?}", r.err());
@@ -77,7 +82,11 @@ async fn connected_open_times_out_against_silent_target() {
         .connect()
         .await;
     assert!(matches!(r, Err(EipError::Timeout(_))), "got {:?}", r.err());
-    assert!(t.elapsed() < Duration::from_millis(1300), "took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(1300),
+        "took {:?}",
+        t.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -87,5 +96,8 @@ async fn default_is_five_seconds_and_none_disables() {
     // indirectly — a None client must still be waiting after the short bound.
     let mut c = builder(addr, None).connect().await.unwrap();
     let r = tokio::time::timeout(Duration::from_millis(600), c.read_tag("Tag1")).await;
-    assert!(r.is_err(), "request_timeout(None) must not time out by itself");
+    assert!(
+        r.is_err(),
+        "request_timeout(None) must not time out by itself"
+    );
 }

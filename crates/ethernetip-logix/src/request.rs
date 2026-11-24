@@ -114,7 +114,9 @@ pub fn build_multiple_service_packet(embedded: &[Vec<u8>]) -> Vec<u8> {
 ///   bytes    embedded reply 0
 ///   bytes    embedded reply 1
 ///   ...
-pub fn parse_multiple_service_packet(body: &[u8]) -> Result<Vec<Vec<u8>>, ethernetip_core::EipError> {
+pub fn parse_multiple_service_packet(
+    body: &[u8],
+) -> Result<Vec<Vec<u8>>, ethernetip_core::EipError> {
     if body.len() < 2 {
         return Err(ethernetip_core::EipError::Short {
             expected: 2,
@@ -137,7 +139,11 @@ pub fn parse_multiple_service_packet(body: &[u8]) -> Result<Vec<Vec<u8>>, ethern
     let mut replies = Vec::with_capacity(n);
     for i in 0..n {
         let start = offsets[i];
-        let end = if i + 1 < n { offsets[i + 1] } else { body.len() };
+        let end = if i + 1 < n {
+            offsets[i + 1]
+        } else {
+            body.len()
+        };
         if end < start || start > body.len() || end > body.len() {
             return Err(ethernetip_core::EipError::Protocol(format!(
                 "MSP reply {i}: bad offsets start={start} end={end} body_len={}",
@@ -174,7 +180,7 @@ mod tests {
         let msp = build_multiple_service_packet(&[inner.clone(), inner.clone(), inner.clone()]);
         let body = &msp[6..]; // skip outer MR header
         assert_eq!(&body[0..2], &3u16.to_le_bytes()); // count = 3
-        // First offset should be header_len = 2 + 3*2 = 8.
+                                                      // First offset should be header_len = 2 + 3*2 = 8.
         assert_eq!(&body[2..4], &8u16.to_le_bytes());
         assert_eq!(&body[4..6], &(8u16 + inner.len() as u16).to_le_bytes());
         assert_eq!(&body[6..8], &(8u16 + 2 * inner.len() as u16).to_le_bytes());

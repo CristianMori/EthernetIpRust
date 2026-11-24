@@ -187,22 +187,23 @@ impl TagRegistry {
     }
 
     /// Insert a multi-dimensional atomic array tag (up to 3 dims).
-    pub fn add_multi_dim(
-        &self,
-        name: impl Into<String>,
-        ty: CipType,
-        dims: &[u32],
-    ) -> Result<u32> {
+    pub fn add_multi_dim(&self, name: impl Into<String>, ty: CipType, dims: &[u32]) -> Result<u32> {
         if !(1..=3).contains(&dims.len()) {
-            return Err(EipError::Protocol(
-                "dims.len() must be 1, 2, or 3".into(),
-            ));
+            return Err(EipError::Protocol("dims.len() must be 1, 2, or 3".into()));
         }
         let (data_size, dims_vec) = self.compute_atomic_storage(ty, dims)?;
         let element_count: u32 = dims.iter().product();
         let sym_type = ty as u16 | ((dims.len() as u16 & 0x03) << 13);
         let data = vec![0u8; data_size];
-        self.insert_entry(name.into(), sym_type, ty, element_count, dims_vec, None, data)
+        self.insert_entry(
+            name.into(),
+            sym_type,
+            ty,
+            element_count,
+            dims_vec,
+            None,
+            data,
+        )
     }
 
     fn compute_atomic_storage(&self, ty: CipType, dims: &[u32]) -> Result<(usize, Vec<u32>)> {
@@ -332,10 +333,7 @@ impl TagRegistry {
     }
 
     pub fn get_by_instance(&self, instance: u32) -> Option<TagEntry> {
-        self.read_or_recover()
-            .by_instance
-            .get(&instance)
-            .cloned()
+        self.read_or_recover().by_instance.get(&instance).cloned()
     }
 
     /// Replace a tag's data buffer. Length must match the registered size.
@@ -459,13 +457,7 @@ impl TagRegistry {
     /// Atomic bit set/clear on a host byte inside a tag's buffer.  Used by
     /// the walker's BOOL bit write path so two concurrent writes to different
     /// bits of the same host byte don't stomp each other.
-    pub fn atomic_set_bit(
-        &self,
-        instance: u32,
-        offset: usize,
-        bit: u8,
-        value: bool,
-    ) -> Result<()> {
+    pub fn atomic_set_bit(&self, instance: u32, offset: usize, bit: u8, value: bool) -> Result<()> {
         let mut guard = self.write_or_recover();
         let entry = guard
             .by_instance
@@ -692,10 +684,9 @@ impl TagRegistry {
             .programs
             .get_mut(program)
             .ok_or_else(|| EipError::Protocol(format!("program `{program}` not registered")))?;
-        let entry = program_entry
-            .tags
-            .get_mut(name)
-            .ok_or_else(|| EipError::Protocol(format!("no such tag `{name}` in program `{program}`")))?;
+        let entry = program_entry.tags.get_mut(name).ok_or_else(|| {
+            EipError::Protocol(format!("no such tag `{name}` in program `{program}`"))
+        })?;
         if offset + bytes.len() > entry.data.len() {
             return Err(EipError::Protocol("write past end of tag".into()));
         }

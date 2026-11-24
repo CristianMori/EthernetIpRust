@@ -20,8 +20,10 @@ const CFG: u16 = 151;
 fn registry() -> AssemblyRegistry {
     let a = AssemblyRegistry::new();
     a.insert(Assembly::new(IN, AssemblyKind::Input, 8)).unwrap();
-    a.insert(Assembly::new(OUT, AssemblyKind::Output, 8)).unwrap();
-    a.insert(Assembly::new(CFG, AssemblyKind::Config, 0)).unwrap();
+    a.insert(Assembly::new(OUT, AssemblyKind::Output, 8))
+        .unwrap();
+    a.insert(Assembly::new(CFG, AssemblyKind::Config, 0))
+        .unwrap();
     a
 }
 
@@ -82,7 +84,11 @@ async fn close_returns_within_timeout_against_silent_target() {
         .await
         .expect("close() hung on a silent target")
         .expect("close");
-    assert!(t.elapsed() < Duration::from_secs(2), "close took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "close took {:?}",
+        t.elapsed()
+    );
 
     adapter.shutdown().await;
 }

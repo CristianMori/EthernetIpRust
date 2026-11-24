@@ -12,10 +12,8 @@ pub const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// is left and reap it. Sessions are expected to observe the shutdown signal
 /// themselves; the abort is only the backstop for a task stuck in a write.
 pub async fn drain_join_set(set: &mut JoinSet<()>, grace: Duration) {
-    let graceful = tokio::time::timeout(grace, async {
-        while set.join_next().await.is_some() {}
-    })
-    .await;
+    let graceful =
+        tokio::time::timeout(grace, async { while set.join_next().await.is_some() {} }).await;
     if graceful.is_err() {
         tracing::warn!("{} session task(s) ignored shutdown, aborting", set.len());
         set.abort_all();

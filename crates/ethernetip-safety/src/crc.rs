@@ -251,10 +251,7 @@ mod tests {
 
     #[test]
     fn s5_xor_out_is_raw_complemented() {
-        assert_eq!(
-            compute_s5_raw(CHECK, 0) ^ 0x00FF_FFFF,
-            compute_s5(CHECK, 0)
-        );
+        assert_eq!(compute_s5_raw(CHECK, 0) ^ 0x00FF_FFFF, compute_s5(CHECK, 0));
     }
 
     #[test]

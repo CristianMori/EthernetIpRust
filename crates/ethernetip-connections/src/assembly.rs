@@ -162,14 +162,18 @@ mod tests {
     #[test]
     fn duplicate_instance_rejected() {
         let reg = AssemblyRegistry::new();
-        reg.insert(Assembly::new(100, AssemblyKind::Input, 4)).unwrap();
-        assert!(reg.insert(Assembly::new(100, AssemblyKind::Output, 8)).is_err());
+        reg.insert(Assembly::new(100, AssemblyKind::Input, 4))
+            .unwrap();
+        assert!(reg
+            .insert(Assembly::new(100, AssemblyKind::Output, 8))
+            .is_err());
     }
 
     #[test]
     fn update_and_read_roundtrip() {
         let reg = AssemblyRegistry::new();
-        reg.insert(Assembly::new(150, AssemblyKind::Output, 4)).unwrap();
+        reg.insert(Assembly::new(150, AssemblyKind::Output, 4))
+            .unwrap();
         reg.update(150, &[1, 2, 3, 4]).unwrap();
         assert_eq!(reg.read(150).unwrap(), vec![1, 2, 3, 4]);
     }
@@ -177,7 +181,8 @@ mod tests {
     #[test]
     fn update_wrong_size_rejected() {
         let reg = AssemblyRegistry::new();
-        reg.insert(Assembly::new(150, AssemblyKind::Output, 4)).unwrap();
+        reg.insert(Assembly::new(150, AssemblyKind::Output, 4))
+            .unwrap();
         assert!(reg.update(150, &[1, 2]).is_err());
     }
 }

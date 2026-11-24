@@ -237,7 +237,8 @@ pub fn build_safety_forward_open(
     let nsd_size = if is_extended { 50 } else { 48 };
     let nsd = &conn_path[safety_off_in_conn_path..safety_off_in_conn_path + nsd_size];
     let effective_path_size_words = ((app_path_slice.len() + safety_seg.len()) / 2) as u8;
-    let cpcrc_value = cpcrc::compute_from_raw(&fwd, app_path_slice, nsd, effective_path_size_words)?;
+    let cpcrc_value =
+        cpcrc::compute_from_raw(&fwd, app_path_slice, nsd, effective_path_size_words)?;
 
     // CPCRC offset from the 0x50 segment byte: 48 (Base) or 50 (Extended).
     let cpcrc_abs = 36 + safety_off_in_conn_path + nsd_size;
@@ -272,8 +273,7 @@ impl SafetyAppReply {
         }
         r.consumer_number = u16::from_le_bytes([bytes[0], bytes[1]]);
         r.target_vendor_id = u16::from_le_bytes([bytes[2], bytes[3]]);
-        r.target_device_serial =
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        r.target_device_serial = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         r.target_connection_serial = u16::from_le_bytes([bytes[8], bytes[9]]);
         if bytes.len() >= 14 {
             r.initial_timestamp = u16::from_le_bytes([bytes[10], bytes[11]]);
@@ -311,8 +311,8 @@ mod tests {
 
     #[test]
     fn base_fo_builds_and_patches_cpcrc() {
-        let wire = build_safety_forward_open(&cfg(), 0x0001, 0x0001, 0x1234_5678, 0xA0, &[], &[])
-            .unwrap();
+        let wire =
+            build_safety_forward_open(&cfg(), 0x0001, 0x0001, 0x1234_5678, 0xA0, &[], &[]).unwrap();
         assert_eq!(wire.cm_path, CM_PATH);
         // Segment starts after the 36-byte FO prefix + shortcut path (8 bytes) — no route.
         let seg_start = 36 + 8;
@@ -343,7 +343,11 @@ mod tests {
         c.format = SafetyFormat::Extended;
         let wire = build_safety_forward_open(&c, 1, 1, 1, 0xA0, &[], &[]).unwrap();
         let seg_start = 36 + 8;
-        assert_eq!(wire.service_data[seg_start + 2], 0x02, "extended format byte");
+        assert_eq!(
+            wire.service_data[seg_start + 2],
+            0x02,
+            "extended format byte"
+        );
         // Extended CPCRC is at segment offset 50.
         let cpcrc_bytes = &wire.service_data[seg_start + 50..seg_start + 54];
         assert_ne!(u32::from_le_bytes(cpcrc_bytes.try_into().unwrap()), 0);

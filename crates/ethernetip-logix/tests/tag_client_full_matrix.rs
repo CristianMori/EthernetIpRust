@@ -36,13 +36,15 @@ fn build_registry() -> TagRegistry {
 
     // --- Atomics ---------------------------------------------------------
     reg.add_atomic("TestDint", CipType::Dint).unwrap();
-    reg.set_by_name("TestDint", &(-1_000_000i32).to_le_bytes()).unwrap();
+    reg.set_by_name("TestDint", &(-1_000_000i32).to_le_bytes())
+        .unwrap();
 
     reg.add_atomic("TestReal", CipType::Real).unwrap();
     reg.set_by_name("TestReal", &3.14f32.to_le_bytes()).unwrap();
 
     reg.add_atomic("TestUdint", CipType::Udint).unwrap();
-    reg.set_by_name("TestUdint", &0xDEAD_BEEFu32.to_le_bytes()).unwrap();
+    reg.set_by_name("TestUdint", &0xDEAD_BEEFu32.to_le_bytes())
+        .unwrap();
 
     reg.add_atomic("TestLint", CipType::Lint).unwrap();
     reg.set_by_name("TestLint", &(-1i64).to_le_bytes()).unwrap();
@@ -141,7 +143,8 @@ fn build_registry() -> TagRegistry {
     let motor_id = reg.add_template(motor_tpl).unwrap();
     let motor_tpl_ref = reg.get_template(motor_id).unwrap();
 
-    reg.add_struct_from_template("MotorA", &motor_tpl_ref).unwrap();
+    reg.add_struct_from_template("MotorA", &motor_tpl_ref)
+        .unwrap();
     let mut mbuf = vec![0u8; 12];
     mbuf[..4].copy_from_slice(&3.14f32.to_le_bytes());
     mbuf[4] = 1; // Fault bit
@@ -276,9 +279,7 @@ fn build_registry() -> TagRegistry {
     reg
 }
 
-async fn spawn(
-    reg: TagRegistry,
-) -> (ethernetip_logix::tag_server::TagServerHandle, SocketAddr) {
+async fn spawn(reg: TagRegistry) -> (ethernetip_logix::tag_server::TagServerHandle, SocketAddr) {
     let cfg = TagServerConfig::new(reg).tcp_bind("127.0.0.1:0".parse().unwrap());
     let handle = start_server(cfg).await.expect("server start");
     let addr = handle.tcp_addr;
@@ -294,7 +295,12 @@ async fn connect(addr: SocketAddr) -> TagClient {
 }
 
 /// Pull the DINT value out of a TagValue, or push a mismatch into `failures`.
-fn expect_dint(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: i32, failures: &mut Vec<String>) {
+fn expect_dint(
+    label: &str,
+    got: Result<TagValue, impl std::fmt::Debug>,
+    want: i32,
+    failures: &mut Vec<String>,
+) {
     match got {
         Ok(TagValue::Dint(v)) if v == want => {}
         Ok(other) => failures.push(format!("{label}: expected Dint({want}), got {other:?}")),
@@ -302,15 +308,27 @@ fn expect_dint(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: i
     }
 }
 
-fn expect_udint(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: u32, failures: &mut Vec<String>) {
+fn expect_udint(
+    label: &str,
+    got: Result<TagValue, impl std::fmt::Debug>,
+    want: u32,
+    failures: &mut Vec<String>,
+) {
     match got {
         Ok(TagValue::Udint(v)) if v == want => {}
-        Ok(other) => failures.push(format!("{label}: expected Udint(0x{want:08X}), got {other:?}")),
+        Ok(other) => failures.push(format!(
+            "{label}: expected Udint(0x{want:08X}), got {other:?}"
+        )),
         Err(e) => failures.push(format!("{label}: {e:?}")),
     }
 }
 
-fn expect_lint(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: i64, failures: &mut Vec<String>) {
+fn expect_lint(
+    label: &str,
+    got: Result<TagValue, impl std::fmt::Debug>,
+    want: i64,
+    failures: &mut Vec<String>,
+) {
     match got {
         Ok(TagValue::Lint(v)) if v == want => {}
         Ok(other) => failures.push(format!("{label}: expected Lint({want}), got {other:?}")),
@@ -318,10 +336,18 @@ fn expect_lint(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: i
     }
 }
 
-fn expect_real(label: &str, got: Result<TagValue, impl std::fmt::Debug>, want: f32, tol: f32, failures: &mut Vec<String>) {
+fn expect_real(
+    label: &str,
+    got: Result<TagValue, impl std::fmt::Debug>,
+    want: f32,
+    tol: f32,
+    failures: &mut Vec<String>,
+) {
     match got {
         Ok(TagValue::Real(v)) if (v - want).abs() < tol => {}
-        Ok(other) => failures.push(format!("{label}: expected Real({want}±{tol}), got {other:?}")),
+        Ok(other) => failures.push(format!(
+            "{label}: expected Real({want}±{tol}), got {other:?}"
+        )),
         Err(e) => failures.push(format!("{label}: {e:?}")),
     }
 }
@@ -340,55 +366,120 @@ async fn tag_client_full_matrix_round_trip() {
     let mut failures: Vec<String> = Vec::new();
 
     // --- Atomics ---------------------------------------------------------
-    expect_dint("TestDint initial", c.read_tag("TestDint").await, -1_000_000, &mut failures);
-    expect_ok(
-        "TestDint write",
-        c.write_tag("TestDint", &TagValue::Dint(2_000_000_000)).await,
+    expect_dint(
+        "TestDint initial",
+        c.read_tag("TestDint").await,
+        -1_000_000,
         &mut failures,
     );
-    expect_dint("TestDint after write", c.read_tag("TestDint").await, 2_000_000_000, &mut failures);
+    expect_ok(
+        "TestDint write",
+        c.write_tag("TestDint", &TagValue::Dint(2_000_000_000))
+            .await,
+        &mut failures,
+    );
+    expect_dint(
+        "TestDint after write",
+        c.read_tag("TestDint").await,
+        2_000_000_000,
+        &mut failures,
+    );
 
-    expect_real("TestReal initial", c.read_tag("TestReal").await, 3.14, 1e-5, &mut failures);
+    expect_real(
+        "TestReal initial",
+        c.read_tag("TestReal").await,
+        3.14,
+        1e-5,
+        &mut failures,
+    );
     expect_ok(
         "TestReal write",
         c.write_tag("TestReal", &TagValue::Real(-2.71828)).await,
         &mut failures,
     );
-    expect_real("TestReal after write", c.read_tag("TestReal").await, -2.71828, 1e-4, &mut failures);
+    expect_real(
+        "TestReal after write",
+        c.read_tag("TestReal").await,
+        -2.71828,
+        1e-4,
+        &mut failures,
+    );
 
-    expect_udint("TestUdint initial", c.read_tag("TestUdint").await, 0xDEAD_BEEF, &mut failures);
+    expect_udint(
+        "TestUdint initial",
+        c.read_tag("TestUdint").await,
+        0xDEAD_BEEF,
+        &mut failures,
+    );
     expect_ok(
         "TestUdint write",
-        c.write_tag("TestUdint", &TagValue::Udint(0xFFFF_FFFF)).await,
+        c.write_tag("TestUdint", &TagValue::Udint(0xFFFF_FFFF))
+            .await,
         &mut failures,
     );
-    expect_udint("TestUdint after write", c.read_tag("TestUdint").await, 0xFFFF_FFFF, &mut failures);
+    expect_udint(
+        "TestUdint after write",
+        c.read_tag("TestUdint").await,
+        0xFFFF_FFFF,
+        &mut failures,
+    );
 
-    expect_lint("TestLint initial", c.read_tag("TestLint").await, -1, &mut failures);
+    expect_lint(
+        "TestLint initial",
+        c.read_tag("TestLint").await,
+        -1,
+        &mut failures,
+    );
     expect_ok(
         "TestLint write",
-        c.write_tag("TestLint", &TagValue::Lint(0x7FFF_FFFF_FFFF_FFFF)).await,
+        c.write_tag("TestLint", &TagValue::Lint(0x7FFF_FFFF_FFFF_FFFF))
+            .await,
         &mut failures,
     );
-    expect_lint("TestLint after write", c.read_tag("TestLint").await, 0x7FFF_FFFF_FFFF_FFFF, &mut failures);
+    expect_lint(
+        "TestLint after write",
+        c.read_tag("TestLint").await,
+        0x7FFF_FFFF_FFFF_FFFF,
+        &mut failures,
+    );
 
     // --- 1-D array indexed ----------------------------------------------
-    expect_dint("DintArr[5] initial", c.read_tag("DintArr[5]").await, 105, &mut failures);
+    expect_dint(
+        "DintArr[5] initial",
+        c.read_tag("DintArr[5]").await,
+        105,
+        &mut failures,
+    );
     expect_ok(
         "DintArr[5] write",
         c.write_tag("DintArr[5]", &TagValue::Dint(999)).await,
         &mut failures,
     );
-    expect_dint("DintArr[5] after write", c.read_tag("DintArr[5]").await, 999, &mut failures);
+    expect_dint(
+        "DintArr[5] after write",
+        c.read_tag("DintArr[5]").await,
+        999,
+        &mut failures,
+    );
 
     // --- Multi-dim array -------------------------------------------------
-    expect_dint("Matrix[1,2]", c.read_tag("Matrix[1,2]").await, 12, &mut failures);
+    expect_dint(
+        "Matrix[1,2]",
+        c.read_tag("Matrix[1,2]").await,
+        12,
+        &mut failures,
+    );
     expect_ok(
         "Matrix[0,1] write",
         c.write_tag("Matrix[0,1]", &TagValue::Dint(777)).await,
         &mut failures,
     );
-    expect_dint("Matrix[0,1] after write", c.read_tag("Matrix[0,1]").await, 777, &mut failures);
+    expect_dint(
+        "Matrix[0,1] after write",
+        c.read_tag("Matrix[0,1]").await,
+        777,
+        &mut failures,
+    );
 
     // --- Logix STRING UDT ------------------------------------------------
     // Read: whole struct comes back as TagValue::Struct { crc, bytes }
@@ -430,7 +521,11 @@ async fn tag_client_full_matrix_round_trip() {
         body.extend_from_slice(&STRING_STRUCT_HANDLE.to_le_bytes());
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&payload);
-        expect_ok("Greeting write", c.write_tag_raw("Greeting", &body).await, &mut failures);
+        expect_ok(
+            "Greeting write",
+            c.write_tag_raw("Greeting", &body).await,
+            &mut failures,
+        );
     }
     match c.read_tag("Greeting").await {
         Ok(TagValue::Struct { bytes, .. }) if bytes.len() >= 4 => {
@@ -463,19 +558,37 @@ async fn tag_client_full_matrix_round_trip() {
     }
 
     // --- UDT member access via the generic read path --------------------
-    expect_real("MotorA.Speed initial", c.read_tag("MotorA.Speed").await, 3.14, 1e-5, &mut failures);
-    expect_dint("MotorA.RunCount", c.read_tag("MotorA.RunCount").await, 42, &mut failures);
+    expect_real(
+        "MotorA.Speed initial",
+        c.read_tag("MotorA.Speed").await,
+        3.14,
+        1e-5,
+        &mut failures,
+    );
+    expect_dint(
+        "MotorA.RunCount",
+        c.read_tag("MotorA.RunCount").await,
+        42,
+        &mut failures,
+    );
     expect_ok(
         "MotorA.Speed write",
         c.write_tag("MotorA.Speed", &TagValue::Real(-1.5)).await,
         &mut failures,
     );
-    expect_real("MotorA.Speed after write", c.read_tag("MotorA.Speed").await, -1.5, 1e-4, &mut failures);
+    expect_real(
+        "MotorA.Speed after write",
+        c.read_tag("MotorA.Speed").await,
+        -1.5,
+        1e-4,
+        &mut failures,
+    );
 
     // Array-of-UDT member access
     expect_ok(
         "MotorArr[1].Speed write",
-        c.write_tag("MotorArr[1].Speed", &TagValue::Real(7.77)).await,
+        c.write_tag("MotorArr[1].Speed", &TagValue::Real(7.77))
+            .await,
         &mut failures,
     );
     expect_real(
@@ -487,23 +600,55 @@ async fn tag_client_full_matrix_round_trip() {
     );
 
     // --- Timer / AOI members --------------------------------------------
-    expect_dint("MyTimer.PRE initial", c.read_tag("MyTimer.PRE").await, 1000, &mut failures);
-    expect_dint("MyTimer.ACC initial", c.read_tag("MyTimer.ACC").await, 250, &mut failures);
+    expect_dint(
+        "MyTimer.PRE initial",
+        c.read_tag("MyTimer.PRE").await,
+        1000,
+        &mut failures,
+    );
+    expect_dint(
+        "MyTimer.ACC initial",
+        c.read_tag("MyTimer.ACC").await,
+        250,
+        &mut failures,
+    );
     expect_ok(
         "MyTimer.PRE write",
         c.write_tag("MyTimer.PRE", &TagValue::Dint(2000)).await,
         &mut failures,
     );
-    expect_dint("MyTimer.PRE after write", c.read_tag("MyTimer.PRE").await, 2000, &mut failures);
+    expect_dint(
+        "MyTimer.PRE after write",
+        c.read_tag("MyTimer.PRE").await,
+        2000,
+        &mut failures,
+    );
 
-    expect_real("MyAOI.Setpoint initial", c.read_tag("MyAOI.Setpoint").await, 42.5, 1e-5, &mut failures);
+    expect_real(
+        "MyAOI.Setpoint initial",
+        c.read_tag("MyAOI.Setpoint").await,
+        42.5,
+        1e-5,
+        &mut failures,
+    );
     expect_ok(
         "MyAOI.Setpoint write",
         c.write_tag("MyAOI.Setpoint", &TagValue::Real(99.9)).await,
         &mut failures,
     );
-    expect_real("MyAOI.Setpoint after write", c.read_tag("MyAOI.Setpoint").await, 99.9, 1e-4, &mut failures);
-    expect_dint("MyAOI.Steps", c.read_tag("MyAOI.Steps").await, 7, &mut failures);
+    expect_real(
+        "MyAOI.Setpoint after write",
+        c.read_tag("MyAOI.Setpoint").await,
+        99.9,
+        1e-4,
+        &mut failures,
+    );
+    expect_dint(
+        "MyAOI.Steps",
+        c.read_tag("MyAOI.Steps").await,
+        7,
+        &mut failures,
+    );
 
     // --- Program-scoped tags --------------------------------------------
     expect_dint(
@@ -514,7 +659,8 @@ async fn tag_client_full_matrix_round_trip() {
     );
     expect_ok(
         "Program:MainProgram.LocalDint write",
-        c.write_tag("Program:MainProgram.LocalDint", &TagValue::Dint(100)).await,
+        c.write_tag("Program:MainProgram.LocalDint", &TagValue::Dint(100))
+            .await,
         &mut failures,
     );
     expect_dint(

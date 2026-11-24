@@ -346,12 +346,8 @@ pub fn parse_template_definition(
         let off = i * 8;
         let info = u16::from_le_bytes([body[off], body[off + 1]]);
         let sym = u16::from_le_bytes([body[off + 2], body[off + 3]]);
-        let member_offset = u32::from_le_bytes([
-            body[off + 4],
-            body[off + 5],
-            body[off + 6],
-            body[off + 7],
-        ]);
+        let member_offset =
+            u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
         members.push(TemplateMember {
             name: String::new(),
             sym_type: SymType(sym),
@@ -397,11 +393,7 @@ fn read_cstring(body: &[u8], cursor: &mut usize) -> Result<String> {
 /// `resolve` is called for each nested struct member — return
 /// `Some(child_template)` to recurse, or `None` to leave it as a `Raw`
 /// blob (useful when the caller hasn't fetched the child template yet).
-pub fn decode_struct<F>(
-    def: &TemplateDefinition,
-    bytes: &[u8],
-    resolve: &F,
-) -> Result<TypedValue>
+pub fn decode_struct<F>(def: &TemplateDefinition, bytes: &[u8], resolve: &F) -> Result<TypedValue>
 where
     F: Fn(u16) -> Option<TemplateDefinition>,
 {
@@ -423,11 +415,7 @@ where
     })
 }
 
-fn decode_member<F>(
-    m: &TemplateMember,
-    bytes: &[u8],
-    resolve: &F,
-) -> Result<TypedValue>
+fn decode_member<F>(m: &TemplateMember, bytes: &[u8], resolve: &F) -> Result<TypedValue>
 where
     F: Fn(u16) -> Option<TemplateDefinition>,
 {
@@ -483,33 +471,29 @@ where
                 CipType::Int => TypedValue::Int(i16::from_le_bytes([slice[0], slice[1]])),
                 CipType::Uint => TypedValue::Uint(u16::from_le_bytes([slice[0], slice[1]])),
                 CipType::Word => TypedValue::Word(u16::from_le_bytes([slice[0], slice[1]])),
-                CipType::Dint => TypedValue::Dint(i32::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3],
-                ])),
-                CipType::Udint => TypedValue::Udint(u32::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3],
-                ])),
-                CipType::Dword => TypedValue::Dword(u32::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3],
-                ])),
-                CipType::Real => TypedValue::Real(f32::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3],
-                ])),
+                CipType::Dint => {
+                    TypedValue::Dint(i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+                }
+                CipType::Udint => {
+                    TypedValue::Udint(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+                }
+                CipType::Dword => {
+                    TypedValue::Dword(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+                }
+                CipType::Real => {
+                    TypedValue::Real(f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+                }
                 CipType::Lint => TypedValue::Lint(i64::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
-                    slice[7],
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
                 ])),
                 CipType::Ulint => TypedValue::Ulint(u64::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
-                    slice[7],
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
                 ])),
                 CipType::Lword => TypedValue::Lword(u64::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
-                    slice[7],
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
                 ])),
                 CipType::Lreal => TypedValue::Lreal(f64::from_le_bytes([
-                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6],
-                    slice[7],
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
                 ])),
                 CipType::ShortString => {
                     // SHORT_STRING member inside a template: decoded as the raw
@@ -783,7 +767,12 @@ mod tests {
         .unwrap();
         if let TypedValue::Struct { fields, .. } = value {
             assert_eq!(fields["N"], TypedValue::Int(1234));
-            if let TypedValue::Struct { fields: inner, name, .. } = &fields["Sub"] {
+            if let TypedValue::Struct {
+                fields: inner,
+                name,
+                ..
+            } = &fields["Sub"]
+            {
                 assert_eq!(name, "Inner");
                 assert_eq!(inner["X"], TypedValue::Sint(9));
                 assert_eq!(inner["Y"], TypedValue::Sint(-3));

@@ -26,7 +26,8 @@ const CONFIG_SIZE: usize = 10;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "echo_adapter=info,ethernetip_connections=info".into()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "echo_adapter=info,ethernetip_connections=info".into()),
         )
         .init();
 
@@ -59,9 +60,21 @@ async fn main() -> Result<()> {
     }
 
     let assemblies = AssemblyRegistry::new();
-    assemblies.insert(Assembly::new(INPUT_INSTANCE, AssemblyKind::Input, INPUT_SIZE))?;
-    assemblies.insert(Assembly::new(OUTPUT_INSTANCE, AssemblyKind::Output, OUTPUT_SIZE))?;
-    assemblies.insert(Assembly::new(CONFIG_INSTANCE, AssemblyKind::Config, CONFIG_SIZE))?;
+    assemblies.insert(Assembly::new(
+        INPUT_INSTANCE,
+        AssemblyKind::Input,
+        INPUT_SIZE,
+    ))?;
+    assemblies.insert(Assembly::new(
+        OUTPUT_INSTANCE,
+        AssemblyKind::Output,
+        OUTPUT_SIZE,
+    ))?;
+    assemblies.insert(Assembly::new(
+        CONFIG_INSTANCE,
+        AssemblyKind::Config,
+        CONFIG_SIZE,
+    ))?;
 
     // Seed the T→O assembly with a 1..=125 DINT ramp so scanners see a
     // recognizable pattern on the very first cyclic frame.

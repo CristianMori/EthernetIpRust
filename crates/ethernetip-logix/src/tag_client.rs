@@ -20,9 +20,7 @@ use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::{parse_route_path, EpathWriter};
 use ethernetip_core::{EipSession, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, EIP_PORT};
 
-use crate::browse::{
-    build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo,
-};
+use crate::browse::{build_symbol_list_request, parse_symbol_chunk, TagCategory, TagInfo};
 use crate::request::{
     build_mr_request, build_multiple_service_packet, parse_multiple_service_packet,
     wrap_unconnected_send,
@@ -131,9 +129,8 @@ impl TagClientBuilder {
     /// Open the TCP session, register, and (optionally) open Class 3.
     pub async fn connect(self) -> Result<TagClient> {
         let route = match &self.route_path {
-            Some(spec) => parse_route_path(spec).ok_or_else(|| {
-                EipError::Protocol(format!("invalid routing path `{}`", spec))
-            })?,
+            Some(spec) => parse_route_path(spec)
+                .ok_or_else(|| EipError::Protocol(format!("invalid routing path `{}`", spec)))?,
             None => Vec::new(),
         };
         let addr = format!("{}:{}", self.host, self.port);
@@ -366,10 +363,7 @@ impl TagClient {
     /// Each entry is `(name, value_body)` where `value_body` is the raw
     /// `type + count + data` slice a normal `write_tag_raw` would send.
     /// Returns one `Result<()>` per entry in order.
-    pub async fn write_tags_batch(
-        &mut self,
-        writes: &[(&str, &[u8])],
-    ) -> Result<Vec<Result<()>>> {
+    pub async fn write_tags_batch(&mut self, writes: &[(&str, &[u8])]) -> Result<Vec<Result<()>>> {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -745,7 +739,10 @@ impl TagClient {
             Item::null_address(),
             Item::new(item_type::UNCONNECTED_DATA, payload),
         ];
-        let envelope = self.session.send_rr_data(&items, REQUEST_TIMEOUT_SECS).await?;
+        let envelope = self
+            .session
+            .send_rr_data(&items, REQUEST_TIMEOUT_SECS)
+            .await?;
         let data = envelope
             .find(item_type::UNCONNECTED_DATA)
             .ok_or_else(|| EipError::Protocol("reply missing UnconnectedData item".into()))?;

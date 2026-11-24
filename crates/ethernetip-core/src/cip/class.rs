@@ -83,7 +83,8 @@ impl CipClass {
     /// (current max instance) so `Get_Attribute_Single` on instance 0 stays
     /// consistent.
     pub fn create_instance(&mut self, instance_id: u32) -> &mut CipInstance {
-        self.instances.insert(instance_id, CipInstance::new(instance_id));
+        self.instances
+            .insert(instance_id, CipInstance::new(instance_id));
         self.update_max_instance(instance_id);
         self.instances.get_mut(&instance_id).unwrap()
     }
@@ -180,7 +181,11 @@ impl CipClass {
 
     /// Look up a service, class-level or instance-level based on whether the
     /// request path targets instance 0.
-    pub fn get_service(&self, service_code: u8, is_class_level: bool) -> Option<&CipServiceDefinition> {
+    pub fn get_service(
+        &self,
+        service_code: u8,
+        is_class_level: bool,
+    ) -> Option<&CipServiceDefinition> {
         if is_class_level {
             self.class_services.get(&service_code)
         } else {

@@ -310,10 +310,8 @@ mod tests {
         dispatcher.register_class(val.into_cip_class());
 
         // First instance goes to id 1.
-        let id = val.create_instance_via_dispatcher(
-            &dispatcher,
-            SafetyValidatorInstanceState::default(),
-        );
+        let id = val
+            .create_instance_via_dispatcher(&dispatcher, SafetyValidatorInstanceState::default());
         assert_eq!(id, Some(1));
 
         // Get_Attribute_Single(class=0x3A, instance=1, attr=2) → 0 (type).
@@ -343,7 +341,10 @@ mod tests {
         assert_eq!(val.alloc_instance_id(), None);
         assert_eq!(val.alloc_instance_id(), None);
         // Counter is still parked at the cap.
-        assert_eq!(*lock_recover(&val.next_instance_id), MAX_SAFETY_VALIDATOR_ID);
+        assert_eq!(
+            *lock_recover(&val.next_instance_id),
+            MAX_SAFETY_VALIDATOR_ID
+        );
     }
 
     #[test]
@@ -359,10 +360,8 @@ mod tests {
             *g = MAX_SAFETY_VALIDATOR_ID;
         }
         dispatcher.register_class(val.into_cip_class());
-        let id = val.create_instance_via_dispatcher(
-            &dispatcher,
-            SafetyValidatorInstanceState::default(),
-        );
+        let id = val
+            .create_instance_via_dispatcher(&dispatcher, SafetyValidatorInstanceState::default());
         assert_eq!(id, None);
     }
 
@@ -372,8 +371,10 @@ mod tests {
         let dispatcher = Arc::new(CipDispatcher::new());
         dispatcher.register_class(val.into_cip_class());
         for expected in 1..=5 {
-            let id = val
-                .create_instance_via_dispatcher(&dispatcher, SafetyValidatorInstanceState::default());
+            let id = val.create_instance_via_dispatcher(
+                &dispatcher,
+                SafetyValidatorInstanceState::default(),
+            );
             assert_eq!(id, Some(expected));
         }
     }

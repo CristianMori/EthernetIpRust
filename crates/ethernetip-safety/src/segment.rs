@@ -122,9 +122,11 @@ impl SafetyNetworkSegment {
         off += 4;
         dst[off..off + 2].copy_from_slice(&self.time_correction_params.to_le_bytes());
         off += 2;
-        self.tunid.copy_to(&mut dst[off..off + UniqueNetworkId::SIZE]);
+        self.tunid
+            .copy_to(&mut dst[off..off + UniqueNetworkId::SIZE]);
         off += UniqueNetworkId::SIZE;
-        self.ounid.copy_to(&mut dst[off..off + UniqueNetworkId::SIZE]);
+        self.ounid
+            .copy_to(&mut dst[off..off + UniqueNetworkId::SIZE]);
         off += UniqueNetworkId::SIZE;
         dst[off..off + 2].copy_from_slice(&self.ping_interval_multiplier.to_le_bytes());
         off += 2;
@@ -257,7 +259,8 @@ impl SafetyNetworkSegment {
         if format == 0x02 {
             seg.initial_time_stamp = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             off += 2;
-            seg.initial_rollover_value = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+            seg.initial_rollover_value =
+                u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             off += 2;
         }
         let _ = off; // suppress unused_assignments after last field

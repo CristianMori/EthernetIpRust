@@ -48,10 +48,7 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             "--path" => {
-                path = Some(
-                    args.next()
-                        .context("--path needs a value like `1,0`")?,
-                );
+                path = Some(args.next().context("--path needs a value like `1,0`")?);
             }
             "--no-path" => path = None,
             "--tag" => {
@@ -103,10 +100,7 @@ async fn run() -> Result<()> {
             Err(e) => println!("read failed: {e}"),
         }
     } else if let Some(first_dint) = tags.iter().find(|t| t.sym_type & 0xFF == 0xC4) {
-        println!(
-            "\n--- auto-read first DINT tag: {} ---",
-            first_dint.name
-        );
+        println!("\n--- auto-read first DINT tag: {} ---", first_dint.name);
         match client.read_tag(&first_dint.name).await {
             Ok(v) => print_value(&first_dint.name, &v),
             Err(e) => println!("read failed: {e}"),
@@ -137,10 +131,7 @@ fn print_value(name: &str, v: &TagValue) {
         TagValue::Lword(x) => println!("  {name} = 0x{x:016X} (LWORD)"),
         TagValue::ShortString(s) => println!("  {name} = {s:?} (SHORT_STRING)"),
         TagValue::Struct { crc, bytes } => {
-            println!(
-                "  {name} = struct(crc=0x{crc:04X}, {} bytes)",
-                bytes.len()
-            );
+            println!("  {name} = struct(crc=0x{crc:04X}, {} bytes)", bytes.len());
         }
     }
 }

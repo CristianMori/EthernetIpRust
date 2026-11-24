@@ -83,12 +83,7 @@ pub struct CipAttribute {
 
 impl CipAttribute {
     /// Create an owned attribute wrapping the given raw bytes.
-    pub fn new(
-        id: u16,
-        data_type: CipDataType,
-        access: AttributeAccess,
-        initial: Vec<u8>,
-    ) -> Self {
+    pub fn new(id: u16, data_type: CipDataType, access: AttributeAccess, initial: Vec<u8>) -> Self {
         Self {
             id,
             data_type,

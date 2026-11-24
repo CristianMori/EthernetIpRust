@@ -82,9 +82,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use ethernetip_core::cip::{
-    class_codes, standard_services::GET_ATTRIBUTE_SINGLE, status, AttributeAccess,
-    CipAttribute, CipClass, CipDataType, CipInstance, CipServiceDefinition,
-    CipServiceRequest, CipServiceResponse,
+    class_codes, standard_services::GET_ATTRIBUTE_SINGLE, status, AttributeAccess, CipAttribute,
+    CipClass, CipDataType, CipInstance, CipServiceDefinition, CipServiceRequest,
+    CipServiceResponse,
 };
 use ethernetip_core::error::{EipError, Result};
 
@@ -286,9 +286,8 @@ pub struct ForwardCloseContext {
 /// per accepted Forward_Open with the freshly-allocated connection metadata
 /// and a shutdown watch receiver; returns the JoinHandle so
 /// process_forward_open can pack it into the ConnectionRow.
-pub type ProducerSpawner = Arc<
-    dyn Fn(ProducerSpawnArgs, watch::Receiver<bool>) -> JoinHandle<()> + Send + Sync,
->;
+pub type ProducerSpawner =
+    Arc<dyn Fn(ProducerSpawnArgs, watch::Receiver<bool>) -> JoinHandle<()> + Send + Sync>;
 
 /// Arguments passed to the producer-spawner callback: everything the T→O
 /// task needs to start streaming this connection's data at the negotiated
@@ -316,9 +315,7 @@ pub struct ProducerSpawnArgs {
 /// the CM treats safety-segmented FOs as unknown paths and rejects them
 /// with `RESOURCE_UNAVAILABLE` — matching what the C# CM does when no
 /// SafetyHandler is set.
-pub type SafetyHandler = Arc<
-    dyn Fn(&[u8]) -> Option<u16> + Send + Sync,
->;
+pub type SafetyHandler = Arc<dyn Fn(&[u8]) -> Option<u16> + Send + Sync>;
 
 // -------------------- Connection Manager object --------------------
 
@@ -405,8 +402,7 @@ impl ConnectionManagerObject {
         let counters_for_fo = counters.clone();
         let next_id_for_fo = next_conn_id.clone();
         let spawner_for_fo = producer_spawner.clone();
-        let safety_handler_for_fo: Arc<Mutex<Option<SafetyHandler>>> =
-            Arc::new(Mutex::new(None));
+        let safety_handler_for_fo: Arc<Mutex<Option<SafetyHandler>>> = Arc::new(Mutex::new(None));
         let safety_slot_for_ctor = safety_handler_for_fo.clone();
         cls.add_instance_service(CipServiceDefinition::new(
             0x54,
@@ -417,7 +413,10 @@ impl ConnectionManagerObject {
                         "Forward_Open reached CipDispatcher with no ForwardOpenContext — \
                          caller should use CipDispatcher::dispatch_with_context"
                     );
-                    return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
+                    return CipServiceResponse::error(
+                        req.service_code,
+                        status::SERVICE_NOT_SUPPORTED,
+                    );
                 };
                 let handler = lock_recover(&safety_handler_for_fo).as_ref().cloned();
                 match do_process_forward_open_with_safety(
@@ -449,7 +448,10 @@ impl ConnectionManagerObject {
                     tracing::warn!(
                         "Forward_Close reached CipDispatcher with no ForwardCloseContext"
                     );
-                    return CipServiceResponse::error(req.service_code, status::SERVICE_NOT_SUPPORTED);
+                    return CipServiceResponse::error(
+                        req.service_code,
+                        status::SERVICE_NOT_SUPPORTED,
+                    );
                 };
                 match do_process_forward_close(
                     &req.data,
@@ -458,7 +460,9 @@ impl ConnectionManagerObject {
                     &counters_for_fc,
                 ) {
                     Ok(resp) => CipServiceResponse::success_with(req.service_code, resp.encode()),
-                    Err(_) => CipServiceResponse::error(req.service_code, status::CONNECTION_FAILURE),
+                    Err(_) => {
+                        CipServiceResponse::error(req.service_code, status::CONNECTION_FAILURE)
+                    }
                 }
             },
         ));
@@ -515,10 +519,7 @@ impl ConnectionManagerObject {
     /// `start()`.
     pub fn set_producer_spawner<F>(&self, spawner: F)
     where
-        F: Fn(ProducerSpawnArgs, watch::Receiver<bool>) -> JoinHandle<()>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(ProducerSpawnArgs, watch::Receiver<bool>) -> JoinHandle<()> + Send + Sync + 'static,
     {
         *lock_recover(&self.producer_spawner) = Some(Arc::new(spawner));
     }
@@ -699,7 +700,7 @@ fn do_process_forward_open_with_safety(
         )));
     };
     let output_asm: u16 = consumed_u32 as u16; // scanner produces, adapter consumes
-    let input_asm: u16 = produced_u32 as u16;  // scanner consumes, adapter produces
+    let input_asm: u16 = produced_u32 as u16; // scanner consumes, adapter produces
 
     if ctx.assemblies.snapshot(input_asm).is_none() {
         counters.record_open_other_reject();
@@ -760,9 +761,7 @@ fn do_process_forward_open_with_safety(
     // matching assembly instance registered.
     if let Some(cfg_u32) = path_result.config_assembly {
         let cfg_asm: u16 = cfg_u32 as u16;
-        if !path_result.config_data.is_empty()
-            && ctx.assemblies.snapshot(cfg_asm).is_some()
-        {
+        if !path_result.config_data.is_empty() && ctx.assemblies.snapshot(cfg_asm).is_some() {
             if let Err(e) = ctx.assemblies.update(cfg_asm, &path_result.config_data) {
                 counters.record_open_other_reject();
                 return Err(EipError::Protocol(format!(
@@ -998,7 +997,9 @@ mod tests {
         // The old receiver must now observe the shutdown signal set
         // to `true` — this is the behaviour that lets the orphan
         // producer actually break out of its tokio::select! loop.
-        rx1.changed().await.expect("shutdown signal must be deliverable");
+        rx1.changed()
+            .await
+            .expect("shutdown signal must be deliverable");
         assert_eq!(*rx1.borrow(), true);
         // Only one row remains in the table.
         assert_eq!(table.rows.len(), 1);
@@ -1081,9 +1082,12 @@ mod tests {
 
     fn make_asm_registry() -> AssemblyRegistry {
         let reg = AssemblyRegistry::new();
-        reg.insert(crate::Assembly::new(100, crate::AssemblyKind::Input, 8)).unwrap();
-        reg.insert(crate::Assembly::new(102, crate::AssemblyKind::Output, 8)).unwrap();
-        reg.insert(crate::Assembly::new(105, crate::AssemblyKind::Config, 4)).unwrap();
+        reg.insert(crate::Assembly::new(100, crate::AssemblyKind::Input, 8))
+            .unwrap();
+        reg.insert(crate::Assembly::new(102, crate::AssemblyKind::Output, 8))
+            .unwrap();
+        reg.insert(crate::Assembly::new(105, crate::AssemblyKind::Config, 4))
+            .unwrap();
         reg
     }
 
@@ -1109,8 +1113,8 @@ mod tests {
         b.extend_from_slice(&10_000u32.to_le_bytes()); // T→O rpi
         b.extend_from_slice(&0x4400u16.to_le_bytes()); // T→O params
         b.push(0xA0); // transport
-        // Connection path: Class 0x04 (Assembly), Instance 105 (config),
-        //                  Connection 102 (O→T), Connection 100 (T→O).
+                      // Connection path: Class 0x04 (Assembly), Instance 105 (config),
+                      //                  Connection 102 (O→T), Connection 100 (T→O).
         let conn_path = [0x20, 0x04, 0x24, 0x69, 0x2C, 0x66, 0x2C, 0x64];
         b.push((conn_path.len() / 2) as u8); // path size in words
         b.extend_from_slice(&conn_path);
@@ -1156,7 +1160,9 @@ mod tests {
             udp,
             run_idle: true,
         };
-        let resp = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap();
+        let resp = cm
+            .process_forward_open(&build_test_fo_body(), &ctx)
+            .unwrap();
         assert_eq!(cm.connection_count(), 1);
 
         // FC body: conn_serial(2) + orig vendor(2) + orig serial(4) +
@@ -1171,7 +1177,8 @@ mod tests {
         fc.push(0); // reserved
         fc.extend_from_slice(&[0x20, 0x06, 0x24, 0x01]);
 
-        cm.process_forward_close(&fc, Some(resp.o_to_t_connection_id)).unwrap();
+        cm.process_forward_close(&fc, Some(resp.o_to_t_connection_id))
+            .unwrap();
         assert_eq!(cm.connection_count(), 0);
         assert_eq!(cm.counters().close_requests.load(Ordering::Relaxed), 1);
     }
@@ -1315,9 +1322,7 @@ mod tests {
                         output_assembly: 102,
                         config_assembly: 0,
                         config_data: Vec::new(),
-                        peer_udp: Arc::new(std::sync::RwLock::new(
-                            "127.0.0.1:0".parse().unwrap(),
-                        )),
+                        peer_udp: Arc::new(std::sync::RwLock::new("127.0.0.1:0".parse().unwrap())),
                         o_to_t_rpi_us: 10_000,
                         t_to_o_rpi_us: 10_000,
                         connection_serial: i as u16,
@@ -1330,7 +1335,9 @@ mod tests {
             }
         }
 
-        let err = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap_err();
+        let err = cm
+            .process_forward_open(&build_test_fo_body(), &ctx)
+            .unwrap_err();
         match err {
             EipError::Cip { status: s, ext } => {
                 assert_eq!(s, 0x01);
@@ -1354,7 +1361,9 @@ mod tests {
             udp,
             run_idle: true,
         };
-        let resp = cm.process_forward_open(&build_test_fo_body(), &ctx).unwrap();
+        let resp = cm
+            .process_forward_open(&build_test_fo_body(), &ctx)
+            .unwrap();
         // build_test_fo_body uses conn serial 0x1111 / vendor 0x0001 /
         // serial 0xC0FFEE01.
         let found = cm.find_by_triplet(0x1111, 0x0001, 0xC0FFEE01);

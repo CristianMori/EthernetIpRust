@@ -43,7 +43,10 @@ fn metadata_short_string_element_size_is_81() {
     assert_eq!(SHORT_STRING_STORAGE_SIZE, 81);
     assert_eq!(SHORT_STRING_MAX_LENGTH, 80);
     assert_eq!(CipType::ShortString.atomic_size(), Some(81));
-    assert_eq!(CipType::from_u16(SHORT_STRING_TYPE), Some(CipType::ShortString));
+    assert_eq!(
+        CipType::from_u16(SHORT_STRING_TYPE),
+        Some(CipType::ShortString)
+    );
 }
 
 #[test]

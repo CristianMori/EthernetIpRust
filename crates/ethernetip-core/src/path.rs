@@ -164,7 +164,10 @@ mod tests {
     #[test]
     fn parse_route_basic() {
         assert_eq!(parse_route_path("1,0"), Some(vec![0x01, 0x00]));
-        assert_eq!(parse_route_path("1,0,2,1"), Some(vec![0x01, 0x00, 0x02, 0x01]));
+        assert_eq!(
+            parse_route_path("1,0,2,1"),
+            Some(vec![0x01, 0x00, 0x02, 0x01])
+        );
         assert_eq!(parse_route_path(""), Some(vec![]));
         assert_eq!(parse_route_path("1"), None);
     }

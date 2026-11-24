@@ -131,9 +131,7 @@ pub fn decode(
     let is_short = data_len <= 2;
     match (format, is_short) {
         (SafetyFormat::Base, true) => decode_base_short(input, data_len, pid_seed_s1),
-        (SafetyFormat::Base, false) => {
-            decode_base_long(input, data_len, pid_seed_s1, pid_seed_s3)
-        }
+        (SafetyFormat::Base, false) => decode_base_long(input, data_len, pid_seed_s1, pid_seed_s3),
         (SafetyFormat::Extended, true) => {
             decode_extended_short(input, data_len, pid_seed_s5, rollover_count)
         }
@@ -680,8 +678,16 @@ mod tests {
             0,
         );
         buf[0] ^= 0xFF;
-        let err = decode(&buf, data.len(), SafetyFormat::Base, PID_S1, PID_S3, PID_S5, 0)
-            .unwrap_err();
+        let err = decode(
+            &buf,
+            data.len(),
+            SafetyFormat::Base,
+            PID_S1,
+            PID_S3,
+            PID_S5,
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             SafetyDecodeError::ComplementMismatch

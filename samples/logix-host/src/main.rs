@@ -19,7 +19,8 @@ use ethernetip_logix::{
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "logix_host=info,ethernetip_logix=info".into()),
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "logix_host=info,ethernetip_logix=info".into()),
         )
         .init();
 

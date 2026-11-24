@@ -21,7 +21,7 @@ use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
 use ethernetip_core::path::EpathWriter;
-use ethernetip_core::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
+use ethernetip_core::timeout::{bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 
 use crate::adapter::IO_UDP_PORT;
 use crate::assembly::AssemblyRegistry;
@@ -78,6 +78,12 @@ pub struct ScannerConfig {
     /// to [`DEFAULT_REQUEST_TIMEOUT`]. The Forward_Close in `close()` is
     /// bounded by `close_timeout` alone.
     pub request_timeout: Option<Duration>,
+    /// Upper bound on opening the TCP connection to the adapter in
+    /// `open_connection` (including name resolution). On expiry the pending connect is
+    /// dropped and [`EipError::Timeout`] is returned. `None` disables the
+    /// bound. Defaults to [`DEFAULT_CONNECT_TIMEOUT`]. Refused or unreachable
+    /// peers still fail fast.
+    pub connect_timeout: Option<Duration>,
 }
 
 impl ScannerConfig {
@@ -113,6 +119,7 @@ impl ScannerConfig {
             config_data: Vec::new(),
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
         }
     }
 
@@ -152,6 +159,12 @@ impl ScannerConfig {
     /// `None` disables the bound.
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Bound the TCP connect to the adapter. `None` disables the bound.
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }
@@ -236,7 +249,7 @@ impl Drop for ScannerConnection {
 
 /// Open a Class 1 connection to an adapter and start the I/O tasks.
 pub async fn open_connection(cfg: ScannerConfig) -> Result<ScannerConnection> {
-    let mut stream = TcpStream::connect(cfg.adapter_tcp).await?;
+    let mut stream = connect_bounded(cfg.adapter_tcp, cfg.connect_timeout).await?;
     stream.set_nodelay(true)?;
 
     // Register session.

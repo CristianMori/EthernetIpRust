@@ -26,7 +26,7 @@ use ethernetip_core::cip::{service_codes as service, status, ReplyHeader};
 use ethernetip_core::cpf::{item_type, Envelope, Item};
 use ethernetip_core::encap::{encode_frame as encode_encap, Command, Header, HEADER_LEN};
 use ethernetip_core::error::{EipError, Result};
-use ethernetip_core::timeout::{bounded, DEFAULT_REQUEST_TIMEOUT};
+use ethernetip_core::timeout::{bounded, connect_bounded, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 
 use ethernetip_connections::scanner::DEFAULT_CLOSE_TIMEOUT;
 use crate::crc;
@@ -73,6 +73,12 @@ pub struct SafetyScannerConfig {
     /// bound. Defaults to [`DEFAULT_REQUEST_TIMEOUT`]. Forward_Close in
     /// `close()` is bounded by `close_timeout` alone.
     pub request_timeout: Option<Duration>,
+    /// Upper bound on opening the TCP connection to the adapter in
+    /// `open_safety_scanner` (including name resolution). On expiry the pending connect is
+    /// dropped and [`EipError::Timeout`] is returned. `None` disables the
+    /// bound. Defaults to [`DEFAULT_CONNECT_TIMEOUT`]. Refused or unreachable
+    /// peers still fail fast.
+    pub connect_timeout: Option<Duration>,
 }
 
 impl SafetyScannerConfig {
@@ -91,6 +97,7 @@ impl SafetyScannerConfig {
             peer_udp_port: IO_UDP_PORT,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
         }
     }
 
@@ -121,6 +128,12 @@ impl SafetyScannerConfig {
     /// `None` disables the bound.
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Bound the TCP connect to the adapter. `None` disables the bound.
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -248,7 +261,7 @@ impl Drop for SafetyScannerConnection {
 /// Open a safety scanner connection (server direction: originator produces
 /// safety O→T data). Blocks until the target's Forward_Open reply is parsed.
 pub async fn open_safety_scanner(cfg: SafetyScannerConfig) -> Result<SafetyScannerConnection> {
-    let mut tcp = TcpStream::connect(cfg.adapter_tcp).await?;
+    let mut tcp = connect_bounded(cfg.adapter_tcp, cfg.connect_timeout).await?;
     tcp.set_nodelay(true)?;
 
     let mut ctx: u64 = 0;

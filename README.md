@@ -404,6 +404,25 @@ for _ in 0..10_000 {
 client.close().await?;
 ```
 
+### Client timeouts
+
+Every client path that opens a TCP connection is bounded, so a silent or unreachable target cannot hang the caller:
+
+| Setting | Default | Bounds | On expiry |
+|---|---|---|---|
+| `connect_timeout` | 5 s | the TCP connect (incl. name resolution) | `EipError::Timeout`, no connection is created |
+| `request_timeout` | 5 s | each reply wait (RegisterSession, Forward_Open, requests) | `EipError::Timeout`, the session is dropped and later calls return `EipError::Closed` |
+
+Both are `Option<Duration>` (`None` disables the bound) on `TagClient::builder`, `ScannerConfig`, and `SafetyScannerConfig`; `EipSession` offers `connect_with_timeout` / `connect_and_register_with_timeouts` and `set_request_timeout`. A refused or unreachable peer still fails fast with `EipError::Io`.
+
+```rust
+let client = TagClient::builder("192.168.1.96")
+    .connect_timeout(Some(Duration::from_secs(2)))
+    .request_timeout(Some(Duration::from_secs(5)))
+    .connect()
+    .await?;
+```
+
 ### Logix tag server
 
 ```rust
